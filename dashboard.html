@@ -1,0 +1,1235 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ARB BOT — Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:        #080b10;
+    --bg1:       #0d1117;
+    --bg2:       #131920;
+    --bg3:       #1a2230;
+    --border:    #1e2d3d;
+    --border2:   #243444;
+    --text:      #c9d4e0;
+    --text2:     #6b8099;
+    --text3:     #3d5266;
+    --green:     #00e676;
+    --green2:    #1de9b6;
+    --red:       #ff5252;
+    --red2:      #ff1744;
+    --yellow:    #ffd740;
+    --blue:      #40c4ff;
+    --blue2:     #0288d1;
+    --purple:    #b388ff;
+    --orange:    #ff9100;
+    --mono:      'JetBrains Mono', monospace;
+    --sans:      'Space Grotesk', sans-serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* ── Scanlines overlay ── */
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background: repeating-linear-gradient(
+      0deg, transparent, transparent 2px,
+      rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px
+    );
+    pointer-events: none;
+    z-index: 1000;
+  }
+
+  /* ── Header ── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 28px;
+    background: var(--bg1);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 100;
+  }
+
+  .logo {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 4px;
+    color: var(--green);
+    text-transform: uppercase;
+  }
+  .logo span { color: var(--text2); }
+
+  .header-meta {
+    display: flex; gap: 20px; align-items: center;
+  }
+  .status-pill {
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 12px;
+    background: rgba(0,230,118,0.08);
+    border: 1px solid rgba(0,230,118,0.25);
+    border-radius: 20px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--green);
+  }
+  .status-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0%,100% { opacity:1; box-shadow: 0 0 0 0 rgba(0,230,118,0.4); }
+    50% { opacity:.6; box-shadow: 0 0 0 4px rgba(0,230,118,0); }
+  }
+
+  .clock {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text2);
+  }
+
+  /* ── Bot control button ── */
+  .btn-bot {
+    display: flex; align-items: center; gap: 7px;
+    padding: 6px 18px;
+    border-radius: 6px;
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 1.5px;
+    cursor: pointer;
+    border: none;
+    transition: all .15s;
+    text-transform: uppercase;
+  }
+  .btn-bot.start {
+    background: rgba(0,230,118,0.12);
+    border: 1px solid rgba(0,230,118,0.35);
+    color: var(--green);
+  }
+  .btn-bot.start:hover {
+    background: rgba(0,230,118,0.22);
+    box-shadow: 0 0 12px rgba(0,230,118,0.2);
+  }
+  .btn-bot.stop {
+    background: rgba(255,82,82,0.12);
+    border: 1px solid rgba(255,82,82,0.35);
+    color: var(--red);
+  }
+  .btn-bot.stop:hover {
+    background: rgba(255,82,82,0.22);
+    box-shadow: 0 0 12px rgba(255,82,82,0.2);
+  }
+  .btn-bot:disabled {
+    opacity: .4; cursor: not-allowed;
+  }
+  .btn-bot .btn-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  .btn-bot.stop .btn-dot { animation: pulse 1.2s infinite; }
+
+  /* ── DB status badge ── */
+  .db-pill {
+    display: flex; align-items: center; gap: 5px;
+    padding: 4px 10px;
+    border-radius: 20px;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: .5px;
+  }
+  .db-pill.ok  { background: rgba(0,230,118,0.07); border: 1px solid rgba(0,230,118,0.2); color: var(--green); }
+  .db-pill.err { background: rgba(255,82,82,0.07);  border: 1px solid rgba(255,82,82,0.25);  color: var(--red); cursor: pointer; }
+  .db-pill .db-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+
+  /* ── Bot error banner ── */
+  .bot-error-banner {
+    background: rgba(255,82,82,0.08);
+    border: 1px solid rgba(255,82,82,0.25);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--red);
+    display: none;
+  }
+  .bot-error-banner.visible { display: block; }
+
+  /* ── Layout ── */
+  .app { padding: 20px 24px; max-width: 1600px; margin: 0 auto; }
+
+  /* ── Stats row ── */
+  .stats-row {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .stat-card {
+    background: var(--bg1);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    transition: border-color .2s;
+  }
+  .stat-card:hover { border-color: var(--border2); }
+  .stat-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 1.5px;
+    color: var(--text3);
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+  .stat-value {
+    font-family: var(--mono);
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--text);
+    line-height: 1;
+  }
+  .stat-value.green { color: var(--green); }
+  .stat-value.red   { color: var(--red);   }
+  .stat-value.blue  { color: var(--blue);  }
+  .stat-sub {
+    font-size: 11px;
+    color: var(--text3);
+    margin-top: 4px;
+    font-family: var(--mono);
+  }
+
+  /* ── Main grid ── */
+  .main-grid {
+    display: grid;
+    grid-template-columns: 380px 1fr;
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+
+  /* ── Section ── */
+  .section {
+    background: var(--bg1);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .section-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg2);
+  }
+  .section-title {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: var(--text2);
+    text-transform: uppercase;
+  }
+  .section-badge {
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: var(--bg3);
+    color: var(--text2);
+    border: 1px solid var(--border);
+  }
+
+  /* ── Balance cards ── */
+  .balance-list { padding: 8px; }
+  .balance-item {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 12px;
+    border-radius: 6px;
+    margin-bottom: 4px;
+    transition: background .15s;
+    cursor: default;
+  }
+  .balance-item:hover { background: var(--bg2); }
+  .balance-item:last-child { margin-bottom: 0; }
+
+  .ex-name {
+    display: flex; align-items: center; gap: 8px;
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    min-width: 80px;
+  }
+  .ex-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .balance-info { text-align: right; }
+  .balance-usd {
+    font-family: var(--mono);
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .balance-position {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text3);
+    margin-top: 1px;
+  }
+  .balance-bar-wrap {
+    flex: 1;
+    margin: 0 12px;
+    height: 3px;
+    background: var(--bg3);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .balance-bar {
+    height: 100%;
+    border-radius: 2px;
+    transition: width .5s ease;
+  }
+
+  /* Алерт баланса */
+  .balance-item.alert {
+    background: rgba(255,82,82,0.06);
+    border: 1px solid rgba(255,82,82,0.2);
+  }
+  .balance-item.alert .balance-usd { color: var(--red); }
+  .alert-badge {
+    font-family: var(--mono);
+    font-size: 9px;
+    padding: 2px 6px;
+    background: rgba(255,82,82,0.15);
+    border: 1px solid rgba(255,82,82,0.3);
+    color: var(--red);
+    border-radius: 4px;
+    margin-left: 6px;
+  }
+
+  /* Выключенная биржа */
+  .balance-item.disabled {
+    opacity: 0.45;
+  }
+  .balance-item.disabled .balance-usd { color: var(--text3); }
+
+  /* Выделенный капитал */
+  .alloc-row {
+    display: flex; align-items: center; gap: 4px;
+    margin-top: 4px;
+  }
+  .alloc-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text3);
+    white-space: nowrap;
+  }
+  .alloc-input {
+    width: 68px;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 2px 6px;
+    outline: none;
+    text-align: right;
+    transition: border-color .2s;
+  }
+  .alloc-input:focus { border-color: var(--blue2); }
+  .alloc-input::placeholder { color: var(--text3); font-size: 10px; }
+  .alloc-preview {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--blue);
+    white-space: nowrap;
+  }
+  .pos-size-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text3);
+    margin-top: 2px;
+  }
+
+  /* Переключатель биржи */
+  .ex-toggle {
+    position: relative;
+    width: 32px; height: 17px;
+    flex-shrink: 0;
+    margin-left: 6px;
+    cursor: pointer;
+  }
+  .ex-toggle input { display: none; }
+  .ex-toggle-track {
+    position: absolute; inset: 0;
+    background: var(--bg3);
+    border: 1px solid var(--border2);
+    border-radius: 10px;
+    transition: background .2s, border-color .2s;
+  }
+  .ex-toggle-thumb {
+    position: absolute;
+    top: 2px; left: 2px;
+    width: 11px; height: 11px;
+    background: var(--text3);
+    border-radius: 50%;
+    transition: transform .2s, background .2s;
+  }
+  .ex-toggle.on .ex-toggle-track { background: rgba(0,230,118,0.15); border-color: rgba(0,230,118,0.3); }
+  .ex-toggle.on .ex-toggle-thumb { transform: translateX(15px); background: var(--green); }
+
+  /* ── Open positions ── */
+  .open-positions { padding: 8px; }
+  .position-card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin-bottom: 8px;
+    transition: border-color .2s;
+  }
+  .position-card:hover { border-color: var(--border2); }
+  .position-card:last-child { margin-bottom: 0; }
+
+  .pos-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 10px;
+  }
+  .pos-ticker {
+    font-family: var(--mono);
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--text);
+  }
+  .pos-status {
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 3px 8px;
+    border-radius: 4px;
+  }
+  .pos-status.open {
+    background: rgba(0,230,118,0.1);
+    border: 1px solid rgba(0,230,118,0.2);
+    color: var(--green);
+  }
+  .pos-status.partial {
+    background: rgba(255,215,64,0.1);
+    border: 1px solid rgba(255,215,64,0.2);
+    color: var(--yellow);
+  }
+
+  .pos-legs {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 8px; margin-bottom: 10px;
+  }
+  .pos-leg {
+    background: var(--bg3);
+    border-radius: 5px;
+    padding: 8px 10px;
+  }
+  .leg-label {
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 1px;
+    margin-bottom: 4px;
+    color: var(--text3);
+  }
+  .leg-exchange {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text2);
+    margin-bottom: 2px;
+  }
+  .leg-price {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text);
+  }
+  .leg-short .leg-label { color: var(--red); }
+  .leg-long  .leg-label { color: var(--green); }
+
+  .pos-meta {
+    display: flex; gap: 16px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text3);
+  }
+  .pos-meta span { color: var(--text2); }
+
+  .empty-state {
+    text-align: center;
+    padding: 40px 20px;
+    color: var(--text3);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .empty-state .icon { font-size: 32px; margin-bottom: 10px; }
+
+  /* ── Trades table ── */
+  .trades-section { margin-bottom: 16px; }
+  .table-wrap { overflow-x: auto; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  thead th {
+    padding: 10px 12px;
+    text-align: left;
+    color: var(--text3);
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+    background: var(--bg2);
+  }
+  tbody tr {
+    border-bottom: 1px solid rgba(30,45,61,0.5);
+    transition: background .1s;
+  }
+  tbody tr:hover { background: var(--bg2); }
+  tbody td {
+    padding: 9px 12px;
+    color: var(--text2);
+    white-space: nowrap;
+  }
+  td.ticker { color: var(--text); font-weight: 600; font-size: 12px; }
+  td.pnl-pos { color: var(--green); }
+  td.pnl-neg { color: var(--red); }
+  td.pnl-neu { color: var(--text3); }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 9px;
+    letter-spacing: .5px;
+  }
+  .badge-open    { background:rgba(0,230,118,.1); color:var(--green); border:1px solid rgba(0,230,118,.2); }
+  .badge-closed  { background:rgba(64,196,255,.1); color:var(--blue);  border:1px solid rgba(64,196,255,.2); }
+  .badge-partial { background:rgba(255,215,64,.1); color:var(--yellow);border:1px solid rgba(255,215,64,.2); }
+  .badge-failed  { background:rgba(255,82,82,.1);  color:var(--red);   border:1px solid rgba(255,82,82,.2); }
+
+  /* ── Tabs ── */
+  .tabs {
+    display: flex; gap: 4px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg2);
+  }
+  .tab {
+    padding: 5px 14px;
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text3);
+    cursor: pointer;
+    transition: all .15s;
+    border: 1px solid transparent;
+    letter-spacing: .5px;
+  }
+  .tab:hover { color: var(--text2); background: var(--bg3); }
+  .tab.active {
+    color: var(--blue);
+    background: rgba(64,196,255,.08);
+    border-color: rgba(64,196,255,.2);
+  }
+
+  /* ── Filters ── */
+  .filters {
+    display: flex; gap: 8px; align-items: center;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .filter-input {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 5px 10px;
+    outline: none;
+    transition: border-color .2s;
+  }
+  .filter-input:focus { border-color: var(--blue2); }
+  .filter-input::placeholder { color: var(--text3); }
+
+  /* ── Toast ── */
+  #toast-container {
+    position: fixed;
+    bottom: 20px; right: 20px;
+    z-index: 9999;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .toast {
+    background: var(--bg2);
+    border: 1px solid var(--border2);
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text);
+    max-width: 320px;
+    animation: slideIn .2s ease;
+    display: flex; gap: 8px; align-items: flex-start;
+  }
+  .toast.alert-toast { border-color: rgba(255,82,82,.4); background: rgba(255,82,82,.08); color: var(--red); }
+  @keyframes slideIn {
+    from { opacity:0; transform: translateX(20px); }
+    to   { opacity:1; transform: translateX(0); }
+  }
+
+  /* ── Scrollbar ── */
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+
+  /* ── Responsive ── */
+  @media(max-width:1100px) {
+    .main-grid { grid-template-columns: 1fr; }
+    .stats-row { grid-template-columns: repeat(3, 1fr); }
+  }
+  @media(max-width:640px) {
+    .stats-row { grid-template-columns: repeat(2, 1fr); }
+    .app { padding: 12px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<header>
+  <div class="logo">ARB<span>//</span>BOT</div>
+  <div class="header-meta">
+    <div class="db-pill err" id="db-pill" onclick="retryDb()" title="Нажми чтобы переподключиться">
+      <div class="db-dot"></div>
+      <span id="db-label">DB ERR</span>
+    </div>
+    <button class="btn-bot start" id="btn-bot" onclick="toggleBot()">
+      <div class="btn-dot"></div>
+      <span id="btn-label">START</span>
+    </button>
+    <div class="status-pill">
+      <div class="status-dot" id="conn-dot"></div>
+      <span id="conn-label">CONNECTING</span>
+    </div>
+    <div class="clock" id="clock">--:--:--</div>
+  </div>
+</header>
+
+<div class="app">
+
+  <!-- Bot / DB error banner -->
+  <div class="bot-error-banner" id="error-banner"></div>
+
+  <!-- Stats row -->
+  <div class="stats-row" id="stats-row">
+    <div class="stat-card">
+      <div class="stat-label">Total PnL</div>
+      <div class="stat-value" id="s-pnl">—</div>
+      <div class="stat-sub" id="s-avg">avg —</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Win Rate</div>
+      <div class="stat-value blue" id="s-wr">—</div>
+      <div class="stat-sub" id="s-wins">— / —</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Total Trades</div>
+      <div class="stat-value" id="s-total">—</div>
+      <div class="stat-sub" id="s-closed">— closed</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Open Now</div>
+      <div class="stat-value green" id="s-open">—</div>
+      <div class="stat-sub" id="s-maxopen">max —</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Leverage</div>
+      <div class="stat-value blue" id="s-lev">5×</div>
+      <div class="stat-sub">all exchanges</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Failed</div>
+      <div class="stat-value" id="s-failed">—</div>
+      <div class="stat-sub">partial fills</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Avg Exec</div>
+      <div class="stat-value blue" id="s-exec">—</div>
+      <div class="stat-sub">ms от сигнала</div>
+    </div>
+  </div>
+
+  <!-- Main grid: balances + open positions -->
+  <div class="main-grid">
+
+    <!-- Left: Balances -->
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">Exchange Balances</span>
+        <span class="section-badge" id="bal-updated">—</span>
+      </div>
+      <div class="balance-list" id="balance-list">
+        <!-- injected by JS -->
+      </div>
+    </div>
+
+    <!-- Right: Open positions -->
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">Open Positions</span>
+        <span class="section-badge" id="open-count">0</span>
+      </div>
+      <div class="open-positions" id="open-positions">
+        <div class="empty-state">
+          <div class="icon">⬜</div>
+          No open positions
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Trades history -->
+  <div class="section trades-section">
+    <div class="section-header">
+      <span class="section-title">Trade History</span>
+      <span class="section-badge" id="trade-count">0</span>
+    </div>
+    <div class="tabs">
+      <div class="tab active" data-tab="all"   onclick="setTab(this,'all')">All</div>
+      <div class="tab"        data-tab="closed" onclick="setTab(this,'closed')">Closed</div>
+      <div class="tab"        data-tab="open"   onclick="setTab(this,'open')">Open</div>
+      <div class="tab"        data-tab="failed" onclick="setTab(this,'failed')">Failed</div>
+    </div>
+    <div class="filters">
+      <input class="filter-input" id="search-input" placeholder="Search ticker..." oninput="renderTable()">
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Ticker</th>
+            <th>Short Ex</th>
+            <th>Long Ex</th>
+            <th>Size $</th>
+            <th>Lev</th>
+            <th>Entry Short</th>
+            <th>Entry Long</th>
+            <th>Close Short</th>
+            <th>Close Long</th>
+            <th>PnL Short</th>
+            <th>PnL Long</th>
+            <th>Fees</th>
+            <th>Net PnL</th>
+            <th>Fund Short</th>
+            <th>Fund Long</th>
+            <th>Spread%</th>
+            <th>Exec ms</th>
+            <th>Opened</th>
+            <th>Closed</th>
+            <th>Duration</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="trades-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<!-- Toast -->
+<div id="toast-container"></div>
+
+<script>
+const API = window.location.origin;
+const WS_URL = `${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws`;
+
+let allTrades    = [];
+let currentTab   = 'all';
+let initialBalances = {};
+let botRunning   = false;
+let dbOk         = false;
+
+const EX_COLORS = {
+  binance: '#f0b90b', bybit: '#f7a600', bitget: '#00c4b4',
+  mexc: '#1976d2', kucoin: '#2dbd85', gate: '#e74c3c',
+};
+
+// ── Clock ──
+setInterval(() => {
+  document.getElementById('clock').textContent = new Date().toUTCString().slice(17,25) + ' UTC';
+}, 1000);
+
+// ── Bot control ──────────────────────────────────────────────
+async function toggleBot() {
+  const btn = document.getElementById('btn-bot');
+  btn.disabled = true;
+
+  if (botRunning) {
+    // STOP
+    try {
+      const r = await fetch(`${API}/api/bot/stop`, { method: 'POST' });
+      const d = await r.json();
+      showToast(d.msg, d.ok ? 'info' : 'alert');
+      if (!d.ok) btn.disabled = false;
+    } catch(e) {
+      showToast('Ошибка остановки: ' + e, 'alert');
+      btn.disabled = false;
+    }
+  } else {
+    // START
+    if (!dbOk) {
+      showToast('PostgreSQL недоступен. Проверь DATABASE_URL в .env', 'alert');
+      btn.disabled = false;
+      return;
+    }
+    try {
+      const r = await fetch(`${API}/api/bot/start`, { method: 'POST' });
+      const d = await r.json();
+      showToast(d.msg, d.ok ? 'info' : 'alert');
+      if (!d.ok) {
+        showError(d.msg);
+        btn.disabled = false;
+      }
+    } catch(e) {
+      showToast('Ошибка запуска: ' + e, 'alert');
+      btn.disabled = false;
+    }
+  }
+  // Статус обновится через WS
+  setTimeout(() => { btn.disabled = false; }, 3000);
+}
+
+async function retryDb() {
+  showToast('Переподключение к PostgreSQL...', 'info');
+  try {
+    const r = await fetch(`${API}/api/db/reconnect`, { method: 'POST' });
+    const d = await r.json();
+    dbOk = d.ok;
+    updateDbPill(d.ok);
+    showToast(d.msg, d.ok ? 'info' : 'alert');
+    if (d.ok) hideError();
+  } catch(e) {
+    showToast('Ошибка: ' + e, 'alert');
+  }
+}
+
+function updateBotButton(running) {
+  botRunning = running;
+  const btn   = document.getElementById('btn-bot');
+  const label = document.getElementById('btn-label');
+  if (running) {
+    btn.className = 'btn-bot stop';
+    label.textContent = 'STOP';
+  } else {
+    btn.className = 'btn-bot start';
+    label.textContent = 'START';
+  }
+  btn.disabled = false;
+}
+
+function updateDbPill(ok) {
+  dbOk = ok;
+  const pill  = document.getElementById('db-pill');
+  const label = document.getElementById('db-label');
+  pill.className = 'db-pill ' + (ok ? 'ok' : 'err');
+  label.textContent = ok ? 'DB OK' : 'DB ERR';
+  pill.title = ok ? 'PostgreSQL подключён' : 'Нажми чтобы переподключиться';
+  if (!ok) {
+    showError('PostgreSQL недоступен. Убедись что PostgreSQL запущен и DATABASE_URL в .env корректен. Нажми «DB ERR» или перезапусти приложение после исправления.');
+  }
+}
+
+function showError(msg) {
+  const b = document.getElementById('error-banner');
+  b.textContent = '⚠ ' + msg;
+  b.classList.add('visible');
+}
+function hideError() {
+  document.getElementById('error-banner').classList.remove('visible');
+}
+
+// ── WebSocket ────────────────────────────────────────────────
+let ws, wsPing;
+function connectWS() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    setConnStatus(true);
+    wsPing = setInterval(() => { if(ws.readyState===1) ws.send('ping'); }, 30000);
+  };
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'state') handleState(msg);
+      if (msg.type === 'bot_status') handleBotStatus(msg);
+    } catch {}
+  };
+  ws.onclose = () => {
+    setConnStatus(false);
+    clearInterval(wsPing);
+    setTimeout(connectWS, 5000);
+  };
+}
+
+function setConnStatus(ok) {
+  document.getElementById('conn-dot').style.background  = ok ? 'var(--green)' : 'var(--red)';
+  document.getElementById('conn-dot').style.animation   = ok ? 'pulse 2s infinite' : 'none';
+  document.getElementById('conn-label').textContent     = ok ? 'LIVE' : 'RECONNECTING';
+}
+
+function handleState(msg) {
+  if (msg.bot_status) handleBotStatus(msg.bot_status);
+  if (msg.disabled_exchanges) disabledExchanges = new Set(msg.disabled_exchanges);
+  if (msg.allocated) Object.assign(allocatedCapital, msg.allocated);
+  if (msg.stats?.leverage) currentLeverage = msg.stats.leverage;
+  renderBalances(msg.balances);
+  renderOpenPositions(msg.open_trades);
+  renderStats(msg.stats);
+  document.getElementById('bal-updated').textContent = 'updated ' + new Date().toTimeString().slice(0,8);
+}
+
+function handleBotStatus(s) {
+  updateBotButton(s.running);
+  updateDbPill(s.db_ok !== undefined ? s.db_ok : dbOk);
+  if (s.error) showError('Ошибка бота: ' + s.error);
+  else if (s.running) hideError();
+}
+
+// ── Exchange toggles + allocated capital ─────────────────────
+let disabledExchanges = new Set();
+let allocatedCapital  = {};   // ex -> number (чистые $, 0 = не задан)
+let lastBalances      = {};
+let currentLeverage   = 5;
+
+async function toggleExchange(ex) {
+  const newEnabled = disabledExchanges.has(ex); // был выключен → включаем
+  try {
+    const r = await fetch(`${API}/api/exchanges/toggle?exchange=${ex}&enabled=${newEnabled}`, {method:'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      if (!newEnabled) disabledExchanges.add(ex);
+      else disabledExchanges.delete(ex);
+      renderBalances(lastBalances);
+      showToast(`${ex.toUpperCase()} ${newEnabled ? '🟢 включена' : '🔴 выключена'}`);
+    } else {
+      showToast(`Ошибка: ${d.msg}`, 'alert');
+    }
+  } catch(e) { console.error(e); showToast('Ошибка соединения', 'alert'); }
+}
+
+// Дебаунс — отправляем на сервер через 600мс после последнего нажатия
+const _allocTimers = {};
+function onAllocInput(ex) {
+  clearTimeout(_allocTimers[ex]);
+  _allocTimers[ex] = setTimeout(() => {
+    const inp = document.getElementById(`alloc-${ex}`);
+    if (inp) saveAlloc(ex, inp.value);
+  }, 600);
+  updateAllocPreview(ex);
+}
+
+function updateAllocPreview(ex) {
+  const inp = document.getElementById(`alloc-${ex}`);
+  const lbl = document.getElementById(`alloc-preview-${ex}`);
+  if (!inp || !lbl) return;
+  const v = parseFloat(inp.value) || 0;
+  lbl.textContent = v > 0 ? `× ${currentLeverage} = $${(v * currentLeverage).toFixed(2)}` : '';
+  lbl.style.color = v > 0 ? 'var(--blue)' : 'var(--text3)';
+}
+
+async function saveAlloc(ex, val) {
+  const amount = Math.max(0, parseFloat(val) || 0);
+  try {
+    const r = await fetch(`${API}/api/exchanges/allocated?exchange=${ex}&amount=${amount}`, {method:'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      allocatedCapital[ex] = amount;
+      const msg = amount > 0
+        ? `${ex.toUpperCase()}: $${amount} × ${currentLeverage} = $${(amount * currentLeverage).toFixed(2)} позиция`
+        : `${ex.toUpperCase()}: используется весь баланс`;
+      showToast(msg);
+    }
+  } catch(e) { console.error(e); }
+}
+
+// ── Balances ─────────────────────────────────────────────────
+const ALERT_PCT = 50;
+function renderBalances(balances) {
+  if (!balances || !Object.keys(balances).length) return;
+  lastBalances = balances;
+  const container = document.getElementById('balance-list');
+
+  Object.entries(balances).forEach(([ex, val]) => {
+    if (val > 0 && !initialBalances[ex]) initialBalances[ex] = val;
+  });
+
+  const maxBal = Math.max(...Object.values(balances).filter(v => v > 0), 1);
+  const lev = currentLeverage;
+
+  container.innerHTML = Object.entries(balances).map(([ex, bal]) => {
+    const color      = EX_COLORS[ex] || '#4a5568';
+    const barPct     = Math.min((bal / maxBal) * 100, 100);
+    const initial    = initialBalances[ex] || bal;
+    const pct        = initial > 0 ? (bal / initial * 100) : 100;
+    const isAlert    = initial > 0 && pct <= ALERT_PCT && bal > 0;
+    const isDisabled = disabledExchanges.has(ex);
+    const alloc      = allocatedCapital[ex] || 0;
+    // Размер позиции: если задан alloc — alloc×lev, иначе balance×lev
+    const posSize    = alloc > 0 ? (alloc * lev).toFixed(2) : (bal * lev).toFixed(2);
+    const posLabel   = alloc > 0
+      ? `$${alloc.toFixed(2)} × ${lev} = $${posSize}`
+      : `$${bal.toFixed(2)} × ${lev} = $${posSize}`;
+    const allocVal   = alloc > 0 ? alloc : '';
+    const preview    = alloc > 0 ? `× ${lev} = $${posSize}` : '';
+    if (isAlert) showToast(`⚠️ ALERT: ${ex.toUpperCase()} balance at ${pct.toFixed(0)}%`, 'alert');
+    return `
+      <div class="balance-item ${isAlert ? 'alert' : ''} ${isDisabled ? 'disabled' : ''}">
+        <div class="ex-name">
+          <div class="ex-dot" style="background:${color}"></div>
+          ${ex.toUpperCase()}
+          ${isAlert ? `<span class="alert-badge">⚠ ${pct.toFixed(0)}%</span>` : ''}
+        </div>
+        <div class="balance-bar-wrap">
+          <div class="balance-bar" style="width:${barPct}%;background:${color}40;"></div>
+        </div>
+        <div class="balance-info">
+          <div class="balance-usd">$${bal.toFixed(2)}</div>
+          <div class="alloc-row">
+            <span class="alloc-label">выд. $</span>
+            <input class="alloc-input" id="alloc-${ex}"
+              type="number" min="0" step="1"
+              value="${allocVal}"
+              placeholder="весь"
+              oninput="onAllocInput('${ex}')"
+              onclick="event.stopPropagation()"
+            >
+            <span class="alloc-preview" id="alloc-preview-${ex}">${preview}</span>
+          </div>
+          <div class="pos-size-label">${posLabel}</div>
+        </div>
+        <div class="ex-toggle ${isDisabled ? '' : 'on'}" onclick="toggleExchange('${ex}')" title="${isDisabled ? 'Включить' : 'Выключить'} биржу">
+          <div class="ex-toggle-track"></div>
+          <div class="ex-toggle-thumb"></div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+// ── Open Positions ───────────────────────────────────────────
+function renderOpenPositions(positions) {
+  const c = document.getElementById('open-positions');
+  document.getElementById('open-count').textContent = positions.length;
+  if (!positions.length) {
+    c.innerHTML = `<div class="empty-state"><div class="icon">⬜</div>No open positions</div>`;
+    return;
+  }
+  c.innerHTML = positions.map(p => {
+    const dur    = p.opened_at ? elapsed(p.opened_at) : '—';
+    const fund_s = p.funding_short != null ? (p.funding_short*100).toFixed(4)+'%' : '—';
+    const fund_l = p.funding_long  != null ? (p.funding_long *100).toFixed(4)+'%' : '—';
+    return `
+      <div class="position-card">
+        <div class="pos-header">
+          <span class="pos-ticker">${p.ticker}</span>
+          <span class="pos-status ${p.status}">${p.status.toUpperCase()}</span>
+        </div>
+        <div class="pos-legs">
+          <div class="pos-leg leg-short">
+            <div class="leg-label">SHORT</div>
+            <div class="leg-exchange">${(p.short_exchange||'').toUpperCase()}</div>
+            <div class="leg-price">$${fmt(p.short_entry_price)}</div>
+          </div>
+          <div class="pos-leg leg-long">
+            <div class="leg-label">LONG</div>
+            <div class="leg-exchange">${(p.long_exchange||'').toUpperCase()}</div>
+            <div class="leg-price">$${fmt(p.long_entry_price)}</div>
+          </div>
+        </div>
+        <div class="pos-meta">
+          <span>size <span>$${p.trade_size_usd?.toFixed(2)||'—'}</span></span>
+          <span>lev <span>${p.leverage||5}×</span></span>
+          <span>spread <span>${p.signal_spread_pct?.toFixed(2)||'—'}%</span></span>
+          <span>fund <span>${fund_s}</span>/<span>${fund_l}</span></span>
+          <span>open <span>${dur}</span></span>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+// ── Stats ────────────────────────────────────────────────────
+function renderStats(s) {
+  if (!s) return;
+  if (s.leverage) currentLeverage = s.leverage;
+  const pnl = s.total_pnl || 0;
+  const el  = document.getElementById('s-pnl');
+  el.textContent = (pnl >= 0 ? '+' : '') + '$' + Number(pnl).toFixed(4);
+  el.className   = 'stat-value ' + (pnl > 0 ? 'green' : pnl < 0 ? 'red' : '');
+  document.getElementById('s-avg').textContent    = 'avg $' + Number(s.avg_pnl||0).toFixed(4);
+  document.getElementById('s-wr').textContent     = (s.win_rate||0) + '%';
+  document.getElementById('s-wins').textContent   = `${s.wins||0} W / ${s.losses||0} L`;
+  document.getElementById('s-total').textContent  = s.total || 0;
+  document.getElementById('s-closed').textContent = `${s.closed||0} closed`;
+  document.getElementById('s-open').textContent   = s.open_cnt || 0;
+  document.getElementById('s-maxopen').textContent= `max ${s.max_open_positions||3}`;
+  document.getElementById('s-lev').textContent    = `${s.leverage||5}×`;
+  document.getElementById('s-failed').textContent = s.failed || 0;
+  // Среднее время исполнения
+  const execEl = document.getElementById('s-exec');
+  const execMs = s.avg_exec_short_ms || s.avg_exec_long_ms;
+  execEl.textContent = execMs ? Math.round(execMs) + 'ms' : '—';
+  execEl.className = 'stat-value ' + (execMs ? (execMs < 500 ? 'green' : execMs < 1500 ? 'blue' : 'red') : 'blue');
+}
+
+// ── Trades table ─────────────────────────────────────────────
+async function loadTrades() {
+  try {
+    const r = await fetch(`${API}/api/trades?limit=500`);
+    allTrades = await r.json();
+    document.getElementById('trade-count').textContent = allTrades.length;
+    renderTable();
+  } catch(e) { console.error(e); }
+}
+
+function setTab(el, tab) {
+  currentTab = tab;
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  renderTable();
+}
+
+function renderTable() {
+  const search = document.getElementById('search-input').value.toLowerCase();
+  const rows = allTrades.filter(t => {
+    if (currentTab !== 'all' && t.status !== currentTab) return false;
+    if (search && !t.ticker.toLowerCase().includes(search)) return false;
+    return true;
+  });
+  const tbody = document.getElementById('trades-tbody');
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="22" style="text-align:center;padding:30px;color:var(--text3);font-family:var(--mono)">No trades found</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map(t => {
+    const pnl      = t.net_pnl_usd;
+    const pnlClass = pnl == null ? 'pnl-neu' : pnl > 0 ? 'pnl-pos' : 'pnl-neg';
+    const pnlStr   = pnl != null ? (pnl >= 0 ? '+' : '') + '$' + Number(pnl).toFixed(4) : '—';
+    const spnl     = t.short_pnl_usd != null ? (t.short_pnl_usd>=0?'+':'')+'$'+Number(t.short_pnl_usd).toFixed(4) : '—';
+    const lpnl     = t.long_pnl_usd  != null ? (t.long_pnl_usd >=0?'+':'')+'$'+Number(t.long_pnl_usd).toFixed(4)  : '—';
+    const fees     = (Number(t.fee_short_usd||0) + Number(t.fee_long_usd||0)).toFixed(4);
+    const dur      = (t.opened_at && t.closed_at) ? duration(t.opened_at, t.closed_at) : (t.opened_at ? elapsed(t.opened_at) : '—');
+    const fund_s   = t.funding_short != null ? (t.funding_short*100).toFixed(4)+'%' : '—';
+    const fund_l   = t.funding_long  != null ? (t.funding_long *100).toFixed(4)+'%' : '—';
+    const execMs   = t.exec_time_short_ms || t.exec_time_long_ms;
+    const execStr  = execMs ? `<span style="color:${execMs<500?'var(--green)':execMs<1500?'var(--blue)':'var(--red)'}">${execMs}ms</span>` : '—';
+    return `<tr>
+      <td style="color:var(--text3)">${t.id}</td>
+      <td class="ticker">${t.ticker}</td>
+      <td>${(t.short_exchange||'').toUpperCase()}</td>
+      <td>${(t.long_exchange||'').toUpperCase()}</td>
+      <td>$${Number(t.trade_size_usd||0).toFixed(2)}</td>
+      <td>${t.leverage||5}×</td>
+      <td>${fmt(t.short_entry_price)}</td>
+      <td>${fmt(t.long_entry_price)}</td>
+      <td>${fmt(t.short_close_price)}</td>
+      <td>${fmt(t.long_close_price)}</td>
+      <td class="${t.short_pnl_usd>=0?'pnl-pos':t.short_pnl_usd<0?'pnl-neg':'pnl-neu'}">${spnl}</td>
+      <td class="${t.long_pnl_usd>=0?'pnl-pos':t.long_pnl_usd<0?'pnl-neg':'pnl-neu'}">${lpnl}</td>
+      <td style="color:var(--text3)">$${fees}</td>
+      <td class="${pnlClass}" style="font-weight:600">${pnlStr}</td>
+      <td style="color:var(--text3)">${fund_s}</td>
+      <td style="color:var(--text3)">${fund_l}</td>
+      <td>${Number(t.signal_spread_pct||0).toFixed(2)}%</td>
+      <td>${execStr}</td>
+      <td style="color:var(--text3)">${fmtTime(t.opened_at)}</td>
+      <td style="color:var(--text3)">${fmtTime(t.closed_at)}</td>
+      <td style="color:var(--text2)">${dur}</td>
+      <td><span class="badge badge-${t.status}">${t.status}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Toast ────────────────────────────────────────────────────
+const shownAlerts = new Set();
+function showToast(msg, type='info') {
+  if (shownAlerts.has(msg)) return;
+  shownAlerts.add(msg);
+  setTimeout(() => shownAlerts.delete(msg), 60000);
+  const c  = document.getElementById('toast-container');
+  const el = document.createElement('div');
+  el.className = `toast ${type==='alert'?'alert-toast':''}`;
+  el.textContent = msg;
+  c.appendChild(el);
+  setTimeout(() => el.remove(), 6000);
+}
+
+// ── Helpers ──────────────────────────────────────────────────
+function fmt(v) { return v == null ? '—' : parseFloat(v).toPrecision(6); }
+function fmtTime(iso) { if (!iso) return '—'; return String(iso).slice(0,16).replace('T',' '); }
+function elapsed(iso) {
+  const s = Math.floor((Date.now() - new Date(iso)) / 1000);
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm';
+  return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+}
+function duration(open, close) {
+  const s = Math.floor((new Date(close) - new Date(open)) / 1000);
+  if (s < 60) return s + 's';
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+// ── Init ─────────────────────────────────────────────────────
+connectWS();
+loadTrades();
+setInterval(loadTrades, 30000);
+
+// Загружаем начальное состояние
+(async () => {
+  try {
+    const [statsR, balR, openR, botR] = await Promise.all([
+      fetch(`${API}/api/stats`).then(r=>r.json()),
+      fetch(`${API}/api/balances`).then(r=>r.json()),
+      fetch(`${API}/api/trades/open`).then(r=>r.json()),
+      fetch(`${API}/api/bot/status`).then(r=>r.json()),
+    ]);
+    renderStats(statsR);
+    const bals = {};
+    Object.entries(balR).forEach(([ex, v]) => bals[ex] = v.display || 0);
+    renderBalances(bals);
+    renderOpenPositions(openR);
+    updateBotButton(botR.running);
+    updateDbPill(botR.db_ok);
+    if (botR.error) showError('Ошибка бота: ' + botR.error);
+  } catch(e) { console.error(e); }
+})();
+</script>
+</body>
+</html>

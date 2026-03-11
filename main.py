@@ -1,50 +1,48 @@
 """
-main.py — запускает бота и GUI-дашборд одновременно.
+main.py — точка входа.
 
-Запуск:
-  python main.py
-
-  Бот: слушает Telegram-канал, торгует по сигналам
-  GUI: http://localhost:8080
+GUI запускается на http://localhost:8080
+Торговля запускается кнопкой START в дашборде.
 """
 
 import asyncio
+import webbrowser
+import threading
 import uvicorn
 
-from db import db_init
 
-
-async def run_bot():
-    from listener import SignalListener
-    listener = SignalListener()
-    try:
-        await listener.start()
-    except Exception as e:
-        print(f"[Bot] Fatal: {e}")
+def _open_browser():
+    """Открывает браузер через 1.5 сек после запуска сервера."""
+    import time
+    time.sleep(1.5)
+    webbrowser.open("http://localhost:8080")
 
 
 async def run_gui():
     config = uvicorn.Config(
-        "gui.server:app",
-        host="0.0.0.0",
+        "gui_server:app",
+        host="127.0.0.1",   # localhost вместо 0.0.0.0 — работает на Windows
         port=8080,
-        log_level="warning",
+        log_level="info",
     )
-    server = uvicorn.Server(config)
-    await server.serve()
+    await uvicorn.Server(config).serve()
 
 
 async def main():
-    db_init()
-    print("=" * 50)
-    print("  ARB BOT — LIVE MODE")
+    print("=" * 45)
+    print("  ARB BOT")
     print("  Dashboard → http://localhost:8080")
-    print("=" * 50)
-    await asyncio.gather(run_bot(), run_gui())
+    print("  Нажми START в дашборде чтобы начать")
+    print("=" * 45)
+
+    # Открываем браузер в отдельном потоке
+    threading.Thread(target=_open_browser, daemon=True).start()
+
+    await run_gui()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n[Main] Stopped.")
+        print("\nStopped.")
