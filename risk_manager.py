@@ -15,7 +15,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Optional
 
-from settings import MAX_OPEN_POSITIONS, MIN_SPREAD_PCT, LEVERAGE, MIN_VOLUME_USD
+from settings import MAX_OPEN_POSITIONS, MIN_SPREAD_PCT, LEVERAGE, MIN_VOLUME_USD, MAX_FUNDING_DIFF_PCT, MAX_FUNDING_ABS_PCT
 from exchanges import BaseExchange
 from db import get_open_trade, get_all_open_trades
 from signal_parser import OpenSignal
@@ -99,6 +99,24 @@ async def check_signal(signal: OpenSignal, short_ex: BaseExchange, long_ex: Base
     real_spread = (short_price / long_price - 1) * 100 if long_price > 0 else 0
     if real_spread < MIN_SPREAD_PCT:
         return RiskResult(ok=False, reason=f"Спред упал до {real_spread:.3f}% (мин {MIN_SPREAD_PCT}%). {signal.ticker} пропущен.")
+
+    # 5b. Фандинг-фильтр
+    fs = signal.funding_short  # уже в долях (0.002 = 0.2%)
+    fl = signal.funding_long
+    if fs is not None and fl is not None:
+        diff_pct  = abs(fs - fl) * 100
+        short_abs = abs(fs) * 100
+        long_abs  = abs(fl) * 100
+        # Пропускаем только если: разница <= MAX_FUNDING_DIFF_PCT ИЛИ оба абс < MAX_FUNDING_ABS_PCT
+        passes_diff = diff_pct  <= MAX_FUNDING_DIFF_PCT
+        passes_abs  = short_abs <= MAX_FUNDING_ABS_PCT and long_abs <= MAX_FUNDING_ABS_PCT
+        if not passes_diff and not passes_abs:
+            return RiskResult(ok=False, reason=(
+                f"Фандинг не прошёл фильтр: "
+                f"short={fs*100:+.3f}% long={fl*100:+.3f}% "
+                f"разница={diff_pct:.3f}% (макс {MAX_FUNDING_DIFF_PCT}%), "
+                f"абс макс {MAX_FUNDING_ABS_PCT}%. {signal.ticker} пропущен."
+            ))
 
     # 6. Проверка объёма (если MIN_VOLUME_USD > 0)
     if MIN_VOLUME_USD > 0:

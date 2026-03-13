@@ -4,11 +4,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 LEVERAGE:            int   = int(os.getenv("LEVERAGE", "5"))
-PROXY:               str   = os.getenv("PROXY", "")   # напр: http://user:pass@1.2.3.4:8080
+PROXY:               str   = os.getenv("PROXY", "")
 MIN_SPREAD_PCT:      float = float(os.getenv("MIN_SPREAD_PCT", "0.5"))
-MIN_VOLUME_USD:      float = float(os.getenv("MIN_VOLUME_USD", "500000"))  # минимальный объём 24ч в USD
+MIN_VOLUME_USD:      float = float(os.getenv("MIN_VOLUME_USD", "500000"))
 MAX_OPEN_POSITIONS:  int   = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 BALANCE_ALERT_PCT:   float = float(os.getenv("BALANCE_ALERT_PCT", "50"))
+# Фандинг-фильтр: пропускаем сделку если оба условия НЕ выполнены:
+#   1) разница фандинга между биржами <= MAX_FUNDING_DIFF_PCT
+#   2) оба фандинга по абсолютной величине < MAX_FUNDING_ABS_PCT
+MAX_FUNDING_DIFF_PCT: float = float(os.getenv("MAX_FUNDING_DIFF_PCT", "0.2"))
+MAX_FUNDING_ABS_PCT:  float = float(os.getenv("MAX_FUNDING_ABS_PCT", "1.5"))
 
 DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/arb_bot")
 

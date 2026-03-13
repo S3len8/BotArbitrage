@@ -138,3 +138,83 @@ if __name__ == '__main__':
     print(f"ticker={sig.ticker} short={sig.short_exchange}@{sig.short_price} long={sig.long_exchange}@{sig.long_price}")
     print(f"spread={sig.spread_pct}% size=${sig.trade_size_usd}")
     print(parse_message("CLOSE BTW"))
+
+
+# ── Парсер закреплённого сообщения ────────────────────────────
+# Формат:
+#   🏦 Active Spreads 🏦
+#   📗 #LYN | 6.14% (0m) 📗
+#   copy
+#   🔵 GATE   : 0.3365
+#   🟠 OURBIT : 0.31702
+#   ====...====
+#   📗 #LYN | 6.04% (355m) 📗
+#   ...
+
+def parse_pinned(text: str) -> list[OpenSignal]:
+    """Парсит закреплённое сообщение с несколькими активными спредами."""
+    signals = []
+    # Разбиваем на блоки по разделителю ===
+    blocks = re.split(r'={5,}', text)
+    for block in blocks:
+        sig = _parse_pinned_block(block.strip())
+        if sig:
+            signals.append(sig)
+    return signals
+
+
+def _parse_pinned_block(block: str) -> Optional[OpenSignal]:
+    """Парсит один блок из закреплённого сообщения."""
+    if not block:
+        return None
+    lines = block.splitlines()
+
+    # Ищем тикер и спред: #LYN | 6.14% (0m)
+    ticker, spread_pct = None, None
+    for line in lines:
+        m = re.search(r'#(\w+)\s*\|\s*([\d.]+)%', line)
+        if m:
+            ticker    = m.group(1).upper()
+            spread_pct = float(m.group(2))
+            break
+    if not ticker:
+        return None
+
+    # Парсим строки с биржами и ценами: GATE : 0.3365
+    # Первая цена = short (выше), вторая = long (ниже) — по порядку
+    exchange_prices = []
+    for line in lines:
+        # Строка типа: 🔵 GATE   : 0.3365  или  GATE : 0.3365
+        m = re.search(r'([A-Z]{2,10})\s*:\s*([\d.]+)', line)
+        if m:
+            ex    = m.group(1).strip().lower()
+            price = float(m.group(2))
+            if ex not in ('copy', 'usdt'):
+                exchange_prices.append((ex, price))
+
+    if len(exchange_prices) < 2:
+        return None
+
+    # В закреплённом: первая биржа = short (дороже), вторая = long (дешевле)
+    short_exchange, short_price = exchange_prices[0]
+    long_exchange,  long_price  = exchange_prices[1]
+
+    # Проверяем что short > long (иначе меняем местами)
+    if short_price < long_price:
+        short_exchange, short_price, long_exchange, long_price = \
+            long_exchange, long_price, short_exchange, short_price
+
+    return OpenSignal(
+        ticker=ticker,
+        symbol=normalize_symbol(ticker),
+        short_exchange=short_exchange,
+        long_exchange=long_exchange,
+        short_price=short_price,
+        long_price=long_price,
+        spread_pct=spread_pct,
+        funding_short=None,   # в закреплённом нет фандинга — фильтр пропускается
+        funding_long=None,
+        max_size_short=None,
+        max_size_long=None,
+        raw_text=block,
+    )

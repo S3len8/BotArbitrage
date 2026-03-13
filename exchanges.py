@@ -91,8 +91,12 @@ class CcxtExchange(BaseExchange):
         self._client = getattr(ccxt, exchange_id)(params)
 
     async def get_price(self, symbol: str) -> float:
-        t = await self._client.fetch_ticker(self._fmt(symbol))
-        return float(t['ask'] or t['last'])
+        """Получает цену через requests — обходит aiohttp DNS проблему на Windows."""
+        return await _run_sync(self._price_sync, symbol)
+
+    def _price_sync(self, symbol: str) -> float:
+        """Переопределяется в каждом классе."""
+        raise NotImplementedError(f"{self.name}: _price_sync не реализован")
 
     async def get_futures_balance(self) -> float:
         raise NotImplementedError
@@ -170,6 +174,14 @@ class BinanceExchange(CcxtExchange):
         self._api_key    = keys['api_key']
         self._api_secret = keys['api_secret']
 
+    def _price_sync(self, symbol: str) -> float:
+        ticker = symbol.replace('/', '').replace(':USDT', '')
+        r = requests.get('https://fapi.binance.com/fapi/v1/ticker/bookTicker',
+                         params={'symbol': ticker}, timeout=10)
+        r.raise_for_status()
+        d = r.json()
+        return float(d.get('askPrice') or d.get('bidPrice'))
+
     def _balance_sync(self) -> float:
         ts  = _ts()
         msg = f"timestamp={ts}&recvWindow=10000"
@@ -238,6 +250,16 @@ class BybitExchange(CcxtExchange):
         keys = get_exchange_keys('bybit')
         self._api_key    = keys['api_key']
         self._api_secret = keys['api_secret']
+
+    def _price_sync(self, symbol: str) -> float:
+        ticker = symbol.replace('/', '').replace(':USDT', '') + 'USDT'
+        r = requests.get('https://api.bybit.com/v5/market/tickers',
+                         params={'category': 'linear', 'symbol': ticker}, timeout=10)
+        r.raise_for_status()
+        items = r.json().get('result', {}).get('list', [])
+        if items:
+            return float(items[0].get('ask1Price') or items[0].get('lastPrice'))
+        raise ValueError(f"bybit: no ticker data for {ticker}")
 
     def _balance_sync(self) -> float:
         # Bybit UNIFIED — берём totalEquity всего кошелька (все монеты в USD)
@@ -354,6 +376,14 @@ class MexcExchange(CcxtExchange):
         self._api_key    = keys['api_key']
         self._api_secret = keys['api_secret']
 
+    def _price_sync(self, symbol: str) -> float:
+        ticker = symbol.replace('/', '_').replace(':USDT', '')
+        r = requests.get('https://contract.mexc.com/api/v1/contract/ticker',
+                         params={'symbol': ticker}, timeout=10)
+        r.raise_for_status()
+        data = r.json().get('data', {})
+        return float(data.get('ask1') or data.get('lastPrice'))
+
     def _balance_sync(self) -> float:
         ts  = str(_ts())
         sign_str = self._api_key + ts
@@ -429,6 +459,15 @@ class BitgetExchange(CcxtExchange):
         self._api_key    = keys['api_key']
         self._api_secret = keys['api_secret']
         self._passphrase = keys.get('api_password', '')
+
+    def _price_sync(self, symbol: str) -> float:
+        ticker = symbol.replace('/', '').replace(':USDT', '') + 'USDT'
+        r = requests.get('https://api.bitget.com/api/v2/mix/market/ticker',
+                         params={'symbol': ticker, 'productType': 'USDT-FUTURES'}, timeout=10)
+        r.raise_for_status()
+        data = r.json().get('data', {})
+        if isinstance(data, list): data = data[0] if data else {}
+        return float(data.get('askPrice') or data.get('lastPr'))
 
     def _balance_sync(self) -> float:
         import base64
@@ -572,8 +611,15 @@ class KucoinExchange(BaseExchange):
         return await _run_sync(_sync)
 
     async def get_price(self, symbol: str) -> float:
-        t = await self._client.fetch_ticker(self._fmt(symbol))
-        return float(t['ask'] or t['last'])
+        return await _run_sync(self._price_sync, symbol)
+
+    def _price_sync(self, symbol: str) -> float:
+        ticker = symbol.replace('/', '').replace(':USDT', '') + 'USDTM'
+        r = requests.get('https://api-futures.kucoin.com/api/v1/ticker',
+                         params={'symbol': ticker}, timeout=10)
+        r.raise_for_status()
+        data = r.json().get('data', {})
+        return float(data.get('bestAskPrice') or data.get('price'))
 
     async def get_max_position_size(self, symbol: str) -> Optional[float]:
         try:
@@ -669,6 +715,16 @@ class GateExchange(CcxtExchange):
         keys = get_exchange_keys('gate')
         self._api_key    = keys['api_key']
         self._api_secret = keys['api_secret']
+
+    def _price_sync(self, symbol: str) -> float:
+        ticker = symbol.replace('/', '_').replace(':USDT', '') + '_USDT'
+        r = requests.get('https://api.gateio.ws/api/v4/futures/usdt/tickers',
+                         params={'contract': ticker}, timeout=10)
+        r.raise_for_status()
+        items = r.json()
+        if items:
+            return float(items[0].get('lowest_ask') or items[0].get('last'))
+        raise ValueError(f"gate: no ticker data for {ticker}")
 
     def _balance_sync(self) -> float:
         import hashlib as hl
