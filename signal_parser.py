@@ -31,6 +31,8 @@ class OpenSignal:
     max_size_short: Optional[float]
     max_size_long: Optional[float]
     raw_text: str
+    interval_short: Optional[int] = None  # интервал фандинга в часах (4 или 8), None если неизвестен
+    interval_long:  Optional[int] = None
 
     @property
     def trade_size_usd(self) -> Optional[float]:
@@ -88,6 +90,7 @@ def _parse_open(text: str) -> Optional[OpenSignal]:
 
     funding_short = funding_long = None
     max_size_short = max_size_long = None
+    interval_short = interval_long = None
     for line in lines:
         if re.search(r'funding\s+' + re.escape(short_exchange), line, re.I):
             m = re.search(r'([+-]?[\d.]+)%', line)
@@ -102,6 +105,15 @@ def _parse_open(text: str) -> Optional[OpenSignal]:
                 max_size_short = val
             elif re.search(long_exchange, line, re.I):
                 max_size_long = val
+        # F/Interval MEXC : 4H | 12:00 UTC  →  парсим часы
+        m_int = re.search(r'f/interval\s+(\w+)\s*:?\s*(\d+)h', line, re.I)
+        if m_int:
+            ex_name = m_int.group(1).lower()
+            hours   = int(m_int.group(2))
+            if ex_name == short_exchange:
+                interval_short = hours
+            elif ex_name == long_exchange:
+                interval_long = hours
 
     return OpenSignal(
         ticker=ticker, symbol=normalize_symbol(ticker),
@@ -110,6 +122,7 @@ def _parse_open(text: str) -> Optional[OpenSignal]:
         spread_pct=spread_pct or 0.0,
         funding_short=funding_short, funding_long=funding_long,
         max_size_short=max_size_short, max_size_long=max_size_long,
+        interval_short=interval_short, interval_long=interval_long,
         raw_text=text,
     )
 
@@ -151,11 +164,21 @@ if __name__ == '__main__':
 #   📗 #LYN | 6.04% (355m) 📗
 #   ...
 
+def _strip_markdown(text: str) -> str:
+    """Убирает Telegram Markdown: **жирный**, ```код```, [текст](url)."""
+    import re as _re
+    text = _re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)   # [текст](url) → текст
+    text = _re.sub(r'```[^`]*```', lambda m: m.group(0).replace('`',''), text)  # ```блок```
+    text = _re.sub(r'`([^`]*)`', r'\1', text)                # `код`
+    text = text.replace('**', '').replace('__', '')           # жирный/курсив
+    return text
+
+
 def parse_pinned(text: str) -> list[OpenSignal]:
     """Парсит закреплённое сообщение с несколькими активными спредами."""
+    text = _strip_markdown(text)
     signals = []
-    # Разбиваем на блоки по разделителю ===
-    blocks = re.split(r'={5,}', text)
+    blocks = re.split(r'={3,}[-=]*', text)
     for block in blocks:
         sig = _parse_pinned_block(block.strip())
         if sig:

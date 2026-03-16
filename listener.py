@@ -23,9 +23,8 @@ from notifier import notify
 DEDUP_WINDOW_S = 120
 _seen: dict[str, float] = {}
 
-# Тикеры из закреплённого сообщения — только они разрешены для edit-сигналов
+# Тикеры из закреплённого сообщения
 _pinned_tickers: set[str] = set()
-# ID закреплённого сообщения — чтобы отличить его редактирование от обычных
 _pinned_msg_id: int | None = None
 
 
@@ -35,6 +34,58 @@ def _is_duplicate(ticker: str) -> bool:
         return True
     _seen[ticker] = now
     return False
+
+
+def _funding_ok(signal) -> tuple[bool, str]:
+    """Проверяет фандинг-фильтр. Возвращает (ok, причина).
+    Логика:
+      ✅ Условие 1: оба фандинга < 1.5% И разница < 0.2%
+      ✅ Условие 2: интервалы 4ч/8ч И:
+           - оба фандинга < 0.5% → разница < 0.3%
+           - хотя бы один ≥ 0.5% → разница < 0.2%
+      ✅ Условие 3: оба интервала 1ч И разница = 0%
+      ❌ всё остальное
+    Если фандинг неизвестен — не блокируем.
+    """
+    from settings import MAX_FUNDING_DIFF_PCT, MAX_FUNDING_ABS_PCT
+    fs = signal.funding_short
+    fl = signal.funding_long
+    if fs is None or fl is None:
+        return True, "фандинг неизвестен — не блокируем"
+
+    diff_pct  = abs(fs - fl) * 100
+    short_abs = abs(fs) * 100
+    long_abs  = abs(fl) * 100
+    i_s = signal.interval_short
+    i_l = signal.interval_long
+
+    # Условие 1: оба < 1.5% И разница < 0.2%
+    if diff_pct <= MAX_FUNDING_DIFF_PCT and short_abs < MAX_FUNDING_ABS_PCT and long_abs < MAX_FUNDING_ABS_PCT:
+        return True, f"фандинг OK: short={fs*100:+.3f}% long={fl*100:+.3f}% diff={diff_pct:.3f}%"
+
+    # Условие 2: интервалы 4ч/8ч с динамичным порогом разницы
+    if i_s in (4, 8) and i_l in (4, 8):
+        dynamic_max = 0.3 if (short_abs < 0.5 and long_abs < 0.5) else 0.2
+        if diff_pct <= dynamic_max:
+            return True, (f"фандинг исключение: short={fs*100:+.3f}% long={fl*100:+.3f}% "
+                          f"diff={diff_pct:.3f}% ≤ {dynamic_max}%, интервалы {i_s}ч/{i_l}ч")
+        return False, (f"фандинг: интервалы {i_s}ч/{i_l}ч, diff={diff_pct:.3f}% "
+                       f"> {dynamic_max}% ({'оба<0.5%→0.3%' if short_abs < 0.5 and long_abs < 0.5 else 'один≥0.5%→0.2%'})")
+
+    # Условие 3: оба интервала 1ч И разница = 0%
+    if i_s == 1 and i_l == 1:
+        if diff_pct == 0.0:
+            return True, (f"фандинг исключение 1ч/1ч: diff=0%, "
+                          f"short={fs*100:+.3f}% long={fl*100:+.3f}%")
+        return False, (f"фандинг: оба 1ч но diff={diff_pct:.3f}% ≠ 0%")
+
+    # Интервал неизвестен — применяем базовый порог 0.2%
+    if i_s is None or i_l is None:
+        if diff_pct <= MAX_FUNDING_DIFF_PCT:
+            return True, f"фандинг: diff={diff_pct:.3f}% OK, интервалы неизвестны"
+        return False, f"фандинг: diff={diff_pct:.3f}% > {MAX_FUNDING_DIFF_PCT}%, интервалы неизвестны"
+
+    return False, (f"фандинг: интервалы {i_s}ч/{i_l}ч — не 4ч/8ч/1ч, diff={diff_pct:.3f}%")
 
 
 class SignalListener:
@@ -54,6 +105,9 @@ class SignalListener:
 
         # Читаем закреплённое при старте
         await self._load_pinned()
+
+        # Порог "недавнего" сообщения — редактирования в пределах этого времени обрабатываем всегда
+        RECENT_MSG_SECONDS = 5 * 60  # 5 минут
 
         @self.client.on(events.NewMessage(chats=SIGNAL_CHANNEL))
         async def on_new(event):
@@ -75,8 +129,16 @@ class SignalListener:
                 await self._load_pinned()
                 return
 
-            # Обычное редактирование — только если тикер есть в закреплённом
-            await self._handle(event.message.text or "", received_ms, is_edit=True)
+            # Проверяем возраст сообщения
+            msg_date = event.message.date
+            if msg_date:
+                import datetime
+                age_seconds = (datetime.datetime.now(datetime.timezone.utc) - msg_date).total_seconds()
+                is_recent = age_seconds <= RECENT_MSG_SECONDS
+            else:
+                is_recent = False
+
+            await self._handle(event.message.text or "", received_ms, is_edit=True, is_recent=is_recent)
 
         await self.client.run_until_disconnected()
 
@@ -99,24 +161,40 @@ class SignalListener:
             if not msgs:
                 return
             text = msgs.text or ""
+            # DEBUG: выводим первые 300 символов сырого текста
+            print(f"[Listener] Закреплённое RAW (первые 300 симв): {repr(text[:300])}")
             signals = parse_pinned(text)
             _pinned_tickers = {s.ticker for s in signals}
             print(f"[Listener] Закреплённое: {len(signals)} спредов → тикеры: {_pinned_tickers}")
         except Exception as e:
             print(f"[Listener] Ошибка чтения закреплённого: {e}")
 
-    async def _handle(self, text: str, received_ms: int, is_edit: bool):
+    async def _handle(self, text: str, received_ms: int, is_edit: bool, is_recent: bool = False):
         signal = parse_message(text)
         if signal is None:
             return
 
         if isinstance(signal, OpenSignal):
-            # Редактирование — только если тикер есть в закреплённом
-            if is_edit and signal.ticker not in _pinned_tickers:
-                print(f"[Listener] edit {signal.ticker} — не в закреплённом, пропускаем")
+            in_pinned = signal.ticker in _pinned_tickers
+
+            if is_edit:
+                if is_recent:
+                    source = "edit+recent"
+                elif in_pinned:
+                    source = "edit+pinned"
+                else:
+                    print(f"[Listener] edit {signal.ticker} — не в закреплённом и не свежее, пропускаем")
+                    return
+            else:
+                source = "new"
+
+            # Фандинг-фильтр применяется ко ВСЕМ типам сообщений
+            ok, reason = _funding_ok(signal)
+            if not ok:
+                print(f"[Listener] [{source}] {signal.ticker} — {reason}, пропускаем")
                 return
-            source = "edit" if is_edit else "new"
-            print(f"[Listener] [{source}] OPEN {signal.ticker} {signal.short_exchange}↕{signal.long_exchange} {signal.spread_pct:.2f}%")
+
+            print(f"[Listener] [{source}] OPEN {signal.ticker} {signal.short_exchange}↕{signal.long_exchange} {signal.spread_pct:.2f}% | {reason}")
             await self._open(signal, received_ms)
 
         elif isinstance(signal, CloseSignal):

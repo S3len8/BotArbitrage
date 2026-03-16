@@ -42,19 +42,31 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
 
     # Замеряем время каждой ноги отдельно
     t_before = _ms()
-    short_r, long_r = await asyncio.gather(
-        short_ex.place_market_order(signal.symbol, 'sell', final_size_usd),
-        long_ex.place_market_order( signal.symbol, 'buy',  final_size_usd),
-        return_exceptions=True,
-    )
+    try:
+        short_r, long_r = await asyncio.wait_for(
+            asyncio.gather(
+                short_ex.place_market_order(signal.symbol, 'sell', final_size_usd),
+                long_ex.place_market_order( signal.symbol, 'buy',  final_size_usd),
+                return_exceptions=True,
+            ),
+            timeout=30
+        )
+    except asyncio.TimeoutError:
+        trade.status = 'failed'
+        save_trade(trade)
+        print(f"[Executor] TIMEOUT place_market_order для {signal.ticker}")
+        await _close(short_ex, long_ex)
+        return None, f"⏱ Таймаут открытия {signal.ticker} (30с)"
     t_after = _ms()
-
-    # Время от сигнала до исполнения (обе ноги запускаются параллельно,
-    # поэтому время одинаковое — это время параллельного gather)
     exec_ms = t_after - t0
 
     short_ok = not isinstance(short_r, Exception)
     long_ok  = not isinstance(long_r,  Exception)
+
+    if not short_ok:
+        print(f"[Executor] SHORT ошибка {signal.short_exchange}: {short_r}")
+    if not long_ok:
+        print(f"[Executor] LONG ошибка {signal.long_exchange}: {long_r}")
 
     if short_ok and long_ok:
         trade.short_order_id    = short_r['order_id'];  trade.short_entry_price = short_r['price']

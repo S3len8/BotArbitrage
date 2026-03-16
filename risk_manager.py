@@ -101,21 +101,36 @@ async def check_signal(signal: OpenSignal, short_ex: BaseExchange, long_ex: Base
         return RiskResult(ok=False, reason=f"Спред упал до {real_spread:.3f}% (мин {MIN_SPREAD_PCT}%). {signal.ticker} пропущен.")
 
     # 5b. Фандинг-фильтр
-    fs = signal.funding_short  # уже в долях (0.002 = 0.2%)
+    fs = signal.funding_short
     fl = signal.funding_long
     if fs is not None and fl is not None:
         diff_pct  = abs(fs - fl) * 100
         short_abs = abs(fs) * 100
         long_abs  = abs(fl) * 100
-        # Пропускаем только если: разница <= MAX_FUNDING_DIFF_PCT ИЛИ оба абс < MAX_FUNDING_ABS_PCT
-        passes_diff = diff_pct  <= MAX_FUNDING_DIFF_PCT
-        passes_abs  = short_abs <= MAX_FUNDING_ABS_PCT and long_abs <= MAX_FUNDING_ABS_PCT
-        if not passes_diff and not passes_abs:
+        i_s = signal.interval_short
+        i_l = signal.interval_long
+
+        # Условие 1: оба < 1.5% И разница < 0.2%
+        passes = diff_pct <= MAX_FUNDING_DIFF_PCT and short_abs < MAX_FUNDING_ABS_PCT and long_abs < MAX_FUNDING_ABS_PCT
+
+        # Условие 2: интервалы 4ч/8ч с динамическим порогом
+        if not passes and i_s in (4, 8) and i_l in (4, 8):
+            max_diff = 0.3 if (short_abs < 0.5 and long_abs < 0.5) else 0.2
+            passes   = diff_pct <= max_diff
+
+        # Условие 3: оба интервала 1ч И разница = 0%
+        if not passes and i_s == 1 and i_l == 1:
+            passes = diff_pct == 0.0
+
+        # Интервал неизвестен — базовый порог 0.2%
+        if not passes and (i_s is None or i_l is None):
+            passes = diff_pct <= MAX_FUNDING_DIFF_PCT
+
+        if not passes:
             return RiskResult(ok=False, reason=(
-                f"Фандинг не прошёл фильтр: "
-                f"short={fs*100:+.3f}% long={fl*100:+.3f}% "
-                f"разница={diff_pct:.3f}% (макс {MAX_FUNDING_DIFF_PCT}%), "
-                f"абс макс {MAX_FUNDING_ABS_PCT}%. {signal.ticker} пропущен."
+                f"Фандинг не прошёл: short={fs*100:+.3f}% long={fl*100:+.3f}% "
+                f"разница={diff_pct:.3f}%, интервалы {i_s}ч/{i_l}ч. "
+                f"{signal.ticker} пропущен."
             ))
 
     # 6. Проверка объёма (если MIN_VOLUME_USD > 0)
