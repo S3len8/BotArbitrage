@@ -72,12 +72,14 @@ def _funding_ok(signal) -> tuple[bool, str]:
         return False, (f"фандинг: интервалы {i_s}ч/{i_l}ч, diff={diff_pct:.3f}% "
                        f"> {dynamic_max}% ({'оба<0.5%→0.3%' if short_abs < 0.5 and long_abs < 0.5 else 'один≥0.5%→0.2%'})")
 
-    # Условие 3: оба интервала 1ч И разница = 0%
+    # Условие 3: оба интервала 1ч, оба фандинга < 0.5%, разница < 0.15%
     if i_s == 1 and i_l == 1:
-        if diff_pct == 0.0:
-            return True, (f"фандинг исключение 1ч/1ч: diff=0%, "
-                          f"short={fs*100:+.3f}% long={fl*100:+.3f}%")
-        return False, (f"фандинг: оба 1ч но diff={diff_pct:.3f}% ≠ 0%")
+        if short_abs < 0.5 and long_abs < 0.5 and diff_pct < 0.15:
+            return True, (f"фандинг исключение 1ч/1ч: "
+                          f"short={fs*100:+.3f}% long={fl*100:+.3f}% diff={diff_pct:.3f}%")
+        return False, (f"фандинг: 1ч/1ч но не прошёл — "
+                       f"short={fs*100:+.3f}% long={fl*100:+.3f}% diff={diff_pct:.3f}% "
+                       f"(нужно: оба<0.5% и diff<0.15%)")
 
     # Интервал неизвестен — применяем базовый порог 0.2%
     if i_s is None or i_l is None:
@@ -253,7 +255,7 @@ class SignalListener:
             print(f"[Listener] Ошибка open_position {signal.ticker}: {e}")
             await notify(f"❌ Ошибка при открытии {signal.ticker}: {e}")
             return
-        await notify(msg)
+        # notify уже вызван внутри open_position с кнопкой TradingView
 
     async def _close(self, signal: CloseSignal):
         try:

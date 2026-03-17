@@ -118,9 +118,9 @@ async def check_signal(signal: OpenSignal, short_ex: BaseExchange, long_ex: Base
             max_diff = 0.3 if (short_abs < 0.5 and long_abs < 0.5) else 0.2
             passes   = diff_pct <= max_diff
 
-        # Условие 3: оба интервала 1ч И разница = 0%
+        # Условие 3: оба интервала 1ч, оба фандинга < 0.5%, разница < 0.15%
         if not passes and i_s == 1 and i_l == 1:
-            passes = diff_pct == 0.0
+            passes = short_abs < 0.5 and long_abs < 0.5 and diff_pct < 0.15
 
         # Интервал неизвестен — базовый порог 0.2%
         if not passes and (i_s is None or i_l is None):

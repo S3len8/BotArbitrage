@@ -11,7 +11,7 @@ from typing import Optional
 from exchanges import create_exchange
 from db import Trade, save_trade, update_trade, get_open_trade, save_balance_snapshot
 from signal_parser import OpenSignal, CloseSignal
-from notifier import notify
+from notifier import notify, tradingview_url
 from settings import LEVERAGE, BALANCE_ALERT_PCT
 
 
@@ -76,12 +76,16 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
         trade.exec_time_short_ms = exec_ms
         trade.exec_time_long_ms  = exec_ms
         save_trade(trade)
+        tv_url = tradingview_url(signal.short_exchange, signal.long_exchange, signal.ticker)
         msg = (f"✅ <b>Открыто: {signal.ticker}</b>\n"
                f"📉 SHORT {signal.short_exchange.upper()}: {trade.short_qty:.6f} @ ${trade.short_entry_price:.6f}\n"
                f"📈 LONG  {signal.long_exchange.upper()}: {trade.long_qty:.6f} @ ${trade.long_entry_price:.6f}\n"
                f"💵 Размер: ${final_size_usd:.2f} | Плечо: {LEVERAGE}×\n"
                f"📊 Спред: {signal.spread_pct:.2f}%\n"
                f"⚡ Исполнение: {exec_ms}мс от сигнала")
+        await _close(short_ex, long_ex)
+        await notify(msg, tv_url=tv_url)
+        return trade, msg
 
     elif short_ok:
         try: await short_ex.close_position(signal.symbol, 'buy', short_r['qty'])
