@@ -100,37 +100,41 @@ async def check_signal(signal: OpenSignal, short_ex: BaseExchange, long_ex: Base
     if real_spread < MIN_SPREAD_PCT:
         return RiskResult(ok=False, reason=f"Спред упал до {real_spread:.3f}% (мин {MIN_SPREAD_PCT}%). {signal.ticker} пропущен.")
 
-    # 5b. Фандинг-фильтр
+    # 5b. Фандинг-фильтр (синхронизирован с listener._funding_ok)
     fs = signal.funding_short
     fl = signal.funding_long
     if fs is not None and fl is not None:
         diff_pct  = abs(fs - fl) * 100
         short_abs = abs(fs) * 100
         long_abs  = abs(fl) * 100
+        max_abs   = max(short_abs, long_abs)
         i_s = signal.interval_short
         i_l = signal.interval_long
+        passes = False
 
-        # Условие 1: оба < 1.5% И разница < 0.2%
-        passes = diff_pct <= MAX_FUNDING_DIFF_PCT and short_abs < MAX_FUNDING_ABS_PCT and long_abs < MAX_FUNDING_ABS_PCT
+        # 1H/4H смешанные — не берём (медиана 3353м)
+        if i_s is not None and i_l is not None and {i_s, i_l} in [({1,4}),({1,8}),({2,4}),({2,8}),({2,1})]:
+            passes = False
 
-        # Условие 2: интервалы 4ч/8ч с динамическим порогом
-        if not passes and i_s in (4, 8) and i_l in (4, 8):
-            max_diff = 0.3 if (short_abs < 0.5 and long_abs < 0.5) else 0.2
-            passes   = diff_pct <= max_diff
+        # 4H/4H, 8H/8H, 4H/8H
+        elif i_s in (4, 8) and i_l in (4, 8):
+            if diff_pct < 0.1:
+                passes = True
+            elif diff_pct < 0.2 and max_abs < MAX_FUNDING_ABS_PCT:
+                passes = True
 
-        # Условие 3: оба интервала 1ч, оба фандинга < 0.5%, разница < 0.15%
-        if not passes and i_s == 1 and i_l == 1:
-            passes = short_abs < 0.5 and long_abs < 0.5 and diff_pct < 0.15
+        # 1H/1H — только diff=0% и оба abs<0.3%
+        elif i_s == 1 and i_l == 1:
+            passes = diff_pct == 0.0 and short_abs < 0.3 and long_abs < 0.3
 
-        # Интервал неизвестен — базовый порог 0.2%
-        if not passes and (i_s is None or i_l is None):
-            passes = diff_pct <= MAX_FUNDING_DIFF_PCT
+        # Интервал неизвестен — строгий порог diff<0.1%
+        elif i_s is None or i_l is None:
+            passes = diff_pct < 0.1 and max_abs < MAX_FUNDING_ABS_PCT
 
         if not passes:
             return RiskResult(ok=False, reason=(
                 f"Фандинг не прошёл: short={fs*100:+.3f}% long={fl*100:+.3f}% "
-                f"разница={diff_pct:.3f}%, интервалы {i_s}ч/{i_l}ч. "
-                f"{signal.ticker} пропущен."
+                f"diff={diff_pct:.3f}%, int={i_s}ч/{i_l}ч. {signal.ticker} пропущен."
             ))
 
     # 6. Проверка объёма (если MIN_VOLUME_USD > 0)

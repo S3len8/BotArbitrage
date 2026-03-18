@@ -263,6 +263,67 @@ class BinanceExchange(CcxtExchange):
         await _run_sync(_sync)
         print(f"[binance] {ticker}: ISOLATED, {LEVERAGE}×")
 
+    def _binance_order_sync(self, symbol: str, side: str, size_usd: float,
+                            reduce_only: bool = False, price: float = None) -> dict:
+        """Размещает рыночный ордер Binance Futures через прямой REST."""
+        ticker = symbol.replace('/', '').replace(':USDT', '')
+        if price is None:
+            price = self._price_sync(symbol)
+        # Получаем минимальный шаг количества
+        ts  = _ts()
+        msg = f"symbol={ticker}&timestamp={ts}&recvWindow=5000"
+        sig = _sign_hmac_sha256(self._api_secret, msg)
+        try:
+            ei = requests.get('https://fapi.binance.com/fapi/v1/exchangeInfo', timeout=10)
+            symbols = ei.json().get('symbols', [])
+            step = 0.001
+            for s in symbols:
+                if s['symbol'] == ticker:
+                    for f in s.get('filters', []):
+                        if f['filterType'] == 'LOT_SIZE':
+                            step = float(f['stepSize'])
+            qty = _round(size_usd / price, step)
+        except Exception:
+            qty = round(size_usd / price, 3)
+
+        ts2  = _ts()
+        params = {
+            'symbol':     ticker,
+            'side':       'SELL' if side == 'sell' else 'BUY',
+            'type':       'MARKET',
+            'quantity':   qty,
+            'timestamp':  ts2,
+            'recvWindow': 5000,
+        }
+        if reduce_only:
+            params['reduceOnly'] = 'true'
+        qs  = '&'.join(f"{k}={v}" for k, v in params.items())
+        sig = _sign_hmac_sha256(self._api_secret, qs)
+        params['signature'] = sig
+        r = requests.post('https://fapi.binance.com/fapi/v1/order',
+                          headers={'X-MBX-APIKEY': self._api_key},
+                          params=params, timeout=15)
+        r.raise_for_status()
+        d = r.json()
+        if 'code' in d and d['code'] < 0:
+            raise ValueError(f"binance order error: {d.get('msg')} code={d['code']}")
+        fill_price = float(d.get('avgPrice') or d.get('price') or price or 0)
+        return {
+            'order_id': str(d.get('orderId', '')),
+            'price':    fill_price,
+            'qty':      float(d.get('executedQty') or qty),
+            'fee':      0.0,
+        }
+
+    async def place_market_order(self, symbol: str, side: str, size_usd: float) -> dict:
+        await self._setup_symbol(symbol)
+        return await _run_sync(self._binance_order_sync, symbol, side, size_usd)
+
+    async def close_position(self, symbol: str, side: str, qty: float) -> dict:
+        price = await self.get_price(symbol)
+        return await _run_sync(self._binance_order_sync, symbol, side,
+                               qty * price, reduce_only=True, price=price)
+
     def _open_params(self, side): return {'type': 'MARKET'}
 
 
@@ -473,6 +534,46 @@ class MexcExchange(CcxtExchange):
 
         await _run_sync(_sync)
         print(f"[mexc] {ticker}: ISOLATED, {LEVERAGE}×")
+
+    def _mexc_order_sync(self, symbol: str, side: str, size_usd: float,
+                         reduce_only: bool = False, price: float = None) -> dict:
+        """Размещает рыночный ордер MEXC через Contract API."""
+        ticker = _mexc_ticker(symbol)
+        if price is None:
+            price = self._price_sync(symbol)
+        qty = max(1, int(size_usd / price))
+
+        ts  = str(_ts())
+        sig = _sign_hmac_sha256(self._api_secret, self._api_key + ts)
+        headers = {
+            'ApiKey':       self._api_key,
+            'Request-Time': ts,
+            'Signature':    sig,
+            'Content-Type': 'application/json',
+        }
+        # MEXC Contract: side 1=open long, 2=close long, 3=open short, 4=close short
+        if reduce_only:
+            order_side = 4 if side == 'sell' else 2
+        else:
+            order_side = 3 if side == 'sell' else 1
+
+        body = {
+            'symbol':    ticker,
+            'price':     price,
+            'vol':       qty,
+            'side':      order_side,
+            'type':      5,       # 5 = market order
+            'openType':  2,       # 2 = isolated
+            'leverage':  LEVERAGE,
+        }
+        r = requests.post('https://contract.mexc.com/api/v1/private/order/submit',
+                          headers=headers, json=body, timeout=15)
+        r.raise_for_status()
+        d = r.json()
+        if not d.get('success'):
+            raise ValueError(f"mexc order error: {d.get('code')} {d.get('message')}")
+        order_id = str(d.get('data', ''))
+        return {'order_id': order_id, 'price': price, 'qty': float(qty), 'fee': 0.0}
 
     async def place_market_order(self, symbol: str, side: str, size_usd: float) -> dict:
         await self._setup_symbol(symbol)
@@ -875,28 +976,44 @@ class GateExchange(CcxtExchange):
 
     def _gate_order_sync(self, symbol: str, side: str, size_usd: float,
                          reduce_only: bool = False, price: float = None) -> dict:
-        """Размещает рыночный ордер Gate через прямой REST."""
+        """Размещает рыночный ордер Gate через прямой REST.
+        Leverage передаётся прямо в теле ордера — единственный надёжный способ
+        для новых позиций (endpoint /positions/{contract}/leverage работает только
+        для уже открытых позиций).
+        """
         import hashlib as hl, json as _json
         ticker = _gate_ticker(symbol)
         if price is None:
             price = self._price_sync(symbol)
+
+        # Ограничиваем size_usd реальным балансом × leverage × 90%
+        if not reduce_only:
+            try:
+                available = self._balance_sync()
+                max_notional = available * LEVERAGE * 0.90
+                if size_usd > max_notional:
+                    print(f"[gate] size ${size_usd:.2f} > max ${max_notional:.2f} (баланс ${available:.2f}×{LEVERAGE}×90%), обрезаем")
+                    size_usd = max_notional
+            except Exception as e:
+                print(f"[gate] balance check failed: {e}")
+
         qty = max(1, int(size_usd / price))
 
         ts     = str(int(time.time()))
         method = 'POST'
         path   = '/api/v4/futures/usdt/orders'
-        # Gate: size отрицательный = short/sell, положительный = long/buy
-        # market order = price "0" + tif "ioc"
-        size = -qty if side == 'sell' else qty
+        size   = -qty if side == 'sell' else qty
         body_d: dict = {
-            'contract': ticker,
-            'size':     size,
-            'price':    '0',
-            'tif':      'ioc',
-            'text':     't-arb',
+            'contract':  ticker,
+            'size':      size,
+            'price':     '0',
+            'tif':       'ioc',
+            'text':      't-arb',
+            'leverage':  str(LEVERAGE),   # ← передаём leverage в ордере
         }
         if reduce_only:
             body_d['reduce_only'] = True
+            body_d.pop('leverage', None)  # reduce_only не нужен leverage
 
         body      = _json.dumps(body_d)
         body_hash = hl.sha512(body.encode()).hexdigest()

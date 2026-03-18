@@ -5,15 +5,27 @@ load_dotenv()
 
 LEVERAGE:            int   = int(os.getenv("LEVERAGE", "5"))
 PROXY:               str   = os.getenv("PROXY", "")
-MIN_SPREAD_PCT:      float = float(os.getenv("MIN_SPREAD_PCT", "0.5"))
+# Минимальный спред: данные показывают что от 4% спреды закрываются вдвое быстрее
+# (медиана 97м vs 300м при 3%), 63% за 4ч vs 48%
+MIN_SPREAD_PCT:      float = float(os.getenv("MIN_SPREAD_PCT", "4.0"))
 MIN_VOLUME_USD:      float = float(os.getenv("MIN_VOLUME_USD", "500000"))
 MAX_OPEN_POSITIONS:  int   = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 BALANCE_ALERT_PCT:   float = float(os.getenv("BALANCE_ALERT_PCT", "50"))
-# Фандинг-фильтр: пропускаем сделку если оба условия НЕ выполнены:
-#   1) разница фандинга между биржами <= MAX_FUNDING_DIFF_PCT
-#   2) оба фандинга по абсолютной величине < MAX_FUNDING_ABS_PCT
-MAX_FUNDING_DIFF_PCT: float = float(os.getenv("MAX_FUNDING_DIFF_PCT", "0.2"))
+
+# ── Фандинг-фильтр ────────────────────────────────────────────
+# Данные: diff<0.1% → медиана закрытия 69м (отлично)
+#         diff 0.1-0.2% → 491м (приемлемо)
+#         diff 0.2-0.3% → 785м (плохо)
+#         diff>0.3% → 1351м (очень плохо)
+MAX_FUNDING_DIFF_PCT: float = float(os.getenv("MAX_FUNDING_DIFF_PCT", "0.1"))  # было 0.2
 MAX_FUNDING_ABS_PCT:  float = float(os.getenv("MAX_FUNDING_ABS_PCT", "1.5"))
+
+# ── Интервальные исключения ────────────────────────────────────
+# 4H/4H: медиана закрытия 102м, 62% за 4ч — лучший вариант, берём при diff<0.2%
+# 1H/1H: медиана 4493м (75ч!) — крайне плохо, брать только при diff=0% и abs<0.3%
+# 1H/4H: медиана 3353м — плохо, не брать
+# Разрешённые интервалы для торговли
+ALLOWED_INTERVALS: set = {4, 8}  # 1H только при строгих условиях
 
 DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/arb_bot")
 

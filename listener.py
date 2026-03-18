@@ -37,17 +37,28 @@ def _is_duplicate(ticker: str) -> bool:
 
 
 def _funding_ok(signal) -> tuple[bool, str]:
-    """Проверяет фандинг-фильтр. Возвращает (ok, причина).
-    Логика:
-      ✅ Условие 1: оба фандинга < 1.5% И разница < 0.2%
-      ✅ Условие 2: интервалы 4ч/8ч И:
-           - оба фандинга < 0.5% → разница < 0.3%
-           - хотя бы один ≥ 0.5% → разница < 0.2%
-      ✅ Условие 3: оба интервала 1ч И разница = 0%
-      ❌ всё остальное
-    Если фандинг неизвестен — не блокируем.
+    """Фандинг-фильтр на основе анализа 40,000+ закрытий спредов.
+
+    Данные показывают:
+      diff<0.1%  → медиана закрытия 69м   (отлично)
+      diff<0.2%  → медиана 491м            (приемлемо)
+      diff>0.2%  → медиана 785м+           (плохо, фандинг съедает прибыль)
+
+      4H/4H      → медиана 102м, 62% за 4ч (лучший вариант)
+      1H/1H      → медиана 4493м (75ч!)    (очень плохо — спреды зависают)
+      1H/4H mix  → медиана 3353м           (плохо, не берём)
+
+    Правила:
+      ✅ 4H/4H или 8H/8H или 4H/8H:
+           diff < 0.1%                      → берём (быстро закроется)
+           diff 0.1-0.2% и оба abs < 1.5%  → берём (приемлемо)
+           diff 0.1-0.2% и один abs ≥ 1.5% → НЕ берём
+           diff ≥ 0.2%                      → НЕ берём
+      ✅ 1H/1H: только если оба abs < 0.3% И diff = 0%
+      ❌ 1H/4H или 1H/8H mix               → НЕ берём (медиана 3353м)
+      ❌ Интервал неизвестен: diff < 0.1%   → берём, иначе нет
     """
-    from settings import MAX_FUNDING_DIFF_PCT, MAX_FUNDING_ABS_PCT
+    from settings import MAX_FUNDING_ABS_PCT
     fs = signal.funding_short
     fl = signal.funding_long
     if fs is None or fl is None:
@@ -56,38 +67,41 @@ def _funding_ok(signal) -> tuple[bool, str]:
     diff_pct  = abs(fs - fl) * 100
     short_abs = abs(fs) * 100
     long_abs  = abs(fl) * 100
+    max_abs   = max(short_abs, long_abs)
     i_s = signal.interval_short
     i_l = signal.interval_long
 
-    # Условие 1: оба < 1.5% И разница < 0.2%
-    if diff_pct <= MAX_FUNDING_DIFF_PCT and short_abs < MAX_FUNDING_ABS_PCT and long_abs < MAX_FUNDING_ABS_PCT:
-        return True, f"фандинг OK: short={fs*100:+.3f}% long={fl*100:+.3f}% diff={diff_pct:.3f}%"
+    info = f"short={fs*100:+.3f}% long={fl*100:+.3f}% diff={diff_pct:.3f}% int={i_s}ч/{i_l}ч"
 
-    # Условие 2: интервалы 4ч/8ч с динамичным порогом разницы
+    # 1H/4H смешанные — медиана 3353м, не берём
+    if i_s is not None and i_l is not None:
+        if {i_s, i_l} in [({1, 4}), ({1, 8}), ({2, 4}), ({2, 8}), ({2, 1})]:
+            return False, f"смешанные интервалы {i_s}ч/{i_l}ч — медиана закрытия 3353м, {info}"
+
+    # 4H/4H, 8H/8H, 4H/8H — лучшие интервалы
     if i_s in (4, 8) and i_l in (4, 8):
-        dynamic_max = 0.3 if (short_abs < 0.5 and long_abs < 0.5) else 0.2
-        if diff_pct <= dynamic_max:
-            return True, (f"фандинг исключение: short={fs*100:+.3f}% long={fl*100:+.3f}% "
-                          f"diff={diff_pct:.3f}% ≤ {dynamic_max}%, интервалы {i_s}ч/{i_l}ч")
-        return False, (f"фандинг: интервалы {i_s}ч/{i_l}ч, diff={diff_pct:.3f}% "
-                       f"> {dynamic_max}% ({'оба<0.5%→0.3%' if short_abs < 0.5 and long_abs < 0.5 else 'один≥0.5%→0.2%'})")
+        if diff_pct < 0.1:
+            return True, f"4/8H: diff<0.1% ✅ {info}"
+        if diff_pct < 0.2 and max_abs < MAX_FUNDING_ABS_PCT:
+            return True, f"4/8H: diff<0.2% и abs<{MAX_FUNDING_ABS_PCT}% ✅ {info}"
+        if diff_pct >= 0.2:
+            return False, f"4/8H: diff≥0.2% — медиана закрытия 785м+ ❌ {info}"
+        return False, f"4/8H: diff<0.2% но abs≥{MAX_FUNDING_ABS_PCT}% ❌ {info}"
 
-    # Условие 3: оба интервала 1ч, оба фандинга < 0.5%, разница < 0.15%
+    # 1H/1H — только при нулевой разнице и малом фандинге (медиана 4493м иначе)
     if i_s == 1 and i_l == 1:
-        if short_abs < 0.5 and long_abs < 0.5 and diff_pct < 0.15:
-            return True, (f"фандинг исключение 1ч/1ч: "
-                          f"short={fs*100:+.3f}% long={fl*100:+.3f}% diff={diff_pct:.3f}%")
-        return False, (f"фандинг: 1ч/1ч но не прошёл — "
-                       f"short={fs*100:+.3f}% long={fl*100:+.3f}% diff={diff_pct:.3f}% "
-                       f"(нужно: оба<0.5% и diff<0.15%)")
+        if diff_pct == 0.0 and short_abs < 0.3 and long_abs < 0.3:
+            return True, f"1H/1H: diff=0% и оба<0.3% ✅ {info}"
+        return False, f"1H/1H — медиана закрытия 4493м ❌ {info}"
 
-    # Интервал неизвестен — применяем базовый порог 0.2%
+    # Интервал неизвестен — строгий порог
     if i_s is None or i_l is None:
-        if diff_pct <= MAX_FUNDING_DIFF_PCT:
-            return True, f"фандинг: diff={diff_pct:.3f}% OK, интервалы неизвестны"
-        return False, f"фандинг: diff={diff_pct:.3f}% > {MAX_FUNDING_DIFF_PCT}%, интервалы неизвестны"
+        if diff_pct < 0.1 and max_abs < MAX_FUNDING_ABS_PCT:
+            return True, f"интервал неизвестен: diff<0.1% ✅ {info}"
+        return False, f"интервал неизвестен: diff≥0.1% ❌ {info}"
 
-    return False, (f"фандинг: интервалы {i_s}ч/{i_l}ч — не 4ч/8ч/1ч, diff={diff_pct:.3f}%")
+    # Всё остальное (2H, 24H и т.д.) — не берём
+    return False, f"интервалы {i_s}ч/{i_l}ч не поддерживаются ❌ {info}"
 
 
 class SignalListener:
