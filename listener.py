@@ -27,6 +27,48 @@ _seen: dict[str, float] = {}
 _pinned_tickers: set[str] = set()
 _pinned_msg_id: int | None = None
 
+# Дедупликация MEXC уведомлений — не спамим одним тикером
+_mexc_notified: dict[str, float] = {}
+MEXC_NOTIFY_WINDOW_S = 300  # не повторять уведомление 5 минут
+
+
+async def _notify_mexc(signal, reason: str = None):
+    """Отправляет уведомление о MEXC сигнале без открытия сделки."""
+    now = time.time()
+    key = f"{signal.ticker}_{signal.short_exchange}_{signal.long_exchange}"
+    if now - _mexc_notified.get(key, 0) < MEXC_NOTIFY_WINDOW_S:
+        return
+    _mexc_notified[key] = now
+
+    other_ex = signal.long_exchange if signal.short_exchange == 'mexc' else signal.short_exchange
+    fs = f"{signal.funding_short*100:+.3f}%" if signal.funding_short is not None else "—"
+    fl = f"{signal.funding_long*100:+.3f}%" if signal.funding_long is not None else "—"
+    i_s = f"{signal.interval_short}ч" if signal.interval_short else "—"
+    i_l = f"{signal.interval_long}ч" if signal.interval_long else "—"
+
+    msg = (f"👁 <b>MEXC сигнал: {signal.ticker}</b>\n"
+           f"📊 Спред: {signal.spread_pct:.2f}%\n"
+           f"📉 Short: {signal.short_exchange.upper()} @ ${signal.short_price:.6f}\n"
+           f"📈 Long:  {signal.long_exchange.upper()} @ ${signal.long_price:.6f}\n"
+           f"💸 Фандинг: {fs} / {fl} | Интервалы: {i_s}/{i_l}")
+    if reason:
+        msg += f"\n⚠️ Причина пропуска: {reason}"
+    msg += f"\n\n⚠️ <i>MEXC API не поддерживает торговлю — открой вручную</i>"
+
+    from notifier import tradingview_url, exchange_url
+    tv_url   = tradingview_url(signal.short_exchange, signal.long_exchange, signal.ticker)
+    short_url = exchange_url(signal.short_exchange, signal.ticker)
+    long_url  = exchange_url(signal.long_exchange, signal.ticker)
+
+    buttons = []
+    if short_url:
+        buttons.append({"text": f"📉 {signal.short_exchange.upper()}", "url": short_url})
+    if long_url:
+        buttons.append({"text": f"📈 {signal.long_exchange.upper()}", "url": long_url})
+
+    await notify(msg, tv_url=tv_url, buttons=buttons)
+    print(f"[MEXC] Уведомление отправлено: {signal.ticker} {signal.short_exchange}↕{signal.long_exchange}")
+
 
 def _is_duplicate(ticker: str) -> bool:
     now = time.time()
@@ -192,6 +234,8 @@ class SignalListener:
 
         if isinstance(signal, OpenSignal):
             in_pinned = signal.ticker in _pinned_tickers
+            is_mexc   = 'mexc' in (signal.short_exchange, signal.long_exchange)
+            other_ex  = signal.long_exchange if signal.short_exchange == 'mexc' else signal.short_exchange
 
             if is_edit:
                 if is_recent:
@@ -199,6 +243,9 @@ class SignalListener:
                 elif in_pinned:
                     source = "edit+pinned"
                 else:
+                    # Если сигнал с MEXC — отправляем инфо-уведомление
+                    if is_mexc:
+                        await _notify_mexc(signal)
                     print(f"[Listener] edit {signal.ticker} — не в закреплённом и не свежее, пропускаем")
                     return
             else:
@@ -207,7 +254,15 @@ class SignalListener:
             # Фандинг-фильтр применяется ко ВСЕМ типам сообщений
             ok, reason = _funding_ok(signal)
             if not ok:
+                if is_mexc:
+                    await _notify_mexc(signal, reason=reason)
                 print(f"[Listener] [{source}] {signal.ticker} — {reason}, пропускаем")
+                return
+
+            # Если одна из бирж MEXC — только уведомление, не торгуем
+            if is_mexc:
+                await _notify_mexc(signal)
+                print(f"[Listener] [{source}] MEXC сигнал {signal.ticker} — уведомление отправлено, торговля пропущена")
                 return
 
             print(f"[Listener] [{source}] OPEN {signal.ticker} {signal.short_exchange}↕{signal.long_exchange} {signal.spread_pct:.2f}% | {reason}")

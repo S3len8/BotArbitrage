@@ -90,6 +90,14 @@ def _mexc_ticker(symbol: str) -> str:
     return s + '_USDT'
 
 
+def _bitget_ticker(symbol: str) -> str:
+    """Конвертирует символ в формат Bitget: BASUSDT или BAS/USDT:USDT → BASUSDT (без подчёркивания)"""
+    s = symbol.replace('/', '').replace(':USDT', '')
+    # Убираем USDT если уже есть, добавляем обратно
+    s = _re_ticker.sub(r'USDT$', '', s)
+    return s + 'USDT'
+
+
 # ── Базовый ccxt адаптер (торговые операции) ──────────────────
 
 class CcxtExchange(BaseExchange):
@@ -320,9 +328,51 @@ class BinanceExchange(CcxtExchange):
         return await _run_sync(self._binance_order_sync, symbol, side, size_usd)
 
     async def close_position(self, symbol: str, side: str, qty: float) -> dict:
-        price = await self.get_price(symbol)
-        return await _run_sync(self._binance_order_sync, symbol, side,
-                               qty * price, reduce_only=True, price=price)
+        """Закрывает позицию. qty — количество монет (не USD)."""
+        def _close_sync():
+            ticker = symbol.replace('/', '').replace(':USDT', '')
+            # Получаем step size для правильного округления
+            try:
+                ei = requests.get('https://fapi.binance.com/fapi/v1/exchangeInfo', timeout=10)
+                step = 0.001
+                for s in ei.json().get('symbols', []):
+                    if s['symbol'] == ticker:
+                        for f in s.get('filters', []):
+                            if f['filterType'] == 'LOT_SIZE':
+                                step = float(f['stepSize'])
+                qty_rounded = _round(qty, step)
+            except Exception:
+                qty_rounded = round(qty, 3)
+
+            if qty_rounded <= 0:
+                raise ValueError(f"binance close: qty={qty_rounded} <= 0")
+
+            ts  = _ts()
+            params = {
+                'symbol':      ticker,
+                'side':        'BUY' if side == 'buy' else 'SELL',
+                'type':        'MARKET',
+                'quantity':    qty_rounded,
+                'reduceOnly':  'true',
+                'timestamp':   ts,
+                'recvWindow':  5000,
+            }
+            qs  = '&'.join(f"{k}={v}" for k, v in params.items())
+            sig = _sign_hmac_sha256(self._api_secret, qs)
+            params['signature'] = sig
+            r = requests.post('https://fapi.binance.com/fapi/v1/order',
+                              headers={'X-MBX-APIKEY': self._api_key},
+                              params=params, timeout=15)
+            r.raise_for_status()
+            d = r.json()
+            if 'code' in d and d['code'] < 0:
+                raise ValueError(f"binance close error: {d.get('msg')}")
+            return {
+                'order_id': str(d.get('orderId', '')),
+                'price':    float(d.get('avgPrice') or d.get('price') or 0),
+                'fee':      0.0,
+            }
+        return await _run_sync(_close_sync)
 
     def _open_params(self, side): return {'type': 'MARKET'}
 
@@ -461,6 +511,20 @@ class MexcExchange(CcxtExchange):
         keys = get_exchange_keys('mexc')
         self._api_key    = keys['api_key']
         self._api_secret = keys['api_secret']
+        self._user_id    = keys.get('user_id', '')
+
+    def _mexc_sign(self, ts: str, body_str: str = '') -> str:
+        """MEXC Contract API подпись: HMAC-SHA256(secret, apiKey + ts)
+        userId только для MetaScalp UI, не входит в подпись."""
+        return _sign_hmac_sha256(self._api_secret, self._api_key + ts)
+
+    def _mexc_headers(self, ts: str, body_str: str = '') -> dict:
+        return {
+            'ApiKey':       self._api_key,
+            'Request-Time': ts,
+            'Signature':    self._mexc_sign(ts),
+            'Content-Type': 'application/json',
+        }
 
     def _price_sync(self, symbol: str) -> float:
         ticker = _mexc_ticker(symbol)
@@ -475,16 +539,9 @@ class MexcExchange(CcxtExchange):
         return float(price)
 
     def _balance_sync(self) -> float:
-        ts  = str(_ts())
-        sign_str = self._api_key + ts
-        sig = _sign_hmac_sha256(self._api_secret, sign_str)
+        ts   = str(_ts())
         data = _req('GET', 'https://contract.mexc.com/api/v1/private/account/assets',
-                    headers={
-                        'ApiKey':       self._api_key,
-                        'Request-Time': ts,
-                        'Signature':    sig,
-                        'Content-Type': 'application/json',
-                    })
+                    headers=self._mexc_headers(ts))
         if not data.get('success'):
             print(f"[mexc] API error: {data.get('code')} {data.get('message')}")
             return 0.0
@@ -513,22 +570,18 @@ class MexcExchange(CcxtExchange):
         ticker = _mexc_ticker(symbol)
 
         def _sync():
-            ts  = str(_ts())
-            sig = _sign_hmac_sha256(self._api_secret, self._api_key + ts)
-            headers = {
-                'ApiKey':       self._api_key,
-                'Request-Time': ts,
-                'Signature':    sig,
-                'Content-Type': 'application/json',
-            }
+            ts      = str(_ts())
+            headers = self._mexc_headers(ts)
             try:
                 requests.post('https://contract.mexc.com/api/v1/private/position/change_margin_mode',
                     headers=headers, json={'symbol': ticker, 'marginMode': 1}, timeout=10)
             except Exception as e:
                 print(f"[mexc] marginMode: {e}")
+            ts2     = str(_ts())
+            headers2 = self._mexc_headers(ts2)
             try:
                 requests.post('https://contract.mexc.com/api/v1/private/position/leverage',
-                    headers=headers, json={'symbol': ticker, 'leverage': LEVERAGE, 'openType': 2}, timeout=10)
+                    headers=headers2, json={'symbol': ticker, 'leverage': LEVERAGE, 'openType': 2}, timeout=10)
             except Exception as e:
                 print(f"[mexc] leverage: {e}")
 
@@ -538,20 +591,12 @@ class MexcExchange(CcxtExchange):
     def _mexc_order_sync(self, symbol: str, side: str, size_usd: float,
                          reduce_only: bool = False, price: float = None) -> dict:
         """Размещает рыночный ордер MEXC через Contract API."""
+        import json as _json
         ticker = _mexc_ticker(symbol)
         if price is None:
             price = self._price_sync(symbol)
         qty = max(1, int(size_usd / price))
 
-        ts  = str(_ts())
-        sig = _sign_hmac_sha256(self._api_secret, self._api_key + ts)
-        headers = {
-            'ApiKey':       self._api_key,
-            'Request-Time': ts,
-            'Signature':    sig,
-            'Content-Type': 'application/json',
-        }
-        # MEXC Contract: side 1=open long, 2=close long, 3=open short, 4=close short
         if reduce_only:
             order_side = 4 if side == 'sell' else 2
         else:
@@ -562,27 +607,47 @@ class MexcExchange(CcxtExchange):
             'price':     price,
             'vol':       qty,
             'side':      order_side,
-            'type':      5,       # 5 = market order
-            'openType':  2,       # 2 = isolated
+            'type':      5,
+            'openType':  2,
             'leverage':  LEVERAGE,
         }
+        body_str = _json.dumps(body, separators=(',', ':'))
+        ts       = str(_ts())
         r = requests.post('https://contract.mexc.com/api/v1/private/order/submit',
-                          headers=headers, json=body, timeout=15)
-        r.raise_for_status()
+                          headers=self._mexc_headers(ts, body_str),
+                          data=body_str, timeout=15)
+        if not r.ok:
+            print(f"[mexc] order failed {r.status_code}: {r.text[:300]}")
+            r.raise_for_status()
         d = r.json()
         if not d.get('success'):
             raise ValueError(f"mexc order error: {d.get('code')} {d.get('message')}")
-        order_id = str(d.get('data', ''))
-        return {'order_id': order_id, 'price': price, 'qty': float(qty), 'fee': 0.0}
+        return {'order_id': str(d.get('data', '')), 'price': price, 'qty': float(qty), 'fee': 0.0}
 
     async def place_market_order(self, symbol: str, side: str, size_usd: float) -> dict:
         await self._setup_symbol(symbol)
         return await _run_sync(self._mexc_order_sync, symbol, side, size_usd)
 
     async def close_position(self, symbol: str, side: str, qty: float) -> dict:
-        price = await self.get_price(symbol)
-        return await _run_sync(self._mexc_order_sync, symbol, side,
-                               qty * price, reduce_only=True, price=price)
+        def _close_sync():
+            import json as _json
+            ticker  = _mexc_ticker(symbol)
+            qty_int = max(1, int(qty))
+            order_side = 4 if side == 'sell' else 2
+            body = {'symbol': ticker, 'vol': qty_int, 'side': order_side, 'type': 5, 'openType': 2}
+            body_str = _json.dumps(body, separators=(',', ':'))
+            ts = str(_ts())
+            r  = requests.post('https://contract.mexc.com/api/v1/private/order/submit',
+                               headers=self._mexc_headers(ts, body_str),
+                               data=body_str, timeout=15)
+            if not r.ok:
+                print(f"[mexc] close failed {r.status_code}: {r.text[:200]}")
+                r.raise_for_status()
+            d = r.json()
+            if not d.get('success'):
+                raise ValueError(f"mexc close error: {d.get('code')} {d.get('message')}")
+            return {'order_id': str(d.get('data', '')), 'price': 0.0, 'fee': 0.0}
+        return await _run_sync(_close_sync)
 
 
 class BitgetExchange(CcxtExchange):
@@ -594,7 +659,7 @@ class BitgetExchange(CcxtExchange):
         self._passphrase = keys.get('api_password', '')
 
     def _price_sync(self, symbol: str) -> float:
-        ticker = symbol.replace('/', '').replace(':USDT', '') + 'USDT'
+        ticker = _bitget_ticker(symbol)
         r = requests.get('https://api.bitget.com/api/v2/mix/market/ticker',
                          params={'symbol': ticker, 'productType': 'USDT-FUTURES'}, timeout=10)
         r.raise_for_status()
@@ -632,7 +697,7 @@ class BitgetExchange(CcxtExchange):
 
     async def get_24h_volume(self, symbol: str) -> Optional[float]:
         def _sync():
-            ticker = symbol.replace('/', '').replace(':USDT', '') + 'USDT'
+            ticker = _bitget_ticker(symbol)
             r = requests.get('https://api.bitget.com/api/v2/mix/market/ticker',
                              params={'symbol': ticker, 'productType': 'USDT-FUTURES'}, timeout=10)
             r.raise_for_status()
@@ -644,7 +709,7 @@ class BitgetExchange(CcxtExchange):
     async def _setup_symbol(self, symbol: str):
         """Bitget: изолированная маржа + leverage через Mix API v2."""
         import base64, json as _json
-        ticker = symbol.replace('/', '').replace(':USDT', '') + 'USDT'
+        ticker = _bitget_ticker(symbol)
 
         def _sign_bitget(ts, method, path, body=''):
             msg = ts + method + path + body

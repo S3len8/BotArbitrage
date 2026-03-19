@@ -41,7 +41,7 @@ EXCHANGE_KEYS: dict = {
     "binance": {"api_key": os.getenv("BINANCE_API_KEY", ""), "api_secret": os.getenv("BINANCE_API_SECRET", "")},
     "bybit":   {"api_key": os.getenv("BYBIT_API_KEY",   ""), "api_secret": os.getenv("BYBIT_API_SECRET",   "")},
     "bitget":  {"api_key": os.getenv("BITGET_API_KEY",  ""), "api_secret": os.getenv("BITGET_API_SECRET",  ""), "api_password": os.getenv("BITGET_PASSPHRASE", "")},
-    "mexc":    {"api_key": os.getenv("MEXC_API_KEY",    ""), "api_secret": os.getenv("MEXC_API_SECRET",    "")},
+    "mexc":    {"api_key": os.getenv("MEXC_API_KEY", ""), "api_secret": os.getenv("MEXC_API_SECRET", ""), "user_id": os.getenv("MEXC_USER_ID", "")},
     "kucoin":  {"api_key": os.getenv("KUCOIN_API_KEY",  ""), "api_secret": os.getenv("KUCOIN_API_SECRET",  ""), "api_password": os.getenv("KUCOIN_PASSPHRASE", "")},
     "gate":    {"api_key": os.getenv("GATE_API_KEY",    ""), "api_secret": os.getenv("GATE_API_SECRET",    "")},
 }
