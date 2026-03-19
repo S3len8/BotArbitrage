@@ -18,10 +18,13 @@ from typing import Optional
 import ccxt.async_support as ccxt
 import requests
 
-from settings import get_exchange_keys, LEVERAGE
+from settings import get_exchange_keys, LEVERAGE, PROXY
 
 # Один executor для всех синхронных вызовов баланса
 _executor = ThreadPoolExecutor(max_workers=10)
+
+# Прокси для запросов (если задан в .env)
+_PROXIES = {'http': PROXY, 'https': PROXY} if PROXY else None
 
 def _run_sync(fn, *args, **kwargs):
     """Запускает синхронную функцию в asyncio без блокировки."""
@@ -66,9 +69,21 @@ def _ts() -> int:
 
 def _req(method: str, url: str, headers: dict = None, params: dict = None, json: dict = None) -> dict:
     """Синхронный HTTP запрос через requests."""
-    r = requests.request(method, url, headers=headers or {}, params=params, json=json, timeout=15)
+    from settings import PROXY
+    proxies = {'http': PROXY, 'https': PROXY} if PROXY else None
+    r = requests.request(method, url, headers=headers or {}, params=params,
+                         json=json, timeout=15, proxies=proxies)
     r.raise_for_status()
     return r.json()
+
+
+def _req_raw(method: str, url: str, headers: dict = None, params: dict = None,
+             data: str = None, json_body: dict = None, use_proxy: bool = False) -> requests.Response:
+    """Синхронный HTTP запрос, возвращает Response объект."""
+    from settings import PROXY
+    proxies = {'http': PROXY, 'https': PROXY} if (PROXY and use_proxy) else None
+    return requests.request(method, url, headers=headers or {}, params=params,
+                            data=data, json=json_body, timeout=15, proxies=proxies)
 
 import re as _re_ticker
 
@@ -93,9 +108,22 @@ def _mexc_ticker(symbol: str) -> str:
 def _bitget_ticker(symbol: str) -> str:
     """Конвертирует символ в формат Bitget: BASUSDT или BAS/USDT:USDT → BASUSDT (без подчёркивания)"""
     s = symbol.replace('/', '').replace(':USDT', '')
-    # Убираем USDT если уже есть, добавляем обратно
     s = _re_ticker.sub(r'USDT$', '', s)
     return s + 'USDT'
+
+
+def _bybit_ticker(symbol: str) -> str:
+    """Конвертирует символ в формат Bybit: BASUSDT или BAS/USDT:USDT → BASUSDT"""
+    s = symbol.replace('/', '').replace(':USDT', '')
+    s = _re_ticker.sub(r'USDT$', '', s)
+    return s + 'USDT'
+
+
+def _kucoin_ticker(symbol: str) -> str:
+    """Конвертирует символ в формат KuCoin Futures: BASUSDT или BAS/USDT:USDT → BASUSDTM"""
+    s = symbol.replace('/', '').replace(':USDT', '')
+    s = _re_ticker.sub(r'USDT$', '', s)
+    return s + 'USDTM'
 
 
 # ── Базовый ccxt адаптер (торговые операции) ──────────────────
@@ -143,24 +171,28 @@ class CcxtExchange(BaseExchange):
         qty     = _round(size_usd / price, min_qty)
         if qty < min_qty:
             raise ValueError(f"{self.name}: qty {qty:.8f} < min {min_qty} for {symbol}")
-        await self._setup_symbol(symbol)   # изолированная маржа + плечо
+        await self._setup_symbol(symbol)
         order = await self._client.create_market_order(
             self._fmt(symbol), side, qty, params=self._open_params(side)
         )
+        fill_price = float(order.get('average') or order.get('price') or 0)
+        fill_qty   = float(order.get('filled') or 0)
         return {
             'order_id': str(order['id']),
-            'price':    float(order.get('average') or order.get('price') or price),
-            'qty':      float(order.get('filled') or qty),
+            'price':    fill_price if fill_price > 0 else price,
+            'qty':      fill_qty   if fill_qty   > 0 else qty,
             'fee':      float((order.get('fee') or {}).get('cost') or 0),
         }
 
     async def close_position(self, symbol: str, side: str, qty: float) -> dict:
+        price = await self.get_price(symbol)
         order = await self._client.create_market_order(
             self._fmt(symbol), side, qty, params={'reduceOnly': True}
         )
+        fill_price = float(order.get('average') or order.get('price') or 0)
         return {
             'order_id': str(order['id']),
-            'price':    float(order.get('average') or order.get('price') or 0),
+            'price':    fill_price if fill_price > 0 else price,
             'fee':      float((order.get('fee') or {}).get('cost') or 0),
         }
 
@@ -315,11 +347,38 @@ class BinanceExchange(CcxtExchange):
         d = r.json()
         if 'code' in d and d['code'] < 0:
             raise ValueError(f"binance order error: {d.get('msg')} code={d['code']}")
-        fill_price = float(d.get('avgPrice') or d.get('price') or price or 0)
+
+        order_id = str(d.get('orderId', ''))
+
+        # Binance Futures возвращает executedQty="0" и avgPrice="0" сразу после размещения
+        # Запрашиваем статус ордера через 300мс
+        import time as _time
+        _time.sleep(0.3)
+        ts3 = _ts()
+        qs3 = f"symbol={ticker}&orderId={order_id}&timestamp={ts3}&recvWindow=5000"
+        sig3 = _sign_hmac_sha256(self._api_secret, qs3)
+        try:
+            r2 = requests.get('https://fapi.binance.com/fapi/v1/order',
+                              headers={'X-MBX-APIKEY': self._api_key},
+                              params={'symbol': ticker, 'orderId': order_id,
+                                      'timestamp': ts3, 'recvWindow': 5000,
+                                      'signature': sig3}, timeout=10)
+            d2 = r2.json()
+            fill_price = float(d2.get('avgPrice') or 0)
+            exec_qty   = float(d2.get('executedQty') or 0)
+        except Exception:
+            fill_price = 0
+            exec_qty   = 0
+
+        if fill_price == 0:
+            fill_price = price
+        if exec_qty == 0:
+            exec_qty = qty
+
         return {
-            'order_id': str(d.get('orderId', '')),
+            'order_id': order_id,
             'price':    fill_price,
-            'qty':      float(d.get('executedQty') or qty),
+            'qty':      exec_qty,
             'fee':      0.0,
         }
 
@@ -363,13 +422,15 @@ class BinanceExchange(CcxtExchange):
             r = requests.post('https://fapi.binance.com/fapi/v1/order',
                               headers={'X-MBX-APIKEY': self._api_key},
                               params=params, timeout=15)
+            price_now = self._price_sync(symbol)
             r.raise_for_status()
             d = r.json()
             if 'code' in d and d['code'] < 0:
                 raise ValueError(f"binance close error: {d.get('msg')}")
+            fill_price = float(d.get('avgPrice') or d.get('price') or 0)
             return {
                 'order_id': str(d.get('orderId', '')),
-                'price':    float(d.get('avgPrice') or d.get('price') or 0),
+                'price':    fill_price if fill_price > 0 else price_now,
                 'fee':      0.0,
             }
         return await _run_sync(_close_sync)
@@ -385,7 +446,7 @@ class BybitExchange(CcxtExchange):
         self._api_secret = keys['api_secret']
 
     def _price_sync(self, symbol: str) -> float:
-        ticker = symbol.replace('/', '').replace(':USDT', '') + 'USDT'
+        ticker = _bybit_ticker(symbol)
         r = requests.get('https://api.bybit.com/v5/market/tickers',
                          params={'category': 'linear', 'symbol': ticker}, timeout=10)
         r.raise_for_status()
@@ -430,7 +491,7 @@ class BybitExchange(CcxtExchange):
 
     async def get_24h_volume(self, symbol: str) -> Optional[float]:
         def _sync():
-            ticker = symbol.replace('/', '').replace(':USDT', '') + 'USDT'
+            ticker = _bybit_ticker(symbol)
             r = requests.get('https://api.bybit.com/v5/market/tickers',
                              params={'category': 'linear', 'symbol': ticker}, timeout=10)
             r.raise_for_status()
@@ -442,7 +503,7 @@ class BybitExchange(CcxtExchange):
 
     async def _setup_symbol(self, symbol: str):
         """Bybit: ISOLATED margin + leverage через v5 REST."""
-        ticker = symbol.replace('/', '').replace(':USDT', '') + 'USDT'
+        ticker = _bybit_ticker(symbol)
 
         def _sync():
             ts          = str(_ts())
@@ -494,13 +555,15 @@ class BybitExchange(CcxtExchange):
     def _open_params(self, side): return {'positionIdx': 0}
 
     async def close_position(self, symbol, side, qty):
+        price = await self.get_price(symbol)
         order = await self._client.create_market_order(
             self._fmt(symbol), side, qty,
             params={'reduceOnly': True, 'positionIdx': 0}
         )
+        fill_price = float(order.get('average') or order.get('price') or 0)
         return {
             'order_id': str(order['id']),
-            'price':    float(order.get('average') or 0),
+            'price':    fill_price if fill_price > 0 else price,
             'fee':      float((order.get('fee') or {}).get('cost') or 0),
         }
 
@@ -540,8 +603,16 @@ class MexcExchange(CcxtExchange):
 
     def _balance_sync(self) -> float:
         ts   = str(_ts())
-        data = _req('GET', 'https://contract.mexc.com/api/v1/private/account/assets',
-                    headers=self._mexc_headers(ts))
+        from settings import PROXY
+        proxies = {'http': PROXY, 'https': PROXY} if PROXY else None
+        try:
+            r = requests.get('https://contract.mexc.com/api/v1/private/account/assets',
+                             headers=self._mexc_headers(ts), timeout=15, proxies=proxies)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            print(f"[mexc] balance error: {e}")
+            return 0.0
         if not data.get('success'):
             print(f"[mexc] API error: {data.get('code')} {data.get('message')}")
             return 0.0
@@ -550,12 +621,25 @@ class MexcExchange(CcxtExchange):
                 return float(asset.get('availableBalance') or 0)
         return 0.0
 
+    def _mexc_post(self, path: str, body_str: str) -> dict:
+        """POST запрос к MEXC Contract API с прокси если задан."""
+        from settings import PROXY
+        proxies = {'http': PROXY, 'https': PROXY} if PROXY else None
+        ts = str(_ts())
+        r  = requests.post(f'https://contract.mexc.com{path}',
+                           headers=self._mexc_headers(ts, body_str),
+                           data=body_str, timeout=15, proxies=proxies)
+        if not r.ok:
+            print(f"[mexc] {path} failed {r.status_code}: {r.text[:200]}")
+            r.raise_for_status()
+        return r.json()
+
     async def get_futures_balance(self) -> float:
         return await _run_sync(self._balance_sync)
 
     async def get_24h_volume(self, symbol: str) -> Optional[float]:
         def _sync():
-            ticker = symbol.replace('/', '_').replace(':USDT', '')
+            ticker = _mexc_ticker(symbol)
             r = requests.get(f'https://contract.mexc.com/api/v1/contract/ticker',
                              params={'symbol': ticker}, timeout=10)
             r.raise_for_status()
@@ -567,21 +651,18 @@ class MexcExchange(CcxtExchange):
 
     async def _setup_symbol(self, symbol: str):
         """MEXC Futures: изолированная маржа + leverage через Contract API."""
+        import json as _json
         ticker = _mexc_ticker(symbol)
 
         def _sync():
-            ts      = str(_ts())
-            headers = self._mexc_headers(ts)
             try:
-                requests.post('https://contract.mexc.com/api/v1/private/position/change_margin_mode',
-                    headers=headers, json={'symbol': ticker, 'marginMode': 1}, timeout=10)
+                self._mexc_post('/api/v1/private/position/change_margin_mode',
+                    _json.dumps({'symbol': ticker, 'marginMode': 1}, separators=(',', ':')))
             except Exception as e:
                 print(f"[mexc] marginMode: {e}")
-            ts2     = str(_ts())
-            headers2 = self._mexc_headers(ts2)
             try:
-                requests.post('https://contract.mexc.com/api/v1/private/position/leverage',
-                    headers=headers2, json={'symbol': ticker, 'leverage': LEVERAGE, 'openType': 2}, timeout=10)
+                self._mexc_post('/api/v1/private/position/leverage',
+                    _json.dumps({'symbol': ticker, 'leverage': LEVERAGE, 'openType': 2}, separators=(',', ':')))
             except Exception as e:
                 print(f"[mexc] leverage: {e}")
 
@@ -602,24 +683,10 @@ class MexcExchange(CcxtExchange):
         else:
             order_side = 3 if side == 'sell' else 1
 
-        body = {
-            'symbol':    ticker,
-            'price':     price,
-            'vol':       qty,
-            'side':      order_side,
-            'type':      5,
-            'openType':  2,
-            'leverage':  LEVERAGE,
-        }
+        body = {'symbol': ticker, 'price': price, 'vol': qty,
+                'side': order_side, 'type': 5, 'openType': 2, 'leverage': LEVERAGE}
         body_str = _json.dumps(body, separators=(',', ':'))
-        ts       = str(_ts())
-        r = requests.post('https://contract.mexc.com/api/v1/private/order/submit',
-                          headers=self._mexc_headers(ts, body_str),
-                          data=body_str, timeout=15)
-        if not r.ok:
-            print(f"[mexc] order failed {r.status_code}: {r.text[:300]}")
-            r.raise_for_status()
-        d = r.json()
+        d = self._mexc_post('/api/v1/private/order/submit', body_str)
         if not d.get('success'):
             raise ValueError(f"mexc order error: {d.get('code')} {d.get('message')}")
         return {'order_id': str(d.get('data', '')), 'price': price, 'qty': float(qty), 'fee': 0.0}
@@ -631,19 +698,12 @@ class MexcExchange(CcxtExchange):
     async def close_position(self, symbol: str, side: str, qty: float) -> dict:
         def _close_sync():
             import json as _json
-            ticker  = _mexc_ticker(symbol)
-            qty_int = max(1, int(qty))
+            ticker   = _mexc_ticker(symbol)
+            qty_int  = max(1, int(qty))
             order_side = 4 if side == 'sell' else 2
-            body = {'symbol': ticker, 'vol': qty_int, 'side': order_side, 'type': 5, 'openType': 2}
+            body     = {'symbol': ticker, 'vol': qty_int, 'side': order_side, 'type': 5, 'openType': 2}
             body_str = _json.dumps(body, separators=(',', ':'))
-            ts = str(_ts())
-            r  = requests.post('https://contract.mexc.com/api/v1/private/order/submit',
-                               headers=self._mexc_headers(ts, body_str),
-                               data=body_str, timeout=15)
-            if not r.ok:
-                print(f"[mexc] close failed {r.status_code}: {r.text[:200]}")
-                r.raise_for_status()
-            d = r.json()
+            d = self._mexc_post('/api/v1/private/order/submit', body_str)
             if not d.get('success'):
                 raise ValueError(f"mexc close error: {d.get('code')} {d.get('message')}")
             return {'order_id': str(d.get('data', '')), 'price': 0.0, 'fee': 0.0}
@@ -801,7 +861,7 @@ class KucoinExchange(BaseExchange):
 
     async def get_24h_volume(self, symbol: str) -> Optional[float]:
         def _sync():
-            ticker = symbol.replace('/', '').replace(':USDT', '') + 'USDTM'
+            ticker = _kucoin_ticker(symbol)
             r = requests.get(f'https://api-futures.kucoin.com/api/v1/ticker',
                              params={'symbol': ticker}, timeout=10)
             r.raise_for_status()
@@ -815,7 +875,7 @@ class KucoinExchange(BaseExchange):
         return await _run_sync(self._price_sync, symbol)
 
     def _price_sync(self, symbol: str) -> float:
-        ticker = symbol.replace('/', '').replace(':USDT', '') + 'USDTM'
+        ticker = _kucoin_ticker(symbol)
         r = requests.get('https://api-futures.kucoin.com/api/v1/ticker',
                          params={'symbol': ticker}, timeout=10)
         r.raise_for_status()
@@ -830,7 +890,7 @@ class KucoinExchange(BaseExchange):
 
     def _min_qty_sync(self, symbol: str) -> float:
         """Получает минимальный размер лота через публичный REST."""
-        ticker = symbol.replace('/', '').replace(':USDT', '') + 'USDTM'
+        ticker = _kucoin_ticker(symbol)
         try:
             r = requests.get('https://api-futures.kucoin.com/api/v1/contracts/active', timeout=10)
             r.raise_for_status()
@@ -844,7 +904,7 @@ class KucoinExchange(BaseExchange):
     def _place_order_sync(self, symbol: str, side: str, qty: float) -> dict:
         """Размещает рыночный ордер через KuCoin REST API."""
         import base64, json as _json, uuid
-        ticker = symbol.replace('/', '').replace(':USDT', '') + 'USDTM'
+        ticker = _kucoin_ticker(symbol)
         ts     = str(_ts())
         method = 'POST'
         path   = '/api/v1/orders'
@@ -878,7 +938,7 @@ class KucoinExchange(BaseExchange):
         if d.get('code') not in ('200000', 200000):
             raise ValueError(f"kucoin order error: {d.get('msg')} code={d.get('code')}")
         order_id = d.get('data', {}).get('orderId', '')
-        return {'order_id': order_id, 'price': 0.0, 'qty': qty, 'fee': 0.0}
+        return {'order_id': order_id, 'price': None, 'qty': qty, 'fee': 0.0}  # price заполнится в place_market_order
 
     async def place_market_order(self, symbol: str, side: str, size_usd: float) -> dict:
         await self._setup_symbol(symbol)
@@ -894,7 +954,7 @@ class KucoinExchange(BaseExchange):
     async def _setup_symbol(self, symbol: str):
         """KuCoin Futures: leverage через ccxt (KuCoin не поддерживает cross/isolated переключение через API v1)."""
         import base64, json as _json
-        ticker = symbol.replace('/', '').replace(':USDT', '') + 'USDTM'
+        ticker = _kucoin_ticker(symbol)
 
         def _sync():
             ts  = str(_ts())

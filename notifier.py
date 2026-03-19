@@ -16,8 +16,8 @@ _TV_PREFIX = {
 # Ссылки на страницы фьючерсной торговли
 _EX_FUTURES_URL = {
     'mexc':    'https://futures.mexc.com/exchange/{symbol}_USDT',
-    'binance': 'https://www.binance.com/en/futures/{symbol}',
-    'bybit':   'https://www.bybit.com/trade/usdt/{symbol}',
+    'binance': 'https://www.binance.com/en/futures/{symbol}USDT',
+    'bybit':   'https://www.bybit.com/trade/usdt/{symbol}USDT',
     'gate':    'https://www.gate.io/futures/usdt/{symbol}_USDT',
     'bitget':  'https://www.bitget.com/futures/usdt/{symbol}USDT',
     'kucoin':  'https://www.kucoin.com/futures/trade/{symbol}USDTM',
@@ -46,17 +46,37 @@ def tradingview_url(short_exchange: str, long_exchange: str, ticker: str) -> str
     return f"https://www.tradingview.com/chart/?symbol={pair}"
 
 
+def _safe_html(text: str) -> str:
+    """Экранирует символы которые ломают HTML parse в Telegram.
+    Оставляем только разрешённые теги: <b>, </b>, <i>, </i>, <code>, </code>.
+    Все остальные < и > заменяем на &lt; и &gt;
+    """
+    import re
+    # Сначала находим разрешённые теги и заменяем их на placeholder
+    allowed = re.findall(r'</?(?:b|i|code|pre|s|u)>', text)
+    result = text
+    # Заменяем разрешённые теги на временные маркеры
+    for i, tag in enumerate(allowed):
+        result = result.replace(tag, f'\x00TAG{i}\x00', 1)
+    # Экранируем оставшиеся < и >
+    result = result.replace('<', '&lt;').replace('>', '&gt;')
+    # Возвращаем разрешённые теги
+    for i, tag in enumerate(allowed):
+        result = result.replace(f'\x00TAG{i}\x00', tag, 1)
+    return result
+
+
 def _send_sync(text: str, tv_url: str = None, buttons: list = None):
     """Синхронная отправка через requests — обходит aiohttp DNS проблему.
     buttons: список кнопок [{"text": "...", "url": "..."}]
     """
     if not NOTIFY_BOT_TOKEN or not NOTIFY_CHAT_ID:
-        print(f"[Notify] {text}")
+        print(f"[Notify] {text[:120]}")
         return
     url = f"https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id":                  NOTIFY_CHAT_ID,
-        "text":                     text,
+        "text":                     _safe_html(text),
         "parse_mode":               "HTML",
         "disable_web_page_preview": True,
     }

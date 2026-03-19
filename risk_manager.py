@@ -100,36 +100,30 @@ async def check_signal(signal: OpenSignal, short_ex: BaseExchange, long_ex: Base
     if real_spread < MIN_SPREAD_PCT:
         return RiskResult(ok=False, reason=f"Спред упал до {real_spread:.3f}% (мин {MIN_SPREAD_PCT}%). {signal.ticker} пропущен.")
 
-    # 5b. Фандинг-фильтр (синхронизирован с listener._funding_ok)
+    # 5b. Фандинг-фильтр (данные 61,471 закрытий без MEXC)
     fs = signal.funding_short
     fl = signal.funding_long
     if fs is not None and fl is not None:
         diff_pct  = abs(fs - fl) * 100
-        short_abs = abs(fs) * 100
-        long_abs  = abs(fl) * 100
-        max_abs   = max(short_abs, long_abs)
         i_s = signal.interval_short
         i_l = signal.interval_long
         passes = False
 
-        # 1H/4H смешанные — не берём (медиана 3353м)
-        if i_s is not None and i_l is not None and {i_s, i_l} in [({1,4}),({1,8}),({2,4}),({2,8}),({2,1})]:
+        # 1H на любой бирже — медиана 4800м, не берём
+        if i_s == 1 or i_l == 1:
             passes = False
 
-        # 4H/4H, 8H/8H, 4H/8H
+        # 4H/4H, 8H/8H, 4H/8H — берём при diff<0.2%
         elif i_s in (4, 8) and i_l in (4, 8):
-            if diff_pct < 0.1:
-                passes = True
-            elif diff_pct < 0.2 and max_abs < MAX_FUNDING_ABS_PCT:
-                passes = True
+            passes = diff_pct < 0.2
 
-        # 1H/1H — только diff=0% и оба abs<0.3%
-        elif i_s == 1 and i_l == 1:
-            passes = diff_pct == 0.0 and short_abs < 0.3 and long_abs < 0.3
-
-        # Интервал неизвестен — строгий порог diff<0.1%
+        # Интервал неизвестен — только diff<0.1%
         elif i_s is None or i_l is None:
-            passes = diff_pct < 0.1 and max_abs < MAX_FUNDING_ABS_PCT
+            passes = diff_pct < 0.1 and max(abs(fs)*100, abs(fl)*100) < MAX_FUNDING_ABS_PCT
+
+        # Остальные интервалы (2H и т.д.) — не берём
+        else:
+            passes = False
 
         if not passes:
             return RiskResult(ok=False, reason=(

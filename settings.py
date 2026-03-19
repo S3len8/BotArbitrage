@@ -5,10 +5,16 @@ load_dotenv()
 
 LEVERAGE:            int   = int(os.getenv("LEVERAGE", "5"))
 PROXY:               str   = os.getenv("PROXY", "")
-# Минимальный спред: данные показывают что от 4% спреды закрываются вдвое быстрее
-# (медиана 97м vs 300м при 3%), 63% за 4ч vs 48%
+# Минимальный спред без MEXC:
+# спред 5-7% + 4H/4H → медиана 49м, 71% за 4ч (отлично)
+# спред 3-4% → медиана 2521м (очень плохо)
+# спред 4-5% → медиана 881м (приемлемо)
 MIN_SPREAD_PCT:      float = float(os.getenv("MIN_SPREAD_PCT", "4.0"))
-MIN_VOLUME_USD:      float = float(os.getenv("MIN_VOLUME_USD", "500000"))
+# Минимальный объём 24ч. Для малых монет (ZBCN, NTRN) объём может быть $20k-100k
+# Ставим 0 чтобы не блокировать — объём проверяется визуально
+MIN_VOLUME_USD:      float = float(os.getenv("MIN_VOLUME_USD", "0"))
+# ⚠️  Если в .env стоит MIN_VOLUME_USD=500000 — убери или поставь MIN_VOLUME_USD=0
+# Малые монеты (ZBCN, NTRN, LYN) имеют объём $10k-100k и будут заблокированы при 500k
 MAX_OPEN_POSITIONS:  int   = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 BALANCE_ALERT_PCT:   float = float(os.getenv("BALANCE_ALERT_PCT", "50"))
 
