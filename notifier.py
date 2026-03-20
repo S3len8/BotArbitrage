@@ -66,13 +66,11 @@ def _safe_html(text: str) -> str:
     return result
 
 
-def _send_sync(text: str, tv_url: str = None, buttons: list = None):
-    """Синхронная отправка через requests — обходит aiohttp DNS проблему.
-    buttons: список кнопок [{"text": "...", "url": "..."}]
-    """
+def _send_sync(text: str, tv_url: str = None, buttons: list = None) -> int | None:
+    """Синхронная отправка. Возвращает message_id для последующего редактирования."""
     if not NOTIFY_BOT_TOKEN or not NOTIFY_CHAT_ID:
         print(f"[Notify] {text[:120]}")
-        return
+        return None
     url = f"https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id":                  NOTIFY_CHAT_ID,
@@ -80,37 +78,74 @@ def _send_sync(text: str, tv_url: str = None, buttons: list = None):
         "parse_mode":               "HTML",
         "disable_web_page_preview": True,
     }
-    # Собираем кнопки
     all_buttons = []
     if tv_url:
         all_buttons.append({"text": "📈 TradingView", "url": tv_url})
     if buttons:
         all_buttons.extend(buttons)
     if all_buttons:
-        # Кнопки в два столбца если их больше одной
-        if len(all_buttons) == 1:
-            keyboard = [all_buttons]
-        else:
-            # Первая строка — TradingView на всю ширину, остальные по парам
-            keyboard = []
-            tv_btns = [b for b in all_buttons if 'TradingView' in b['text']]
-            ex_btns = [b for b in all_buttons if 'TradingView' not in b['text']]
-            if tv_btns:
-                keyboard.append(tv_btns)
-            # Биржи парами в одну строку
-            if ex_btns:
-                keyboard.append(ex_btns)
+        keyboard = []
+        tv_btns = [b for b in all_buttons if 'TradingView' in b['text']]
+        ex_btns = [b for b in all_buttons if 'TradingView' not in b['text']]
+        if tv_btns:
+            keyboard.append(tv_btns)
+        if ex_btns:
+            keyboard.append(ex_btns)
         payload["reply_markup"] = {"inline_keyboard": keyboard}
     try:
         r = requests.post(url, json=payload, timeout=15)
         if not r.ok:
             print(f"[Notify] error {r.status_code}: {r.text[:100]}")
+            return None
+        return r.json().get('result', {}).get('message_id')
     except Exception as e:
         print(f"[Notify] error: {e}")
+        return None
 
 
-async def notify(text: str, tv_url: str = None, buttons: list = None):
-    """Отправляет сообщение через requests в executor (не блокирует event loop)."""
+def _edit_sync(message_id: int, text: str, tv_url: str = None, buttons: list = None):
+    """Редактирует существующее сообщение."""
+    if not NOTIFY_BOT_TOKEN or not NOTIFY_CHAT_ID or not message_id:
+        return
+    url = f"https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}/editMessageText"
+    payload = {
+        "chat_id":                  NOTIFY_CHAT_ID,
+        "message_id":               message_id,
+        "text":                     _safe_html(text),
+        "parse_mode":               "HTML",
+        "disable_web_page_preview": True,
+    }
+    all_buttons = []
+    if tv_url:
+        all_buttons.append({"text": "📈 TradingView", "url": tv_url})
+    if buttons:
+        all_buttons.extend(buttons)
+    if all_buttons:
+        keyboard = []
+        tv_btns = [b for b in all_buttons if 'TradingView' in b['text']]
+        ex_btns = [b for b in all_buttons if 'TradingView' not in b['text']]
+        if tv_btns:
+            keyboard.append(tv_btns)
+        if ex_btns:
+            keyboard.append(ex_btns)
+        payload["reply_markup"] = {"inline_keyboard": keyboard}
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        if not r.ok and 'message is not modified' not in r.text:
+            print(f"[Notify] edit error {r.status_code}: {r.text[:100]}")
+    except Exception as e:
+        print(f"[Notify] edit error: {e}")
+
+
+async def notify(text: str, tv_url: str = None, buttons: list = None) -> int | None:
+    """Отправляет сообщение. Возвращает message_id."""
     import asyncio
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(_executor, _send_sync, text, tv_url, buttons)
+    return await loop.run_in_executor(_executor, _send_sync, text, tv_url, buttons)
+
+
+async def edit_notify(message_id: int, text: str, tv_url: str = None, buttons: list = None):
+    """Редактирует существующее сообщение в Telegram."""
+    import asyncio
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(_executor, _edit_sync, message_id, text, tv_url, buttons)

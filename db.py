@@ -200,6 +200,13 @@ def get_open_trade(ticker: str) -> Optional[Trade]:
     return _to_trade(row) if row else None
 
 
+def get_trade_by_id(trade_id: int) -> Optional[Trade]:
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("SELECT * FROM trades WHERE id=%s", (trade_id,))
+        row = cur.fetchone()
+    return _to_trade(row) if row else None
+
+
 def get_all_open_trades() -> list[Trade]:
     with _conn() as c, c.cursor() as cur:
         cur.execute("SELECT * FROM trades WHERE status IN ('open','partial') ORDER BY id DESC")

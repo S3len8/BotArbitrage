@@ -306,6 +306,113 @@ async def api_open_trades():
     return [_t(t) for t in get_all_open_trades()]
 
 
+@app.get("/api/positions/live")
+async def api_positions_live():
+    """Возвращает открытые позиции с текущими ценами и PnL в реальном времени."""
+    if not _db_ok:
+        return []
+    from db import get_all_open_trades
+    from exchanges import create_exchange
+    trades = get_all_open_trades()
+    if not trades:
+        return []
+
+    result = []
+    for t in trades:
+        item = _t(t)
+        try:
+            s_ex = create_exchange(t.short_exchange)
+            l_ex = create_exchange(t.long_exchange)
+            short_price, long_price = await asyncio.gather(
+                s_ex.get_price(t.symbol),
+                l_ex.get_price(t.symbol),
+            )
+            await asyncio.gather(s_ex.close(), l_ex.close())
+
+            # Текущий спред
+            cur_spread = (short_price / long_price - 1) * 100 if long_price > 0 else 0
+
+            # Нереализованный PnL
+            # SHORT: прибыль если цена упала (entry - current) * qty
+            # LONG:  прибыль если цена выросла (current - entry) * qty
+            short_pnl = 0.0
+            long_pnl  = 0.0
+            if t.short_entry_price and t.short_qty:
+                short_pnl = (t.short_entry_price - short_price) * t.short_qty
+            if t.long_entry_price and t.long_qty:
+                long_pnl  = (long_price - t.long_entry_price) * t.long_qty
+            unrealized_pnl = short_pnl + long_pnl
+
+            item['cur_short_price'] = short_price
+            item['cur_long_price']  = long_price
+            item['cur_spread_pct']  = round(cur_spread, 4)
+            item['unrealized_pnl']  = round(unrealized_pnl, 6)
+            item['short_unrealized'] = round(short_pnl, 6)
+            item['long_unrealized']  = round(long_pnl, 6)
+        except Exception as e:
+            item['live_error'] = str(e)[:80]
+        result.append(item)
+    return result
+
+
+@app.post("/api/positions/{trade_id}/mark-closed")
+async def api_mark_closed(trade_id: int):
+    """Помечает позицию закрытой вручную (когда закрыли на бирже руками)."""
+    if not _db_ok:
+        return {"ok": False, "error": "db not ready"}
+    try:
+        from db import get_trade_by_id, update_trade
+        from datetime import datetime, timezone
+        t = get_trade_by_id(trade_id)
+        if not t:
+            return {"ok": False, "error": f"trade {trade_id} not found"}
+        if t.status not in ('open', 'partial'):
+            return {"ok": False, "error": f"trade status is '{t.status}', not open"}
+        t.status    = 'closed'
+        t.closed_at = datetime.now(timezone.utc).isoformat()
+        # Пробуем получить текущие цены для расчёта PnL
+        try:
+            from exchanges import create_exchange
+            s_ex = create_exchange(t.short_exchange)
+            l_ex = create_exchange(t.long_exchange)
+            sp, lp = await asyncio.gather(s_ex.get_price(t.symbol), l_ex.get_price(t.symbol))
+            await asyncio.gather(s_ex.close(), l_ex.close())
+            t.short_close_price = sp
+            t.long_close_price  = lp
+            if t.short_entry_price and t.short_qty:
+                t.short_pnl_usd = round((t.short_entry_price - sp) * t.short_qty, 6)
+            if t.long_entry_price and t.long_qty:
+                t.long_pnl_usd  = round((lp - t.long_entry_price) * t.long_qty, 6)
+            fees = (t.fee_short_usd or 0) + (t.fee_long_usd or 0)
+            if t.short_pnl_usd is not None and t.long_pnl_usd is not None:
+                t.net_pnl_usd = round(t.short_pnl_usd + t.long_pnl_usd - fees, 6)
+        except Exception as e:
+            print(f"[GUI] mark-closed price fetch: {e}")
+        update_trade(t)
+        # Уведомление в Telegram
+        try:
+            from notifier import notify
+            pnl = t.net_pnl_usd
+            pnl_str  = f"${pnl:+.4f}" if pnl is not None else "—"
+            pnl_emoji = "💰" if pnl and pnl > 0 else "💸"
+            await notify(
+                f"🔒 <b>Закрыто вручную: {t.ticker}</b>\n"
+                f"📉 SHORT {t.short_exchange.upper()} @ "
+                f"${t.short_close_price:.6f if t.short_close_price else '—'}\n"
+                f"📈 LONG  {t.long_exchange.upper()} @ "
+                f"${t.long_close_price:.6f if t.long_close_price else '—'}\n"
+                f"PnL: short {'+' if (t.short_pnl_usd or 0)>=0 else ''}${t.short_pnl_usd:.4f if t.short_pnl_usd else 0} | "
+                f"long {'+' if (t.long_pnl_usd or 0)>=0 else ''}${t.long_pnl_usd:.4f if t.long_pnl_usd else 0}\n"
+                f"{pnl_emoji} <b>Чистая прибыль: {pnl_str}</b>"
+            )
+        except Exception as e:
+            print(f"[GUI] notify mark-closed: {e}")
+        return {"ok": True, "net_pnl": t.net_pnl_usd}
+    except Exception as e:
+        print(f"[GUI] mark-closed error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/stats")
 async def api_stats():
     base = {"leverage": LEVERAGE, "balance_alert_pct": BALANCE_ALERT_PCT,

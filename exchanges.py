@@ -1195,35 +1195,48 @@ class GateExchange(CcxtExchange):
         return await _run_sync(_sync)
 
     async def _setup_symbol(self, symbol: str):
-        """Gate.io Futures: dual_mode=false (single direction) + leverage через REST v4."""
+        """Gate.io Futures: переводим в single (не dual) режим + leverage."""
         import hashlib as hl, json as _json
         ticker = _gate_ticker(symbol)
 
         def _sign_gate(method, path, query='', body=''):
             ts = str(int(time.time()))
-            body_hash  = hl.sha512(body.encode()).hexdigest()
-            sign_str   = '\n'.join([method, path, query, body_hash, ts])
+            body_hash = hl.sha512(body.encode()).hexdigest()
+            sign_str  = '\n'.join([method, path, query, body_hash, ts])
             sig = hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha512).hexdigest()
             return ts, sig
 
         def _sync():
-            # 1. Выставляем leverage (Gate не разделяет isolated/cross для фьючерсов USDT —
-            #    leverage просто задаётся на позицию)
-            path  = f'/api/v4/futures/usdt/positions/{ticker}/leverage'
-            body  = _json.dumps({'leverage': str(LEVERAGE), 'cross_leverage_limit': '0'})
-            ts, sig = _sign_gate('POST', path, '', body)
+            # 1. Отключаем dual mode (нужен single direction для isolated)
+            path1 = '/api/v4/futures/usdt/dual_mode'
+            body1 = _json.dumps({'dual_mode': False})
+            ts1, sig1 = _sign_gate('POST', path1, '', body1)
             try:
-                requests.post(f'https://api.gateio.ws{path}',
-                    headers={
-                        'KEY': self._api_key, 'SIGN': sig, 'Timestamp': ts,
-                        'Content-Type': 'application/json',
-                    },
-                    data=body, timeout=10)
+                requests.post(f'https://api.gateio.ws{path1}',
+                    headers={'KEY': self._api_key, 'SIGN': sig1, 'Timestamp': ts1,
+                             'Content-Type': 'application/json'},
+                    data=body1, timeout=10)
+            except Exception as e:
+                print(f"[gate] dual_mode: {e}")
+
+            # 2. Выставляем leverage на позицию
+            # cross_leverage_limit=0 означает isolated mode на Gate
+            path2 = f'/api/v4/futures/usdt/positions/{ticker}/leverage'
+            body2 = _json.dumps({'leverage': str(LEVERAGE), 'cross_leverage_limit': '0'})
+            ts2, sig2 = _sign_gate('POST', path2, '', body2)
+            try:
+                r = requests.post(f'https://api.gateio.ws{path2}',
+                    headers={'KEY': self._api_key, 'SIGN': sig2, 'Timestamp': ts2,
+                             'Content-Type': 'application/json'},
+                    data=body2, timeout=10)
+                d = r.json()
+                if isinstance(d, dict) and d.get('label'):
+                    print(f"[gate] leverage warn: {d.get('label')} {d.get('message')}")
             except Exception as e:
                 print(f"[gate] leverage: {e}")
 
         await _run_sync(_sync)
-        print(f"[gate] {ticker}: {LEVERAGE}×")
+        print(f"[gate] {ticker}: {LEVERAGE}× isolated")
 
     def _gate_order_sync(self, symbol: str, side: str, size_usd: float,
                          reduce_only: bool = False, price: float = None) -> dict:

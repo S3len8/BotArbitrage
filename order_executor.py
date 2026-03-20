@@ -11,7 +11,7 @@ from typing import Optional
 from exchanges import create_exchange
 from db import Trade, save_trade, update_trade, get_open_trade, save_balance_snapshot
 from signal_parser import OpenSignal, CloseSignal
-from notifier import notify, tradingview_url
+from notifier import notify, tradingview_url, edit_notify, exchange_url
 from settings import LEVERAGE, BALANCE_ALERT_PCT
 
 
@@ -76,15 +76,68 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
         trade.exec_time_short_ms = exec_ms
         trade.exec_time_long_ms  = exec_ms
         save_trade(trade)
-        tv_url = tradingview_url(signal.short_exchange, signal.long_exchange, signal.ticker)
-        msg = (f"✅ <b>Открыто: {signal.ticker}</b>\n"
-               f"📉 SHORT {signal.short_exchange.upper()}: {trade.short_qty:.6f} @ ${trade.short_entry_price:.6f}\n"
-               f"📈 LONG  {signal.long_exchange.upper()}: {trade.long_qty:.6f} @ ${trade.long_entry_price:.6f}\n"
-               f"💵 Размер: ${final_size_usd:.2f} | Плечо: {LEVERAGE}×\n"
-               f"📊 Спред: {signal.spread_pct:.2f}%\n"
-               f"⚡ Исполнение: {exec_ms}мс от сигнала")
+
+        # Фактический спред по ценам исполнения
+        actual_spread = 0.0
+        if trade.long_entry_price and trade.long_entry_price > 0:
+            actual_spread = (trade.short_entry_price / trade.long_entry_price - 1) * 100
+
+        tv_url   = tradingview_url(signal.short_exchange, signal.long_exchange, signal.ticker)
+        short_url = exchange_url(signal.short_exchange, signal.ticker)
+        long_url  = exchange_url(signal.long_exchange, signal.ticker)
+        ex_buttons = []
+        if short_url:
+            ex_buttons.append({"text": f"📉 {signal.short_exchange.upper()}", "url": short_url})
+        if long_url:
+            ex_buttons.append({"text": f"📈 {signal.long_exchange.upper()}", "url": long_url})
+
+        def _build_msg(current_spread: float = None) -> str:
+            spread_line = f"📊 Спред сигнала: {signal.spread_pct:.2f}% | Фактический: {actual_spread:.2f}%"
+            if current_spread is not None:
+                spread_line += f"\n📡 Текущий спред: {current_spread:.2f}%"
+            return (
+                f"✅ <b>Открыто: {signal.ticker}</b>\n"
+                f"📉 SHORT {signal.short_exchange.upper()}: {trade.short_qty} @ ${trade.short_entry_price:.6f}\n"
+                f"📈 LONG  {signal.long_exchange.upper()}: {trade.long_qty} @ ${trade.long_entry_price:.6f}\n"
+                f"💵 Размер: ${final_size_usd:.2f} | Плечо: {LEVERAGE}×\n"
+                f"{spread_line}\n"
+                f"⚡ Исполнение: {exec_ms}мс от сигнала"
+            )
+
         await _close(short_ex, long_ex)
-        await notify(msg, tv_url=tv_url)
+        msg = _build_msg()
+        msg_id = await notify(msg, tv_url=tv_url, buttons=ex_buttons)
+
+        # Live-обновление спреда каждые 30 секунд пока позиция открыта
+        async def _live_spread_updater():
+            if not msg_id:
+                return
+            from exchanges import create_exchange
+            for _ in range(20):  # максимум 20 обновлений = 10 минут
+                await asyncio.sleep(30)
+                try:
+                    from db import get_open_trade
+                    open_t = get_open_trade(trade.id)
+                    if not open_t or open_t.status != 'open':
+                        break  # позиция закрыта — прекращаем
+                    s_ex = create_exchange(signal.short_exchange)
+                    l_ex = create_exchange(signal.long_exchange)
+                    try:
+                        sp, lp = await asyncio.gather(
+                            s_ex.get_price(signal.symbol),
+                            l_ex.get_price(signal.symbol),
+                        )
+                        cur_spread = (sp / lp - 1) * 100 if lp > 0 else 0
+                        updated_msg = _build_msg(cur_spread)
+                        await edit_notify(msg_id, updated_msg, tv_url=tv_url, buttons=ex_buttons)
+                    finally:
+                        await s_ex.close()
+                        await l_ex.close()
+                except Exception as e:
+                    print(f"[Executor] live spread error: {e}")
+                    break
+
+        asyncio.create_task(_live_spread_updater())
         return trade, msg
 
     elif short_ok:
@@ -141,20 +194,29 @@ async def close_position(close_signal: CloseSignal) -> tuple[Optional[Trade], st
 
     pnl  = f"${trade.net_pnl_usd:+.4f}" if trade.net_pnl_usd is not None else "—"
     fees = (trade.fee_short_usd or 0) + (trade.fee_long_usd or 0)
-    dur  = ""
+    dur_str = ""
     try:
         t1 = datetime.fromisoformat(str(trade.opened_at))
         t2 = datetime.fromisoformat(str(trade.closed_at))
         s  = int((t2 - t1).total_seconds())
-        dur = f"\n⏱ {s//3600}ч {(s%3600)//60}м"
+        dur_str = f"{s//3600}ч {(s%3600)//60}м {s%60}с" if s >= 3600 else f"{s//60}м {s%60}с"
     except Exception: pass
 
+    # Фактический спред по ценам закрытия
+    actual_close_spread = ""
+    if trade.short_close_price and trade.long_close_price and trade.long_close_price > 0:
+        cs = (trade.short_close_price / trade.long_close_price - 1) * 100
+        actual_close_spread = f"\n📊 Спред закрытия: {cs:.2f}%"
+
+    pnl_emoji = "💰" if trade.net_pnl_usd and trade.net_pnl_usd > 0 else "💸"
     msg = (f"{'✅' if trade.status=='closed' else '⚠️'} <b>Закрыто: {trade.ticker}</b>\n"
-           f"📉 SHORT @ ${trade.short_close_price:.6f if trade.short_close_price else '—'}\n"
-           f"📈 LONG  @ ${trade.long_close_price:.6f  if trade.long_close_price  else '—'}\n"
+           f"📉 SHORT {trade.short_exchange.upper()} @ ${trade.short_close_price:.6f if trade.short_close_price else '—'}\n"
+           f"📈 LONG  {trade.long_exchange.upper()} @ ${trade.long_close_price:.6f  if trade.long_close_price  else '—'}\n"
+           f"📊 Спред входа: {trade.signal_spread_pct:.2f}%{actual_close_spread}\n"
            f"PnL short: {_upnl(trade.short_pnl_usd)} | long: {_upnl(trade.long_pnl_usd)}\n"
            f"Комиссии: ${fees:.4f}\n"
-           f"💰 Чистая прибыль: <b>{pnl}</b>{dur}")
+           f"{pnl_emoji} <b>Чистая прибыль: {pnl}</b>\n"
+           f"⏱ Удержание: {dur_str}")
     if not (short_ok and long_ok):
         msg += f"\n⚠️ Требуется ручная проверка!"
 

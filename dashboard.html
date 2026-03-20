@@ -1052,36 +1052,80 @@ function renderOpenPositions(positions) {
     return;
   }
   c.innerHTML = positions.map(p => {
-    const dur    = p.opened_at ? elapsed(p.opened_at) : '—';
-    const fund_s = p.funding_short != null ? (p.funding_short*100).toFixed(4)+'%' : '—';
-    const fund_l = p.funding_long  != null ? (p.funding_long *100).toFixed(4)+'%' : '—';
+    const dur     = p.opened_at ? elapsed(p.opened_at) : '—';
+    const fund_s  = p.funding_short != null ? (p.funding_short*100).toFixed(3)+'%' : '—';
+    const fund_l  = p.funding_long  != null ? (p.funding_long *100).toFixed(3)+'%' : '—';
+    const sigSpread = p.signal_spread_pct?.toFixed(2) || '—';
+
+    // Live данные (если есть)
+    const hasLive   = p.cur_spread_pct != null;
+    const curSpread = hasLive ? p.cur_spread_pct.toFixed(2) : '…';
+    const uPnl      = p.unrealized_pnl;
+    const uPnlStr   = uPnl != null ? (uPnl >= 0 ? '+' : '') + '$' + uPnl.toFixed(4) : '…';
+    const uPnlClass = uPnl == null ? '' : uPnl > 0 ? 'color:var(--green)' : uPnl < 0 ? 'color:var(--red)' : '';
+    const sPnl      = p.short_unrealized != null ? (p.short_unrealized>=0?'+':'')+'$'+p.short_unrealized.toFixed(4) : '…';
+    const lPnl      = p.long_unrealized  != null ? (p.long_unrealized>=0?'+':'')+'$'+p.long_unrealized.toFixed(4)  : '…';
+    const sPnlClass = p.short_unrealized > 0 ? 'color:var(--green)' : p.short_unrealized < 0 ? 'color:var(--red)' : '';
+    const lPnlClass = p.long_unrealized  > 0 ? 'color:var(--green)' : p.long_unrealized  < 0 ? 'color:var(--red)' : '';
+    const curShort  = p.cur_short_price ? '$'+fmt(p.cur_short_price) : '…';
+    const curLong   = p.cur_long_price  ? '$'+fmt(p.cur_long_price)  : '…';
+    const spreadColor = hasLive && p.cur_spread_pct < 0.5 ? 'color:var(--green)' :
+                        hasLive && p.cur_spread_pct < 1.5 ? 'color:var(--yellow)' : '';
+
     return `
-      <div class="position-card">
+      <div class="position-card" id="pos-${p.id}">
         <div class="pos-header">
           <span class="pos-ticker">${p.ticker}</span>
-          <span class="pos-status ${p.status}">${p.status.toUpperCase()}</span>
+          <span style="display:flex;gap:8px;align-items:center">
+            <span class="pos-status ${p.status}">${p.status.toUpperCase()}</span>
+            <button onclick="markClosed(${p.id},'${p.ticker}')"
+              style="background:var(--red2);border:none;color:#fff;padding:2px 10px;
+                     border-radius:4px;cursor:pointer;font-size:11px;font-family:var(--mono)">
+              ✕ закрыто
+            </button>
+          </span>
         </div>
         <div class="pos-legs">
           <div class="pos-leg leg-short">
             <div class="leg-label">SHORT</div>
             <div class="leg-exchange">${(p.short_exchange||'').toUpperCase()}</div>
-            <div class="leg-price">$${fmt(p.short_entry_price)}</div>
+            <div class="leg-price">entry $${fmt(p.short_entry_price)}</div>
+            <div style="font-size:11px;color:var(--text2)">now ${curShort}</div>
+            <div style="font-size:11px;${sPnlClass}">${sPnl}</div>
           </div>
           <div class="pos-leg leg-long">
             <div class="leg-label">LONG</div>
             <div class="leg-exchange">${(p.long_exchange||'').toUpperCase()}</div>
-            <div class="leg-price">$${fmt(p.long_entry_price)}</div>
+            <div class="leg-price">entry $${fmt(p.long_entry_price)}</div>
+            <div style="font-size:11px;color:var(--text2)">now ${curLong}</div>
+            <div style="font-size:11px;${lPnlClass}">${lPnl}</div>
           </div>
         </div>
         <div class="pos-meta">
           <span>size <span>$${p.trade_size_usd?.toFixed(2)||'—'}</span></span>
           <span>lev <span>${p.leverage||5}×</span></span>
-          <span>spread <span>${p.signal_spread_pct?.toFixed(2)||'—'}%</span></span>
+          <span>спред сигн. <span>${sigSpread}%</span></span>
+          <span>спред тек. <span style="${spreadColor}">${curSpread}%</span></span>
           <span>fund <span>${fund_s}</span>/<span>${fund_l}</span></span>
           <span>open <span>${dur}</span></span>
+          <span style="${uPnlClass};font-weight:600">unrealized <span>${uPnlStr}</span></span>
         </div>
+        ${p.live_error ? `<div style="font-size:10px;color:var(--red);padding:4px 8px">${p.live_error}</div>` : ''}
       </div>`;
   }).join('');
+}
+
+async function markClosed(tradeId, ticker) {
+  if (!confirm(`Пометить ${ticker} как закрытую? Это обновит статус в базе и отправит уведомление.`)) return;
+  try {
+    const r = await fetch(`${API}/api/positions/${tradeId}/mark-closed`, {method:'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      loadLivePositions();
+    } else {
+      alert('Ошибка: ' + (d.error || 'unknown'));
+    }
+  } catch(e) { alert('Ошибка: ' + e); }
 }
 
 // ── Stats ────────────────────────────────────────────────────
@@ -1211,23 +1255,41 @@ connectWS();
 loadTrades();
 setInterval(loadTrades, 30000);
 
+// Live позиции — обновляем каждые 15 секунд
+async function loadLivePositions() {
+  try {
+    const positions = await fetch(`${API}/api/positions/live`).then(r=>r.json());
+    renderOpenPositions(positions);
+  } catch(e) {
+    console.error('live positions error:', e);
+    // fallback — загружаем обычные открытые позиции
+    try {
+      const positions = await fetch(`${API}/api/trades/open`).then(r=>r.json());
+      renderOpenPositions(positions);
+    } catch(e2) {}
+  }
+}
+
+loadLivePositions();
+setInterval(loadLivePositions, 15000);
+
 // Загружаем начальное состояние
 (async () => {
   try {
-    const [statsR, balR, openR, botR] = await Promise.all([
+    const [statsR, balR, botR] = await Promise.all([
       fetch(`${API}/api/stats`).then(r=>r.json()),
       fetch(`${API}/api/balances`).then(r=>r.json()),
-      fetch(`${API}/api/trades/open`).then(r=>r.json()),
       fetch(`${API}/api/bot/status`).then(r=>r.json()),
     ]);
     renderStats(statsR);
     const bals = {};
     Object.entries(balR).forEach(([ex, v]) => bals[ex] = v.display || 0);
     renderBalances(bals);
-    renderOpenPositions(openR);
     updateBotButton(botR.running);
     updateDbPill(botR.db_ok);
     if (botR.error) showError('Ошибка бота: ' + botR.error);
+    // Live позиции загружаются отдельно
+    await loadLivePositions();
   } catch(e) { console.error(e); }
 })();
 </script>
