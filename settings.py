@@ -5,11 +5,9 @@ load_dotenv()
 
 LEVERAGE:            int   = int(os.getenv("LEVERAGE", "5"))
 PROXY:               str   = os.getenv("PROXY", "")
-# Минимальный спред без MEXC:
-# спред 5-7% + 4H/4H → медиана 49м, 71% за 4ч (отлично)
-# спред 3-4% → медиана 2521м (очень плохо)
-# спред 4-5% → медиана 881м (приемлемо)
-MIN_SPREAD_PCT:      float = float(os.getenv("MIN_SPREAD_PCT", "4.0"))
+# Минимальный спред: стратегия #4 работает от 3%
+# (медиана закрытия 2 минуты при обоих отрицательных фандингах)
+MIN_SPREAD_PCT:      float = float(os.getenv("MIN_SPREAD_PCT", "3.0"))
 # Минимальный объём 24ч. Для малых монет (ZBCN, NTRN) объём может быть $20k-100k
 # Ставим 0 чтобы не блокировать — объём проверяется визуально
 MIN_VOLUME_USD:      float = float(os.getenv("MIN_VOLUME_USD", "0"))

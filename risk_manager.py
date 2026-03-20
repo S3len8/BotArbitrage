@@ -100,35 +100,22 @@ async def check_signal(signal: OpenSignal, short_ex: BaseExchange, long_ex: Base
     if real_spread < MIN_SPREAD_PCT:
         return RiskResult(ok=False, reason=f"Спред упал до {real_spread:.3f}% (мин {MIN_SPREAD_PCT}%). {signal.ticker} пропущен.")
 
-    # 5b. Фандинг-фильтр (данные 61,471 закрытий без MEXC)
+    # 5b. Фандинг-фильтр — Стратегия #4
+    # ✅ Условие A: diff < 0.2%
+    # ✅ Условие B: оба фандинга отрицательные И diff < 1.0%
     fs = signal.funding_short
     fl = signal.funding_long
     if fs is not None and fl is not None:
-        diff_pct  = abs(fs - fl) * 100
-        i_s = signal.interval_short
-        i_l = signal.interval_long
-        passes = False
+        diff_pct      = abs(fs - fl) * 100
+        both_negative = fs < 0 and fl < 0
 
-        # 1H на любой бирже — медиана 4800м, не берём
-        if i_s == 1 or i_l == 1:
-            passes = False
-
-        # 4H/4H, 8H/8H, 4H/8H — берём при diff<0.2%
-        elif i_s in (4, 8) and i_l in (4, 8):
-            passes = diff_pct < 0.2
-
-        # Интервал неизвестен — только diff<0.1%
-        elif i_s is None or i_l is None:
-            passes = diff_pct < 0.1 and max(abs(fs)*100, abs(fl)*100) < MAX_FUNDING_ABS_PCT
-
-        # Остальные интервалы (2H и т.д.) — не берём
-        else:
-            passes = False
+        passes = diff_pct < 0.2 or (both_negative and diff_pct < 1.0)
 
         if not passes:
             return RiskResult(ok=False, reason=(
                 f"Фандинг не прошёл: short={fs*100:+.3f}% long={fl*100:+.3f}% "
-                f"diff={diff_pct:.3f}%, int={i_s}ч/{i_l}ч. {signal.ticker} пропущен."
+                f"diff={diff_pct:.3f}% — нужно diff<0.2% ИЛИ (оба отриц. + diff<1%). "
+                f"{signal.ticker} пропущен."
             ))
 
     # 6. Проверка объёма (если MIN_VOLUME_USD > 0)

@@ -438,12 +438,32 @@ class BinanceExchange(CcxtExchange):
     def _open_params(self, side): return {'type': 'MARKET'}
 
 
-class BybitExchange(CcxtExchange):
+class BybitExchange(BaseExchange):
+    name = 'bybit'
+
     def __init__(self):
-        super().__init__('bybit')
         keys = get_exchange_keys('bybit')
         self._api_key    = keys['api_key']
         self._api_secret = keys['api_secret']
+
+    async def get_price(self, symbol: str) -> float:
+        return await _run_sync(self._price_sync, symbol)
+
+    async def get_max_position_size(self, symbol: str) -> Optional[float]:
+        return None
+
+    async def get_24h_volume(self, symbol: str) -> Optional[float]:
+        def _sync():
+            ticker = _bybit_ticker(symbol)
+            r = requests.get('https://api.bybit.com/v5/market/tickers',
+                             params={'category': 'linear', 'symbol': ticker}, timeout=10)
+            r.raise_for_status()
+            items = r.json().get('result', {}).get('list', [])
+            return float(items[0].get('turnover24h') or 0) if items else None
+        return await _run_sync(_sync)
+
+    async def close(self):
+        pass  # нет ccxt клиента — закрывать нечего
 
     def _price_sync(self, symbol: str) -> float:
         ticker = _bybit_ticker(symbol)
@@ -488,18 +508,6 @@ class BybitExchange(CcxtExchange):
 
     async def get_futures_balance(self) -> float:
         return await _run_sync(self._balance_sync)
-
-    async def get_24h_volume(self, symbol: str) -> Optional[float]:
-        def _sync():
-            ticker = _bybit_ticker(symbol)
-            r = requests.get('https://api.bybit.com/v5/market/tickers',
-                             params={'category': 'linear', 'symbol': ticker}, timeout=10)
-            r.raise_for_status()
-            items = r.json().get('result', {}).get('list', [])
-            if items:
-                return float(items[0].get('turnover24h') or 0)
-            return None
-        return await _run_sync(_sync)
 
     async def _setup_symbol(self, symbol: str):
         """Bybit: ISOLATED margin + leverage через v5 REST."""
@@ -552,20 +560,69 @@ class BybitExchange(CcxtExchange):
         await _run_sync(_sync)
         print(f"[bybit] {ticker}: ISOLATED, {LEVERAGE}×")
 
+    def _bybit_order_sync(self, symbol: str, side: str, size_usd: float,
+                          reduce_only: bool = False, price: float = None) -> dict:
+        """Прямой REST ордер Bybit Futures v5 — без ccxt."""
+        import json as _json
+        ticker = _bybit_ticker(symbol)
+        if price is None:
+            price = self._price_sync(symbol)
+
+        # Минимальный шаг qty
+        try:
+            r = requests.get('https://api.bybit.com/v5/market/instruments-info',
+                             params={'category': 'linear', 'symbol': ticker}, timeout=10)
+            items = r.json().get('result', {}).get('list', [])
+            step = float(items[0]['lotSizeFilter']['qtyStep']) if items else 0.01
+        except Exception:
+            step = 0.01
+        qty = _round(size_usd / price, step)
+        if qty <= 0:
+            raise ValueError(f"bybit: qty={qty} <= 0 для {ticker}")
+
+        ts  = str(_ts())
+        recv_window = '5000'
+        body = {
+            'category':   'linear',
+            'symbol':     ticker,
+            'side':       'Sell' if side == 'sell' else 'Buy',
+            'orderType':  'Market',
+            'qty':        str(qty),
+            'timeInForce': 'IOC',
+        }
+        if reduce_only:
+            body['reduceOnly'] = True
+        body_str  = _json.dumps(body, separators=(',', ':'))
+        sign_str  = ts + self._api_key + recv_window + body_str
+        sig = _sign_hmac_sha256(self._api_secret, sign_str)
+        headers = {
+            'X-BAPI-API-KEY':     self._api_key,
+            'X-BAPI-SIGN':        sig,
+            'X-BAPI-TIMESTAMP':   ts,
+            'X-BAPI-RECV-WINDOW': recv_window,
+            'Content-Type':       'application/json',
+        }
+        r = requests.post('https://api.bybit.com/v5/order/create',
+                          headers=headers, data=body_str, timeout=15)
+        r.raise_for_status()
+        d = r.json()
+        if d.get('retCode') != 0:
+            raise ValueError(f"bybit order error: {d.get('retMsg')} code={d.get('retCode')}")
+        order_id = d.get('result', {}).get('orderId', '')
+        return {'order_id': order_id, 'price': price, 'qty': qty, 'fee': 0.0}
+
     def _open_params(self, side): return {'positionIdx': 0}
+
+    async def place_market_order(self, symbol: str, side: str, size_usd: float) -> dict:
+        await self._setup_symbol(symbol)
+        return await _run_sync(self._bybit_order_sync, symbol, side, size_usd)
 
     async def close_position(self, symbol, side, qty):
         price = await self.get_price(symbol)
-        order = await self._client.create_market_order(
-            self._fmt(symbol), side, qty,
-            params={'reduceOnly': True, 'positionIdx': 0}
-        )
-        fill_price = float(order.get('average') or order.get('price') or 0)
-        return {
-            'order_id': str(order['id']),
-            'price':    fill_price if fill_price > 0 else price,
-            'fee':      float((order.get('fee') or {}).get('cost') or 0),
-        }
+        result = await _run_sync(self._bybit_order_sync, symbol, side,
+                                 qty * price, reduce_only=True, price=price)
+        result['price'] = price
+        return result
 
 
 class MexcExchange(CcxtExchange):
@@ -710,13 +767,23 @@ class MexcExchange(CcxtExchange):
         return await _run_sync(_close_sync)
 
 
-class BitgetExchange(CcxtExchange):
+class BitgetExchange(BaseExchange):
+    name = 'bitget'
+
     def __init__(self):
-        super().__init__('bitget', {'options': {'defaultType': 'swap'}})
         keys = get_exchange_keys('bitget')
         self._api_key    = keys['api_key']
         self._api_secret = keys['api_secret']
         self._passphrase = keys.get('api_password', '')
+
+    async def get_price(self, symbol: str) -> float:
+        return await _run_sync(self._price_sync, symbol)
+
+    async def get_max_position_size(self, symbol: str) -> Optional[float]:
+        return None
+
+    async def close(self):
+        pass
 
     def _price_sync(self, symbol: str) -> float:
         ticker = _bitget_ticker(symbol)
@@ -813,6 +880,74 @@ class BitgetExchange(CcxtExchange):
         await _run_sync(_sync)
         print(f"[bitget] {ticker}: ISOLATED, {LEVERAGE}×")
 
+    def _bitget_order_sync(self, symbol: str, side: str, size_usd: float,
+                           reduce_only: bool = False, price: float = None) -> dict:
+        """Прямой REST ордер Bitget Futures Mix API v2 — без ccxt."""
+        import base64, json as _json
+        ticker = _bitget_ticker(symbol)
+        if price is None:
+            price = self._price_sync(symbol)
+
+        # Минимальный шаг qty
+        try:
+            r = requests.get('https://api.bitget.com/api/v2/mix/market/contracts',
+                             params={'symbol': ticker, 'productType': 'USDT-FUTURES'}, timeout=10)
+            data = r.json().get('data', [])
+            step = float(data[0]['sizeMultiplier']) if data else 0.01
+        except Exception:
+            step = 0.01
+        qty = _round(size_usd / price, step)
+        if qty <= 0:
+            raise ValueError(f"bitget: qty={qty} <= 0 для {ticker}")
+
+        def _sign_bitget(ts, method, path, body=''):
+            msg = ts + method + path + body
+            return base64.b64encode(
+                hmac.new(self._api_secret.encode(), msg.encode(), hashlib.sha256).digest()
+            ).decode()
+
+        ts   = str(_ts())
+        path = '/api/v2/mix/order/place-order'
+        body_d = {
+            'symbol':      ticker,
+            'productType': 'USDT-FUTURES',
+            'marginMode':  'isolated',
+            'marginCoin':  'USDT',
+            'side':        'sell' if side == 'sell' else 'buy',
+            'tradeSide':   'close' if reduce_only else 'open',
+            'orderType':   'market',
+            'size':        str(qty),
+            'leverage':    str(LEVERAGE),
+        }
+        body_str = _json.dumps(body_d, separators=(',', ':'))
+        sig = _sign_bitget(ts, 'POST', path, body_str)
+        headers = {
+            'ACCESS-KEY':        self._api_key,
+            'ACCESS-SIGN':       sig,
+            'ACCESS-TIMESTAMP':  ts,
+            'ACCESS-PASSPHRASE': self._passphrase,
+            'Content-Type':      'application/json',
+        }
+        r = requests.post(f'https://api.bitget.com{path}',
+                          headers=headers, data=body_str, timeout=15)
+        r.raise_for_status()
+        d = r.json()
+        if d.get('code') not in ('00000', 0):
+            raise ValueError(f"bitget order error: {d.get('msg')} code={d.get('code')}")
+        order_id = d.get('data', {}).get('orderId', '')
+        return {'order_id': order_id, 'price': price, 'qty': qty, 'fee': 0.0}
+
+    async def place_market_order(self, symbol: str, side: str, size_usd: float) -> dict:
+        await self._setup_symbol(symbol)
+        return await _run_sync(self._bitget_order_sync, symbol, side, size_usd)
+
+    async def close_position(self, symbol: str, side: str, qty: float) -> dict:
+        price = await self.get_price(symbol)
+        result = await _run_sync(self._bitget_order_sync, symbol, side,
+                                 qty * price, reduce_only=True, price=price)
+        result['price'] = price
+        return result
+
     def _fmt(self, symbol): return f"{symbol.replace('USDT','')}/USDT:USDT"
 
 
@@ -824,12 +959,6 @@ class KucoinExchange(BaseExchange):
         self._api_key    = keys['api_key']
         self._api_secret = keys['api_secret']
         self._passphrase = keys.get('api_password', '')
-        self._client = ccxt.kucoinfutures({
-            'apiKey':          self._api_key,
-            'secret':          self._api_secret,
-            'password':        self._passphrase,
-            'enableRateLimit': True,
-        })
 
     def _balance_sync(self) -> float:
         import base64
@@ -901,21 +1030,25 @@ class KucoinExchange(BaseExchange):
             pass
         return 1.0
 
-    def _place_order_sync(self, symbol: str, side: str, qty: float) -> dict:
+    def _place_order_sync(self, symbol: str, side: str, qty: float,
+                          reduce_only: bool = False) -> dict:
         """Размещает рыночный ордер через KuCoin REST API."""
         import base64, json as _json, uuid
         ticker = _kucoin_ticker(symbol)
         ts     = str(_ts())
         method = 'POST'
         path   = '/api/v1/orders'
-        body   = _json.dumps({
+        body_d = {
             'clientOid': str(uuid.uuid4()),
             'symbol':    ticker,
             'side':      'sell' if side == 'sell' else 'buy',
             'type':      'market',
             'size':      str(int(qty)),
             'leverage':  str(LEVERAGE),
-        })
+        }
+        if reduce_only:
+            body_d['closeOrder'] = True
+        body = _json.dumps(body_d)
         sign_str = ts + method + path + body
         sig = base64.b64encode(
             hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha256).digest()
@@ -991,28 +1124,21 @@ class KucoinExchange(BaseExchange):
                 print(f"[kucoin] leverage: {e}")
 
         await _run_sync(_sync)
-        # Также через ccxt для надёжности
-        try:
-            await self._client.set_leverage(LEVERAGE, self._fmt(symbol))
-        except Exception as e:
-            print(f"[kucoin] ccxt set_leverage: {e}")
         print(f"[kucoin] {ticker}: {LEVERAGE}×")
 
     async def close_position(self, symbol: str, side: str, qty: float) -> dict:
-        order = await self._client.create_market_order(
-            self._fmt(symbol), side, qty, params={'reduceOnly': True}
-        )
-        return {
-            'order_id': str(order['id']),
-            'price':    float(order.get('average') or order.get('price') or 0),
-            'fee':      float((order.get('fee') or {}).get('cost') or 0),
-        }
+        price = await self.get_price(symbol)
+        qty_int = max(1, int(qty))
+        result = await _run_sync(self._place_order_sync, symbol, side, qty_int,
+                                 reduce_only=True)
+        result['price'] = price
+        return result
 
     def _fmt(self, symbol: str) -> str:
         return f"{symbol.replace('USDT', '')}/USDT:USDT"
 
     async def close(self):
-        await self._client.close()
+        pass  # нет ccxt клиента
 
 
 class GateExchange(CcxtExchange):
