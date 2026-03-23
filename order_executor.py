@@ -187,7 +187,38 @@ async def close_position(close_signal: CloseSignal) -> tuple[Optional[Trade], st
         trade.fee_long_usd = (trade.fee_long_usd or 0) + long_c.get('fee', 0)
 
     trade.status = 'closed' if (short_ok and long_ok) else 'partial'
-    _calc_pnl(trade)
+
+    # Получаем реальный PnL с бирж (через 500мс после закрытия чтобы данные появились)
+    await asyncio.sleep(0.5)
+    real_short_pnl = None
+    real_long_pnl  = None
+    try:
+        s_ex2 = create_exchange(trade.short_exchange)
+        l_ex2 = create_exchange(trade.long_exchange)
+        s_pnl_r, l_pnl_r = await asyncio.gather(
+            s_ex2.get_closed_pnl(trade.symbol),
+            l_ex2.get_closed_pnl(trade.symbol),
+            return_exceptions=True,
+        )
+        await asyncio.gather(s_ex2.close(), l_ex2.close(), return_exceptions=True)
+        if not isinstance(s_pnl_r, Exception) and s_pnl_r is not None:
+            real_short_pnl = s_pnl_r
+        if not isinstance(l_pnl_r, Exception) and l_pnl_r is not None:
+            real_long_pnl = l_pnl_r
+        print(f"[Executor] Real PnL from exchanges: short={real_short_pnl} long={real_long_pnl}")
+    except Exception as e:
+        print(f"[Executor] get_closed_pnl error: {e}")
+
+    # Если получили реальные данные с бирж — используем их
+    fees = (trade.fee_short_usd or 0) + (trade.fee_long_usd or 0)
+    if real_short_pnl is not None and real_long_pnl is not None:
+        trade.short_pnl_usd = round(real_short_pnl, 6)
+        trade.long_pnl_usd  = round(real_long_pnl, 6)
+        trade.net_pnl_usd   = round(real_short_pnl + real_long_pnl - fees, 6)
+    else:
+        # Fallback — считаем через нотиональную стоимость
+        _calc_pnl(trade)
+
     update_trade(trade)
 
     await _snapshot_balances([trade.short_exchange, trade.long_exchange])
@@ -237,10 +268,36 @@ async def check_balance_alerts(exchanges: list[str], initial_balances: dict[str,
 
 
 def _calc_pnl(t: Trade):
-    try: t.short_pnl_usd = round((t.short_entry_price - t.short_close_price) * t.short_qty, 6)
-    except TypeError: t.short_pnl_usd = None
-    try: t.long_pnl_usd  = round((t.long_close_price  - t.long_entry_price)  * t.long_qty,  6)
-    except TypeError: t.long_pnl_usd = None
+    """Считает PnL арбитражной позиции.
+
+    Формула через нотиональную стоимость:
+    SHORT PnL = size_usd * (entry_short / close_short - 1)
+    LONG  PnL = size_usd * (close_long  / entry_long  - 1)
+
+    Это корректно даже если qty на разных биржах отличается
+    (например Gate контракты vs Binance монеты).
+    """
+    size = t.trade_size_usd or 0
+    try:
+        if t.short_entry_price and t.short_close_price and t.short_entry_price > 0:
+            # SHORT: зарабатываем когда цена падает
+            short_return = t.short_entry_price / t.short_close_price - 1
+            t.short_pnl_usd = round(size * short_return, 6)
+        else:
+            t.short_pnl_usd = None
+    except (TypeError, ZeroDivisionError):
+        t.short_pnl_usd = None
+
+    try:
+        if t.long_entry_price and t.long_close_price and t.long_entry_price > 0:
+            # LONG: зарабатываем когда цена растёт
+            long_return = t.long_close_price / t.long_entry_price - 1
+            t.long_pnl_usd = round(size * long_return, 6)
+        else:
+            t.long_pnl_usd = None
+    except (TypeError, ZeroDivisionError):
+        t.long_pnl_usd = None
+
     fees = (t.fee_short_usd or 0) + (t.fee_long_usd or 0)
     if t.short_pnl_usd is not None and t.long_pnl_usd is not None:
         t.net_pnl_usd = round(t.short_pnl_usd + t.long_pnl_usd - fees, 6)
@@ -259,3 +316,222 @@ async def _close(*exs):
 
 
 def _upnl(v): return f"${v:+.4f}" if v is not None else "—"
+
+
+# ── Фандинг-монитор ───────────────────────────────────────────
+# Проверяет каждые 60с: если diff фандинга > спред и идёт в убыток —
+# закрывает позицию за 5 минут до начисления.
+
+_funding_monitor_task: asyncio.Task | None = None
+
+# Кэш фандинга: {trade_id: {'sf': rate, 'lf': rate, 'interval': h, 'updated': ts}}
+_funding_cache: dict = {}
+FUNDING_CACHE_TTL = 20 * 60  # обновляем каждые 20 минут
+
+
+async def start_funding_monitor():
+    """Запускает фоновый мониторинг фандинга для всех открытых позиций."""
+    global _funding_monitor_task
+    if _funding_monitor_task and not _funding_monitor_task.done():
+        return
+    _funding_monitor_task = asyncio.create_task(_funding_monitor_loop())
+    print("[FundingMonitor] запущен")
+
+
+async def _funding_monitor_loop():
+    """
+    Логика:
+    1. Каждые 60с проверяем открытые позиции
+    2. Каждые 20 минут обновляем фандинг с бирж
+    3. Считаем текущий спред (по ценам с бирж)
+    4. Считаем net_funding_per_period = сколько % платим/получаем за 1 период
+    5. Если фандинг в убыток:
+       - Считаем сколько периодов пройдёт пока фандинг "съест" спред
+       - Закрываем за 5 минут до того как накопленный фандинг >= текущего спреда
+    6. Всегда закрываем за 5 минут до начисления если общий убыток > спреда
+    """
+    import time as _time
+    from db import get_all_open_trades
+    from exchanges import create_exchange
+    from signal_parser import CloseSignal
+
+    while True:
+        await asyncio.sleep(60)
+        try:
+            trades = get_all_open_trades()
+            if not trades:
+                continue
+
+            for t in trades:
+                try:
+                    await _check_funding_for_trade(t)
+                except Exception as e:
+                    print(f"[FundingMonitor] ошибка {t.ticker}: {e}")
+
+        except Exception as e:
+            print(f"[FundingMonitor] loop error: {e}")
+
+
+async def _check_funding_for_trade(t):
+    import time as _time
+    from exchanges import create_exchange
+    from signal_parser import CloseSignal
+
+    now = int(_time.time())
+    cache = _funding_cache.get(t.id, {})
+
+    # Обновляем фандинг каждые 20 минут
+    if now - cache.get('updated', 0) > FUNDING_CACHE_TTL:
+        s_ex = create_exchange(t.short_exchange)
+        l_ex = create_exchange(t.long_exchange)
+        s_fund, l_fund, s_price, l_price = await asyncio.gather(
+            s_ex.get_funding_rate(t.symbol),
+            l_ex.get_funding_rate(t.symbol),
+            s_ex.get_price(t.symbol),
+            l_ex.get_price(t.symbol),
+            return_exceptions=True,
+        )
+        await asyncio.gather(s_ex.close(), l_ex.close(), return_exceptions=True)
+
+        if isinstance(s_fund, Exception) or isinstance(l_fund, Exception):
+            return
+        if not s_fund or not l_fund:
+            return
+
+        # Интервал фандинга (берём наименьший из двух бирж)
+        s_interval = s_fund.get('interval_hours', 8)
+        l_interval = l_fund.get('interval_hours', 8)
+        interval   = min(s_interval, l_interval)
+
+        _funding_cache[t.id] = {
+            'sf':          s_fund.get('rate', 0),
+            'lf':          l_fund.get('rate', 0),
+            'interval':    interval,
+            'next_short':  s_fund.get('next_time', 0),
+            'next_long':   l_fund.get('next_time', 0),
+            'cur_short':   float(s_price) if not isinstance(s_price, Exception) else None,
+            'cur_long':    float(l_price) if not isinstance(l_price, Exception) else None,
+            'updated':     now,
+        }
+        cache = _funding_cache[t.id]
+        print(f"[FundingMonitor] {t.ticker}: обновлён фандинг "
+              f"short={cache['sf']*100:+.3f}% long={cache['lf']*100:+.3f}% "
+              f"интервал={interval}ч")
+
+    sf_rate  = cache.get('sf', 0)
+    lf_rate  = cache.get('lf', 0)
+    interval = cache.get('interval', 8)
+    sp       = cache.get('cur_short')
+    lp       = cache.get('cur_long')
+
+    # Текущий спред по ценам с бирж
+    if sp and lp and lp > 0:
+        current_spread_pct = (sp / lp - 1) * 100
+    else:
+        current_spread_pct = t.signal_spread_pct or 0
+
+    # Спред по ценам входа (реальный потенциал прибыли)
+    if t.short_entry_price and t.long_entry_price and t.long_entry_price > 0:
+        entry_spread_pct = (t.short_entry_price / t.long_entry_price - 1) * 100
+    else:
+        entry_spread_pct = t.signal_spread_pct or 0
+
+    # Net фандинг за 1 период:
+    # SHORT позиция: если sf_rate > 0 — платим, если < 0 — получаем
+    # LONG позиция:  если lf_rate < 0 — платим, если > 0 — получаем
+    # Итого за период (в % от позиции):
+    net_fund_per_period = -(sf_rate * 100) - (lf_rate * 100)
+    # net_fund_per_period > 0 = получаем фандинг (хорошо)
+    # net_fund_per_period < 0 = платим фандинг (плохо)
+
+    # Время до следующего начисления
+    next_short = cache.get('next_short', 0)
+    next_long  = cache.get('next_long', 0)
+    next_times = [t for t in [next_short, next_long] if t > 0]
+    next_fund  = min(next_times) if next_times else 0
+    minutes_until = (next_fund - now) / 60 if next_fund > now else 999
+
+    # Время в позиции
+    from datetime import datetime, timezone
+    try:
+        opened = datetime.fromisoformat(str(t.opened_at).replace('Z', '+00:00'))
+        hours_held = (datetime.now(timezone.utc) - opened).total_seconds() / 3600
+    except Exception:
+        hours_held = 0
+
+    # Сколько периодов уже прошло
+    periods_elapsed = hours_held / interval if interval > 0 else 0
+
+    # Накопленный фандинг с момента входа
+    accumulated_fund = net_fund_per_period * periods_elapsed
+
+    print(f"[FundingMonitor] {t.ticker}: "
+          f"entry_spread={entry_spread_pct:.2f}% cur_spread={current_spread_pct:.2f}% "
+          f"net_fund/period={net_fund_per_period:+.3f}% "
+          f"accumulated={accumulated_fund:+.3f}% "
+          f"held={hours_held:.1f}ч next_fund={minutes_until:.0f}м")
+
+    should_close = False
+    close_reason = ""
+
+    if net_fund_per_period < 0:
+        # Фандинг идёт в убыток — нужно следить
+
+        # Остаточная прибыль = entry_spread + накопленный фандинг
+        remaining_profit = entry_spread_pct + accumulated_fund
+
+        # Через сколько периодов фандинг съест весь спред
+        if net_fund_per_period < 0:
+            periods_until_loss = entry_spread_pct / abs(net_fund_per_period)
+            hours_until_loss   = periods_until_loss * interval
+        else:
+            hours_until_loss   = 9999
+
+        # Через сколько минут следующее начисление которое убьёт прибыль
+        next_period_fund = net_fund_per_period  # следующее начисление
+        after_next_profit = remaining_profit + next_period_fund
+
+        print(f"[FundingMonitor] {t.ticker}: "
+              f"remaining_profit={remaining_profit:.3f}% "
+              f"after_next={after_next_profit:.3f}% "
+              f"hours_until_loss={hours_until_loss:.1f}ч")
+
+        # Закрываем за 5 минут до начисления если:
+        # 1. После следующего начисления прибыль станет отрицательной
+        if after_next_profit < 0 and 0 < minutes_until <= 5:
+            should_close = True
+            close_reason = (
+                f"После следующего фандинга прибыль будет {after_next_profit:.3f}% (убыток)\n"
+                f"Entry спред: {entry_spread_pct:.2f}% | Накоплено: {accumulated_fund:+.3f}%\n"
+                f"Net фандинг/период: {net_fund_per_period:+.3f}%"
+            )
+
+        # 2. Накопленный фандинг уже съел >80% спреда и фандинг ещё идёт в минус
+        elif accumulated_fund < -(entry_spread_pct * 0.8):
+            should_close = True
+            close_reason = (
+                f"Фандинг съел {abs(accumulated_fund):.3f}% из {entry_spread_pct:.2f}% спреда\n"
+                f"Осталось: {remaining_profit:.3f}%"
+            )
+
+        # 3. Логика из примера: фандинг -1%/ч, спред 3% → ждём 2ч и закрываем
+        # Если прошло >= расчётного времени удержания (спред / |fund_rate| периодов)
+        elif hours_held >= hours_until_loss * 0.9 and 0 < minutes_until <= 5:
+            should_close = True
+            close_reason = (
+                f"Достигнуто расчётное время удержания ({hours_until_loss:.1f}ч)\n"
+                f"Фандинг {net_fund_per_period:+.3f}%/{interval}ч | Спред входа {entry_spread_pct:.2f}%"
+            )
+
+    if should_close:
+        print(f"[FundingMonitor] ⚠️ {t.ticker}: закрываем! {close_reason}")
+        await notify(
+            f"⚠️ <b>Авто-закрытие {t.ticker}</b>\n"
+            f"{close_reason}\n"
+            f"⏱ До фандинга: {minutes_until:.0f} мин"
+        )
+        cs = CloseSignal(ticker=t.ticker, symbol=t.symbol)
+        _, msg = await close_position(cs)
+        await notify(msg)
+        # Убираем из кэша
+        _funding_cache.pop(t.id, None)

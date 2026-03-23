@@ -53,6 +53,25 @@ class BaseExchange(ABC):
         """Объём торгов за 24ч в USD. None если недоступно."""
         return None
 
+    async def get_funding_rate(self, symbol: str) -> Optional[dict]:
+        """Возвращает текущий фандинг и время следующего начисления.
+        {'rate': float, 'next_time': int (unix timestamp), 'interval_hours': int}
+        """
+        return None
+
+    async def get_open_position(self, symbol: str) -> Optional[dict]:
+        """Возвращает открытую позицию на бирже или None если нет.
+        {'size': float, 'side': 'long'|'short', 'entry_price': float,
+         'unrealized_pnl': float, 'leverage': int}
+        """
+        return None
+
+    async def get_closed_pnl(self, symbol: str) -> Optional[float]:
+        """Возвращает реализованный PnL последней закрытой позиции с биржи.
+        Это точные данные с биржи — использовать для итогового расчёта прибыли.
+        """
+        return None
+
     async def get_position_size_usd(self) -> float:
         return await self.get_futures_balance() * LEVERAGE
 
@@ -437,6 +456,68 @@ class BinanceExchange(CcxtExchange):
 
     def _open_params(self, side): return {'type': 'MARKET'}
 
+    async def get_closed_pnl(self, symbol: str) -> Optional[float]:
+        """Получает реализованный PnL закрытой позиции с Binance Futures."""
+        def _sync():
+            ticker = symbol.replace('/', '').replace(':USDT', '')
+            ts = _ts()
+            qs = f"symbol={ticker}&limit=10&timestamp={ts}&recvWindow=5000"
+            sig = _sign_hmac_sha256(self._api_secret, qs)
+            r = requests.get('https://fapi.binance.com/fapi/v1/userTrades',
+                             headers={'X-MBX-APIKEY': self._api_key},
+                             params={'symbol': ticker, 'limit': 10, 'timestamp': ts,
+                                     'recvWindow': 5000, 'signature': sig}, timeout=10)
+            r.raise_for_status()
+            trades = r.json()
+            if not trades: return None
+            return sum(float(t.get('realizedPnl', 0)) for t in trades)
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
+
+    async def get_funding_rate(self, symbol: str) -> Optional[dict]:
+        def _sync():
+            ticker = symbol.replace('/', '').replace(':USDT', '')
+            r = requests.get('https://fapi.binance.com/fapi/v1/premiumIndex',
+                             params={'symbol': ticker}, timeout=10)
+            r.raise_for_status()
+            d = r.json()
+            rate = float(d.get('lastFundingRate') or 0)
+            next_ts = int(d.get('nextFundingTime', 0)) // 1000
+            return {'rate': rate, 'next_time': next_ts, 'interval_hours': 8}
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
+
+    async def get_open_position(self, symbol: str) -> Optional[dict]:
+        def _sync():
+            ticker = symbol.replace('/', '').replace(':USDT', '')
+            ts = _ts()
+            qs = f"symbol={ticker}&timestamp={ts}&recvWindow=5000"
+            sig = _sign_hmac_sha256(self._api_secret, qs)
+            r = requests.get('https://fapi.binance.com/fapi/v2/positionRisk',
+                             headers={'X-MBX-APIKEY': self._api_key},
+                             params={'symbol': ticker, 'timestamp': ts,
+                                     'recvWindow': 5000, 'signature': sig}, timeout=10)
+            r.raise_for_status()
+            for p in r.json():
+                amt = float(p.get('positionAmt', 0))
+                if amt != 0:
+                    return {
+                        'size': abs(amt),
+                        'side': 'long' if amt > 0 else 'short',
+                        'entry_price': float(p.get('entryPrice', 0)),
+                        'unrealized_pnl': float(p.get('unRealizedProfit', 0)),
+                        'leverage': int(float(p.get('leverage', LEVERAGE))),
+                    }
+            return None
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
+
 
 class BybitExchange(BaseExchange):
     name = 'bybit'
@@ -612,6 +693,82 @@ class BybitExchange(BaseExchange):
         return {'order_id': order_id, 'price': price, 'qty': qty, 'fee': 0.0}
 
     def _open_params(self, side): return {'positionIdx': 0}
+
+    async def get_closed_pnl(self, symbol: str) -> Optional[float]:
+        """Получает реализованный PnL закрытой позиции с Bybit."""
+        def _sync():
+            ticker = _bybit_ticker(symbol)
+            ts = str(_ts())
+            recv = '5000'
+            qs = f"category=linear&symbol={ticker}&limit=10"
+            sign_str = ts + self._api_key + recv + qs
+            sig = _sign_hmac_sha256(self._api_secret, sign_str)
+            r = requests.get('https://api.bybit.com/v5/position/closed-pnl',
+                             headers={'X-BAPI-API-KEY': self._api_key,
+                                      'X-BAPI-SIGN': sig,
+                                      'X-BAPI-TIMESTAMP': ts,
+                                      'X-BAPI-RECV-WINDOW': recv},
+                             params={'category': 'linear', 'symbol': ticker, 'limit': 10},
+                             timeout=10)
+            r.raise_for_status()
+            items = r.json().get('result', {}).get('list', [])
+            if not items: return None
+            # Берём самую последнюю закрытую позицию
+            return float(items[0].get('closedPnl', 0))
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
+
+    async def get_funding_rate(self, symbol: str) -> Optional[dict]:
+        def _sync():
+            ticker = _bybit_ticker(symbol)
+            r = requests.get('https://api.bybit.com/v5/market/tickers',
+                             params={'category': 'linear', 'symbol': ticker}, timeout=10)
+            r.raise_for_status()
+            items = r.json().get('result', {}).get('list', [])
+            if not items: return None
+            d = items[0]
+            rate    = float(d.get('fundingRate') or 0)
+            next_ts = int(d.get('nextFundingTime', 0)) // 1000
+            return {'rate': rate, 'next_time': next_ts, 'interval_hours': 8}
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
+
+    async def get_open_position(self, symbol: str) -> Optional[dict]:
+        def _sync():
+            ticker = _bybit_ticker(symbol)
+            ts = str(_ts())
+            recv = '5000'
+            qs = f"category=linear&symbol={ticker}"
+            sign_str = ts + self._api_key + recv + qs
+            sig = _sign_hmac_sha256(self._api_secret, sign_str)
+            r = requests.get('https://api.bybit.com/v5/position/list',
+                             headers={'X-BAPI-API-KEY': self._api_key,
+                                      'X-BAPI-SIGN': sig,
+                                      'X-BAPI-TIMESTAMP': ts,
+                                      'X-BAPI-RECV-WINDOW': recv},
+                             params={'category': 'linear', 'symbol': ticker}, timeout=10)
+            r.raise_for_status()
+            items = r.json().get('result', {}).get('list', [])
+            for p in items:
+                size = float(p.get('size', 0))
+                if size > 0:
+                    side = p.get('side', '').lower()
+                    return {
+                        'size': size,
+                        'side': side,
+                        'entry_price': float(p.get('avgPrice', 0)),
+                        'unrealized_pnl': float(p.get('unrealisedPnl', 0)),
+                        'leverage': int(float(p.get('leverage', LEVERAGE))),
+                    }
+            return None
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
 
     async def place_market_order(self, symbol: str, side: str, size_usd: float) -> dict:
         await self._setup_symbol(symbol)
@@ -888,15 +1045,25 @@ class BitgetExchange(BaseExchange):
         if price is None:
             price = self._price_sync(symbol)
 
-        # Минимальный шаг qty
+        # Получаем параметры контракта
+        # sizeMultiplier = размер 1 контракта в базовой валюте
+        # minTradeNum    = минимальный размер ордера в контрактах
+        contract_size = 1.0
+        min_trade     = 1.0
         try:
             r = requests.get('https://api.bitget.com/api/v2/mix/market/contracts',
                              params={'symbol': ticker, 'productType': 'USDT-FUTURES'}, timeout=10)
             data = r.json().get('data', [])
-            step = float(data[0]['sizeMultiplier']) if data else 0.01
-        except Exception:
-            step = 0.01
-        qty = _round(size_usd / price, step)
+            if data:
+                contract_size = float(data[0].get('sizeMultiplier') or 1)
+                min_trade     = float(data[0].get('minTradeNum') or 1)
+                print(f"[bitget] {ticker}: contract_size={contract_size} min_trade={min_trade}")
+        except Exception as e:
+            print(f"[bitget] contract info error: {e}")
+
+        # qty в контрактах
+        qty_raw = size_usd / price / contract_size
+        qty = max(min_trade, round(qty_raw / min_trade) * min_trade)
         if qty <= 0:
             raise ValueError(f"bitget: qty={qty} <= 0 для {ticker}")
 
@@ -930,7 +1097,9 @@ class BitgetExchange(BaseExchange):
         }
         r = requests.post(f'https://api.bitget.com{path}',
                           headers=headers, data=body_str, timeout=15)
-        r.raise_for_status()
+        if not r.ok:
+            print(f"[bitget] order failed {r.status_code}: {r.text[:300]}")
+            r.raise_for_status()
         d = r.json()
         if d.get('code') not in ('00000', 0):
             raise ValueError(f"bitget order error: {d.get('msg')} code={d.get('code')}")
@@ -947,6 +1116,81 @@ class BitgetExchange(BaseExchange):
                                  qty * price, reduce_only=True, price=price)
         result['price'] = price
         return result
+
+    async def get_closed_pnl(self, symbol: str) -> Optional[float]:
+        """Получает реализованный PnL закрытой позиции с Bitget."""
+        import base64
+        def _sync():
+            ticker = _bitget_ticker(symbol)
+            ts   = str(_ts())
+            path = f'/api/v2/mix/order/history?symbol={ticker}&productType=USDT-FUTURES&limit=5'
+            msg  = ts + 'GET' + path
+            sig  = base64.b64encode(
+                hmac.new(self._api_secret.encode(), msg.encode(), hashlib.sha256).digest()
+            ).decode()
+            r = requests.get(f'https://api.bitget.com{path}',
+                             headers={'ACCESS-KEY': self._api_key, 'ACCESS-SIGN': sig,
+                                      'ACCESS-TIMESTAMP': ts, 'ACCESS-PASSPHRASE': self._passphrase,
+                                      'Content-Type': 'application/json'}, timeout=10)
+            r.raise_for_status()
+            orders = r.json().get('data', {}).get('orderList', []) or []
+            if not orders: return None
+            # Суммируем pnl последних закрытых ордеров
+            return sum(float(o.get('pnl', 0) or 0) for o in orders[:5])
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
+
+    async def get_funding_rate(self, symbol: str) -> Optional[dict]:
+        def _sync():
+            ticker = _bitget_ticker(symbol)
+            r = requests.get('https://api.bitget.com/api/v2/mix/market/current-fund-rate',
+                             params={'symbol': ticker, 'productType': 'USDT-FUTURES'}, timeout=10)
+            r.raise_for_status()
+            data = r.json().get('data', [])
+            if not data: return None
+            d = data[0] if isinstance(data, list) else data
+            rate    = float(d.get('fundingRate') or 0)
+            next_ts = int(d.get('nextFundingTime', 0)) // 1000
+            return {'rate': rate, 'next_time': next_ts, 'interval_hours': 8}
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
+
+    async def get_open_position(self, symbol: str) -> Optional[dict]:
+        import base64
+        def _sync():
+            ticker = _bitget_ticker(symbol)
+            ts   = str(_ts())
+            path = f'/api/v2/mix/position/single-position?symbol={ticker}&productType=USDT-FUTURES&marginCoin=USDT'
+            msg  = ts + 'GET' + path
+            sig  = base64.b64encode(
+                hmac.new(self._api_secret.encode(), msg.encode(), hashlib.sha256).digest()
+            ).decode()
+            r = requests.get(f'https://api.bitget.com{path}',
+                             headers={'ACCESS-KEY': self._api_key, 'ACCESS-SIGN': sig,
+                                      'ACCESS-TIMESTAMP': ts, 'ACCESS-PASSPHRASE': self._passphrase,
+                                      'Content-Type': 'application/json'}, timeout=10)
+            r.raise_for_status()
+            data = r.json().get('data', [])
+            for p in (data if isinstance(data, list) else [data]):
+                size = float(p.get('total', 0) or 0)
+                if size > 0:
+                    side = 'long' if p.get('holdSide') == 'long' else 'short'
+                    return {
+                        'size': size,
+                        'side': side,
+                        'entry_price': float(p.get('openPriceAvg', 0)),
+                        'unrealized_pnl': float(p.get('unrealizedPL', 0)),
+                        'leverage': int(float(p.get('leverage', LEVERAGE))),
+                    }
+            return None
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
 
     def _fmt(self, symbol): return f"{symbol.replace('USDT','')}/USDT:USDT"
 
@@ -1140,6 +1384,54 @@ class KucoinExchange(BaseExchange):
     async def close(self):
         pass  # нет ccxt клиента
 
+    async def get_funding_rate(self, symbol: str) -> Optional[dict]:
+        def _sync():
+            ticker = _kucoin_ticker(symbol)
+            r = requests.get(f'https://api-futures.kucoin.com/api/v1/funding-rate/{ticker}/current',
+                             timeout=10)
+            r.raise_for_status()
+            d = r.json().get('data', {})
+            rate    = float(d.get('value') or 0)
+            next_ts = int(d.get('timePoint', 0)) // 1000
+            return {'rate': rate, 'next_time': next_ts, 'interval_hours': 8}
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
+
+    async def get_open_position(self, symbol: str) -> Optional[dict]:
+        import base64
+        def _sync():
+            ticker = _kucoin_ticker(symbol)
+            ts  = str(_ts())
+            path = f'/api/v1/position?symbol={ticker}'
+            sign_str = ts + 'GET' + path
+            sig = base64.b64encode(
+                hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha256).digest()
+            ).decode()
+            pp_sig = base64.b64encode(
+                hmac.new(self._api_secret.encode(), self._passphrase.encode(), hashlib.sha256).digest()
+            ).decode()
+            r = requests.get(f'https://api-futures.kucoin.com{path}',
+                             headers={'KC-API-KEY': self._api_key, 'KC-API-SIGN': sig,
+                                      'KC-API-TIMESTAMP': ts, 'KC-API-PASSPHRASE': pp_sig,
+                                      'KC-API-KEY-VERSION': '2'}, timeout=10)
+            r.raise_for_status()
+            d = r.json().get('data', {})
+            size = float(d.get('currentQty', 0) or 0)
+            if size == 0: return None
+            return {
+                'size': abs(size),
+                'side': 'long' if size > 0 else 'short',
+                'entry_price': float(d.get('avgEntryPrice', 0)),
+                'unrealized_pnl': float(d.get('unrealisedPnl', 0)),
+                'leverage': int(float(d.get('realLeverage', LEVERAGE))),
+            }
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
+
 
 class GateExchange(CcxtExchange):
     def __init__(self):
@@ -1250,13 +1542,14 @@ class GateExchange(CcxtExchange):
         if price is None:
             price = self._price_sync(symbol)
 
-        # Ограничиваем size_usd реальным балансом × leverage × 90%
+        # Ограничиваем size_usd реальным балансом × leverage × 80%
         if not reduce_only:
             try:
                 available = self._balance_sync()
-                max_notional = available * LEVERAGE * 0.90
+                max_notional = available * LEVERAGE * 0.80
                 if size_usd > max_notional:
-                    print(f"[gate] size ${size_usd:.2f} > max ${max_notional:.2f} (баланс ${available:.2f}×{LEVERAGE}×90%), обрезаем")
+                    print(f"[gate] size ${size_usd:.2f} > max ${max_notional:.2f} "
+                          f"(баланс ${available:.2f}×{LEVERAGE}×80%), обрезаем")
                     size_usd = max_notional
             except Exception as e:
                 print(f"[gate] balance check failed: {e}")
@@ -1293,7 +1586,20 @@ class GateExchange(CcxtExchange):
         r = requests.post(f'https://api.gateio.ws{path}',
                           headers=headers, data=body, timeout=15)
         if not r.ok:
-            raise ValueError(f"gate order {r.status_code}: {r.text}")
+            err_text = r.text
+            try:
+                err_json = r.json()
+                label = err_json.get('label', '')
+                msg   = err_json.get('message', '')
+                if label == 'INSUFFICIENT_AVAILABLE':
+                    raise ValueError(f"gate: недостаточно маржи ({msg}) — уменьши размер позиции")
+                elif label == 'LIQUIDATE_IMMEDIATELY':
+                    raise ValueError(f"gate: ликвидация немедленно — позиция слишком большая для доступного баланса")
+                raise ValueError(f"gate order {r.status_code}: {label} — {msg}")
+            except ValueError:
+                raise
+            except Exception:
+                raise ValueError(f"gate order {r.status_code}: {err_text[:200]}")
         d = r.json()
         if isinstance(d, dict) and d.get('label'):
             raise ValueError(f"gate order error: {d.get('label')} — {d.get('message')}")
@@ -1310,6 +1616,78 @@ class GateExchange(CcxtExchange):
         price = await self.get_price(symbol)
         return await _run_sync(self._gate_order_sync, symbol, side,
                                qty * price, reduce_only=True, price=price)
+
+    async def get_closed_pnl(self, symbol: str) -> Optional[float]:
+        """Получает реализованный PnL закрытой позиции с Gate."""
+        import hashlib as hl
+        def _sync():
+            ticker = _gate_ticker(symbol)
+            ts = str(int(time.time()))
+            path = f'/api/v4/futures/usdt/my_trades?contract={ticker}&limit=10'
+            body_hash = hl.sha512(b'').hexdigest()
+            sign_str = '\n'.join(['GET', path, '', body_hash, ts])
+            sig = hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha512).hexdigest()
+            # Убираем query string из пути для подписи, но передаём как params
+            path_base = '/api/v4/futures/usdt/my_trades'
+            sign_str2 = '\n'.join(['GET', path_base, f'contract={ticker}&limit=10', body_hash, ts])
+            sig2 = hmac.new(self._api_secret.encode(), sign_str2.encode(), hashlib.sha512).hexdigest()
+            r = requests.get('https://api.gateio.ws' + path_base,
+                             params={'contract': ticker, 'limit': 10},
+                             headers={'KEY': self._api_key, 'SIGN': sig2, 'Timestamp': ts,
+                                      'Content-Type': 'application/json'}, timeout=10)
+            r.raise_for_status()
+            trades = r.json()
+            if not trades: return None
+            return sum(float(t.get('profit', 0) or 0) for t in trades[:10])
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
+
+    async def get_funding_rate(self, symbol: str) -> Optional[dict]:
+        def _sync():
+            ticker = _gate_ticker(symbol)
+            r = requests.get('https://api.gateio.ws/api/v4/futures/usdt/contracts/' + ticker,
+                             timeout=10)
+            r.raise_for_status()
+            d = r.json()
+            rate    = float(d.get('funding_rate') or 0)
+            next_ts = int(d.get('funding_next_apply', 0))
+            interval = int(d.get('funding_interval', 28800)) // 3600
+            return {'rate': rate, 'next_time': next_ts, 'interval_hours': interval}
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
+
+    async def get_open_position(self, symbol: str) -> Optional[dict]:
+        import hashlib as hl
+        def _sync():
+            ticker = _gate_ticker(symbol)
+            ts = str(int(time.time()))
+            path = f'/api/v4/futures/usdt/positions/{ticker}'
+            body_hash = hl.sha512(b'').hexdigest()
+            sign_str = '\n'.join(['GET', path, '', body_hash, ts])
+            sig = hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha512).hexdigest()
+            r = requests.get(f'https://api.gateio.ws{path}',
+                             headers={'KEY': self._api_key, 'SIGN': sig, 'Timestamp': ts,
+                                      'Content-Type': 'application/json'}, timeout=10)
+            if r.status_code == 404: return None
+            r.raise_for_status()
+            d = r.json()
+            size = float(d.get('size', 0) or 0)
+            if size == 0: return None
+            return {
+                'size': abs(size),
+                'side': 'long' if size > 0 else 'short',
+                'entry_price': float(d.get('entry_price', 0)),
+                'unrealized_pnl': float(d.get('unrealised_pnl', 0)),
+                'leverage': int(float(d.get('leverage', LEVERAGE))),
+            }
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
 
 
 # ── Фабрика ───────────────────────────────────────────────────

@@ -1053,24 +1053,55 @@ function renderOpenPositions(positions) {
   }
   c.innerHTML = positions.map(p => {
     const dur     = p.opened_at ? elapsed(p.opened_at) : '—';
-    const fund_s  = p.funding_short != null ? (p.funding_short*100).toFixed(3)+'%' : '—';
-    const fund_l  = p.funding_long  != null ? (p.funding_long *100).toFixed(3)+'%' : '—';
     const sigSpread = p.signal_spread_pct?.toFixed(2) || '—';
 
-    // Live данные (если есть)
+    // Фандинг
+    const sf = p.funding_short != null ? (p.funding_short*100).toFixed(3)+'%' : '—';
+    const lf = p.funding_long  != null ? (p.funding_long *100).toFixed(3)+'%' : '—';
+
+    // Время до следующего фандинга
+    function nextFundStr(ts) {
+      if (!ts) return '—';
+      const diff = ts - Math.floor(Date.now()/1000);
+      if (diff <= 0) return 'скоро';
+      const h = Math.floor(diff/3600), m = Math.floor((diff%3600)/60);
+      return h > 0 ? `${h}ч ${m}м` : `${m}м`;
+    }
+    const nextFund = Math.min(
+      p.funding_short_next || 9e9,
+      p.funding_long_next  || 9e9
+    );
+    const nextFundLabel = nextFundStr(nextFund < 9e9 ? nextFund : null);
+    const fundWarn = nextFund < 9e9 && (nextFund - Date.now()/1000) < 360; // < 6 минут
+
+    // Статус позиций на биржах
+    const sOnEx = p.short_on_exchange;
+    const lOnEx = p.long_on_exchange;
+    const shortStatus = sOnEx === false ? '🔴 нет' : sOnEx === true ? '🟢' : '…';
+    const longStatus  = lOnEx === false ? '🔴 нет' : lOnEx === true ? '🟢' : '…';
+
+    // Live данные
     const hasLive   = p.cur_spread_pct != null;
     const curSpread = hasLive ? p.cur_spread_pct.toFixed(2) : '…';
-    const uPnl      = p.unrealized_pnl;
-    const uPnlStr   = uPnl != null ? (uPnl >= 0 ? '+' : '') + '$' + uPnl.toFixed(4) : '…';
-    const uPnlClass = uPnl == null ? '' : uPnl > 0 ? 'color:var(--green)' : uPnl < 0 ? 'color:var(--red)' : '';
-    const sPnl      = p.short_unrealized != null ? (p.short_unrealized>=0?'+':'')+'$'+p.short_unrealized.toFixed(4) : '…';
-    const lPnl      = p.long_unrealized  != null ? (p.long_unrealized>=0?'+':'')+'$'+p.long_unrealized.toFixed(4)  : '…';
-    const sPnlClass = p.short_unrealized > 0 ? 'color:var(--green)' : p.short_unrealized < 0 ? 'color:var(--red)' : '';
-    const lPnlClass = p.long_unrealized  > 0 ? 'color:var(--green)' : p.long_unrealized  < 0 ? 'color:var(--red)' : '';
-    const curShort  = p.cur_short_price ? '$'+fmt(p.cur_short_price) : '…';
-    const curLong   = p.cur_long_price  ? '$'+fmt(p.cur_long_price)  : '…';
     const spreadColor = hasLive && p.cur_spread_pct < 0.5 ? 'color:var(--green)' :
                         hasLive && p.cur_spread_pct < 1.5 ? 'color:var(--yellow)' : '';
+
+    // Unrealized PnL (с фандингом)
+    const uPnl      = p.unrealized_pnl;
+    const uPnlStr   = uPnl != null ? (uPnl >= 0 ? '+' : '') + '$' + Math.abs(uPnl).toFixed(4) : '…';
+    const uPnlClass = uPnl == null ? '' : uPnl > 0 ? 'color:var(--green)' : uPnl < 0 ? 'color:var(--red)' : '';
+
+    const sPnl      = p.short_unrealized != null ? (p.short_unrealized>=0?'+':'')+'$'+Math.abs(p.short_unrealized).toFixed(4) : '…';
+    const lPnl      = p.long_unrealized  != null ? (p.long_unrealized>=0?'+':'')+'$'+Math.abs(p.long_unrealized).toFixed(4)  : '…';
+    const sPnlClass = p.short_unrealized > 0 ? 'color:var(--green)' : p.short_unrealized < 0 ? 'color:var(--red)' : '';
+    const lPnlClass = p.long_unrealized  > 0 ? 'color:var(--green)' : p.long_unrealized  < 0 ? 'color:var(--red)' : '';
+
+    const curShort  = p.cur_short_price ? '$'+fmt(p.cur_short_price) : '…';
+    const curLong   = p.cur_long_price  ? '$'+fmt(p.cur_long_price)  : '…';
+
+    const fundEarned = p.fund_earned;
+    const fundStr    = fundEarned != null ? (fundEarned>=0?'+':'')+'$'+Math.abs(fundEarned).toFixed(4) : '';
+    const fundClass  = fundEarned > 0 ? 'color:var(--green)' : fundEarned < 0 ? 'color:var(--red)' : '';
 
     return `
       <div class="position-card" id="pos-${p.id}">
@@ -1078,6 +1109,12 @@ function renderOpenPositions(positions) {
           <span class="pos-ticker">${p.ticker}</span>
           <span style="display:flex;gap:8px;align-items:center">
             <span class="pos-status ${p.status}">${p.status.toUpperCase()}</span>
+            <button onclick="toggleFundingHistory(${p.id})"
+              style="background:var(--bg3);border:1px solid var(--border2);color:var(--blue);
+                     padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;
+                     font-family:var(--mono)">
+              📊 фандинг
+            </button>
             <button onclick="markClosed(${p.id},'${p.ticker}')"
               style="background:var(--red2);border:none;color:#fff;padding:2px 10px;
                      border-radius:4px;cursor:pointer;font-size:11px;font-family:var(--mono)">
@@ -1087,18 +1124,20 @@ function renderOpenPositions(positions) {
         </div>
         <div class="pos-legs">
           <div class="pos-leg leg-short">
-            <div class="leg-label">SHORT</div>
+            <div class="leg-label">SHORT ${shortStatus}</div>
             <div class="leg-exchange">${(p.short_exchange||'').toUpperCase()}</div>
             <div class="leg-price">entry $${fmt(p.short_entry_price)}</div>
             <div style="font-size:11px;color:var(--text2)">now ${curShort}</div>
             <div style="font-size:11px;${sPnlClass}">${sPnl}</div>
+            <div style="font-size:10px;color:var(--text3)">fund ${sf}</div>
           </div>
           <div class="pos-leg leg-long">
-            <div class="leg-label">LONG</div>
+            <div class="leg-label">LONG ${longStatus}</div>
             <div class="leg-exchange">${(p.long_exchange||'').toUpperCase()}</div>
             <div class="leg-price">entry $${fmt(p.long_entry_price)}</div>
             <div style="font-size:11px;color:var(--text2)">now ${curLong}</div>
             <div style="font-size:11px;${lPnlClass}">${lPnl}</div>
+            <div style="font-size:10px;color:var(--text3)">fund ${lf}</div>
           </div>
         </div>
         <div class="pos-meta">
@@ -1106,11 +1145,33 @@ function renderOpenPositions(positions) {
           <span>lev <span>${p.leverage||5}×</span></span>
           <span>спред сигн. <span>${sigSpread}%</span></span>
           <span>спред тек. <span style="${spreadColor}">${curSpread}%</span></span>
-          <span>fund <span>${fund_s}</span>/<span>${fund_l}</span></span>
+          <span style="${fundWarn?'color:var(--red)':''}">след. фанд. <span>${nextFundLabel}</span></span>
           <span>open <span>${dur}</span></span>
-          <span style="${uPnlClass};font-weight:600">unrealized <span>${uPnlStr}</span></span>
+        </div>
+        <div style="display:flex;justify-content:space-between;padding:6px 8px;
+                    border-top:1px solid var(--border);margin-top:4px;font-size:12px">
+          <span>Unrealized PnL <span style="${uPnlClass};font-weight:600">${uPnlStr}</span></span>
+          ${fundStr ? `<span>Фандинг <span style="${fundClass}">${fundStr}</span></span>` : ''}
+        </div>
+        <!-- Панель истории фандинга (скрыта по умолчанию) -->
+        <div id="fund-history-${p.id}" style="display:none;border-top:1px solid var(--border);
+             margin-top:4px;padding:6px 8px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            <span style="font-size:11px;color:var(--text2);font-family:var(--mono)">
+              ИСТОРИЯ ФАНДИНГА
+            </span>
+            <button onclick="refreshFundingHistory(${p.id})"
+              style="background:none;border:1px solid var(--border2);color:var(--text2);
+                     padding:1px 6px;border-radius:3px;cursor:pointer;font-size:10px">
+              ↻ обновить
+            </button>
+          </div>
+          <div id="fund-history-rows-${p.id}" style="font-size:10px;font-family:var(--mono)">
+            <span style="color:var(--text3)">Загрузка...</span>
+          </div>
         </div>
         ${p.live_error ? `<div style="font-size:10px;color:var(--red);padding:4px 8px">${p.live_error}</div>` : ''}
+        ${p.auto_closed ? `<div style="font-size:10px;color:var(--yellow);padding:4px 8px">⚠️ Авто-закрыто: позиция не найдена на биржах</div>` : ''}
       </div>`;
   }).join('');
 }
@@ -1126,6 +1187,73 @@ async function markClosed(tradeId, ticker) {
       alert('Ошибка: ' + (d.error || 'unknown'));
     }
   } catch(e) { alert('Ошибка: ' + e); }
+}
+
+async function toggleFundingHistory(tradeId) {
+  const panel = document.getElementById(`fund-history-${tradeId}`);
+  if (!panel) return;
+  const isHidden = panel.style.display === 'none';
+  panel.style.display = isHidden ? 'block' : 'none';
+  if (isHidden) await refreshFundingHistory(tradeId);
+}
+
+async function refreshFundingHistory(tradeId) {
+  const container = document.getElementById(`fund-history-rows-${tradeId}`);
+  if (!container) return;
+  try {
+    const data = await fetch(`${API}/api/positions/${tradeId}/funding-history`).then(r=>r.json());
+    if (!data || !data.length) {
+      container.innerHTML = '<span style="color:var(--text3)">Нет данных — фандинг обновляется каждые 20 минут</span>';
+      return;
+    }
+    container.innerHTML = `
+      <table style="width:100%;border-collapse:collapse;font-size:10px">
+        <thead>
+          <tr style="color:var(--text3);border-bottom:1px solid var(--border)">
+            <th style="text-align:left;padding:2px 4px">Время</th>
+            <th style="text-align:left;padding:2px 4px">Биржа (Short)</th>
+            <th style="text-align:right;padding:2px 4px">Фандинг</th>
+            <th style="text-align:right;padding:2px 4px">Следующее</th>
+            <th style="text-align:left;padding:2px 4px">Биржа (Long)</th>
+            <th style="text-align:right;padding:2px 4px">Фандинг</th>
+            <th style="text-align:right;padding:2px 4px">Следующее</th>
+            <th style="text-align:right;padding:2px 4px">Интервал</th>
+            <th style="text-align:right;padding:2px 4px">Разница</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${data.map(row => {
+            const t   = new Date(row.time);
+            const tStr = t.toLocaleTimeString('ru-RU', {hour:'2-digit',minute:'2-digit',second:'2-digit'})
+                       + ' ' + t.toLocaleDateString('ru-RU', {day:'2-digit',month:'2-digit'});
+            const sf  = (row.sf * 100).toFixed(4) + '%';
+            const lf  = (row.lf * 100).toFixed(4) + '%';
+            const diff = Math.abs((row.sf - row.lf) * 100).toFixed(4) + '%';
+            const sfColor = row.sf < 0 ? 'color:var(--green)' : row.sf > 0 ? 'color:var(--red)' : '';
+            const lfColor = row.lf < 0 ? 'color:var(--green)' : row.lf > 0 ? 'color:var(--red)' : '';
+            const diffColor = Math.abs(row.sf - row.lf) * 100 > 0.2 ? 'color:var(--yellow)' : '';
+            const nextS = row.next_s ? new Date(row.next_s*1000).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}) : '—';
+            const nextL = row.next_l ? new Date(row.next_l*1000).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}) : '—';
+            const interval = row.interval_s === row.interval_l
+              ? row.interval_s + 'ч'
+              : row.interval_s + 'ч / ' + row.interval_l + 'ч';
+            return `<tr style="border-bottom:1px solid var(--border);line-height:1.8">
+              <td style="padding:2px 4px;color:var(--text2)">${tStr}</td>
+              <td style="padding:2px 4px;color:var(--text)">${(row.short_ex||'').toUpperCase()}</td>
+              <td style="padding:2px 4px;text-align:right;${sfColor}">${sf}</td>
+              <td style="padding:2px 4px;text-align:right;color:var(--text2)">${nextS}</td>
+              <td style="padding:2px 4px;color:var(--text)">${(row.long_ex||'').toUpperCase()}</td>
+              <td style="padding:2px 4px;text-align:right;${lfColor}">${lf}</td>
+              <td style="padding:2px 4px;text-align:right;color:var(--text2)">${nextL}</td>
+              <td style="padding:2px 4px;text-align:right;color:var(--text2)">${interval}</td>
+              <td style="padding:2px 4px;text-align:right;${diffColor}">${diff}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  } catch(e) {
+    if (container) container.innerHTML = `<span style="color:var(--red)">Ошибка: ${e}</span>`;
+  }
 }
 
 // ── Stats ────────────────────────────────────────────────────

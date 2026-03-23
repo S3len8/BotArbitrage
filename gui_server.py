@@ -40,6 +40,12 @@ _db_ok = False  # флаг: PostgreSQL доступен
 # 0 = не задан (используется весь баланс биржи)
 _allocated: dict[str, float] = {ex: 0.0 for ex in EXCHANGES}
 
+# История фандинга для открытых позиций
+# {trade_id: [{'time': iso, 'sf': rate, 'lf': rate, 'interval_s': h, 'interval_l': h,
+#              'next_s': ts, 'next_l': ts, 'short_ex': str, 'long_ex': str}, ...]}
+_funding_history: dict[int, list] = {}
+MAX_FUNDING_HISTORY = 100  # максимум записей на позицию
+
 
 # ── Startup ───────────────────────────────────────────────────
 
@@ -102,6 +108,9 @@ async def bot_start():
         _bot_state["started_at"] = datetime.now(timezone.utc).isoformat()
         _bot_state["error"]      = None
         print("[Bot] Started via GUI")
+        # Запускаем фандинг-монитор
+        from order_executor import start_funding_monitor
+        await start_funding_monitor()
         await _broadcast_status()
         return {"ok": True, "msg": "Бот запущен. Слушаю канал..."}
     except Exception as e:
@@ -308,11 +317,12 @@ async def api_open_trades():
 
 @app.get("/api/positions/live")
 async def api_positions_live():
-    """Возвращает открытые позиции с текущими ценами и PnL в реальном времени."""
+    """Открытые позиции с реальными данными с бирж: PnL, цены, фандинг, статус."""
     if not _db_ok:
         return []
-    from db import get_all_open_trades
+    from db import get_all_open_trades, update_trade
     from exchanges import create_exchange
+    from datetime import datetime, timezone
     trades = get_all_open_trades()
     if not trades:
         return []
@@ -323,39 +333,167 @@ async def api_positions_live():
         try:
             s_ex = create_exchange(t.short_exchange)
             l_ex = create_exchange(t.long_exchange)
-            short_price, long_price = await asyncio.gather(
+
+            # Запрашиваем всё параллельно
+            s_price, l_price, s_pos, l_pos, s_fund, l_fund = await asyncio.gather(
                 s_ex.get_price(t.symbol),
                 l_ex.get_price(t.symbol),
+                s_ex.get_open_position(t.symbol),
+                l_ex.get_open_position(t.symbol),
+                s_ex.get_funding_rate(t.symbol),
+                l_ex.get_funding_rate(t.symbol),
+                return_exceptions=True,
             )
-            await asyncio.gather(s_ex.close(), l_ex.close())
+            await asyncio.gather(s_ex.close(), l_ex.close(), return_exceptions=True)
+
+            # Цены
+            sp = float(s_price) if not isinstance(s_price, Exception) else None
+            lp = float(l_price) if not isinstance(l_price, Exception) else None
 
             # Текущий спред
-            cur_spread = (short_price / long_price - 1) * 100 if long_price > 0 else 0
+            cur_spread = round((sp / lp - 1) * 100, 4) if sp and lp and lp > 0 else None
 
-            # Нереализованный PnL
-            # SHORT: прибыль если цена упала (entry - current) * qty
-            # LONG:  прибыль если цена выросла (current - entry) * qty
-            short_pnl = 0.0
-            long_pnl  = 0.0
-            if t.short_entry_price and t.short_qty:
-                short_pnl = (t.short_entry_price - short_price) * t.short_qty
-            if t.long_entry_price and t.long_qty:
-                long_pnl  = (long_price - t.long_entry_price) * t.long_qty
-            unrealized_pnl = short_pnl + long_pnl
+            # PnL напрямую с бирж (более точный)
+            short_pnl = None
+            long_pnl  = None
+            short_closed = True   # если позиция не найдена на бирже — считаем закрытой
+            long_closed  = True
 
-            item['cur_short_price'] = short_price
-            item['cur_long_price']  = long_price
-            item['cur_spread_pct']  = round(cur_spread, 4)
-            item['unrealized_pnl']  = round(unrealized_pnl, 6)
-            item['short_unrealized'] = round(short_pnl, 6)
-            item['long_unrealized']  = round(long_pnl, 6)
+            if not isinstance(s_pos, Exception) and s_pos:
+                short_pnl    = s_pos.get('unrealized_pnl', 0)
+                short_closed = False
+                item['exchange_short_size']  = s_pos.get('size')
+                item['exchange_short_entry'] = s_pos.get('entry_price')
+
+            if not isinstance(l_pos, Exception) and l_pos:
+                long_pnl    = l_pos.get('unrealized_pnl', 0)
+                long_closed = False
+                item['exchange_long_size']  = l_pos.get('size')
+                item['exchange_long_entry'] = l_pos.get('entry_price')
+
+            # Если обе позиции закрыты на биржах — авто-закрываем в БД
+            if short_closed and long_closed and sp and lp:
+                t.status    = 'closed'
+                t.closed_at = datetime.now(timezone.utc).isoformat()
+                t.short_close_price = sp
+                t.long_close_price  = lp
+                if t.short_entry_price and t.short_qty:
+                    t.short_pnl_usd = round((t.short_entry_price - sp) * t.short_qty, 6)
+                if t.long_entry_price and t.long_qty:
+                    t.long_pnl_usd  = round((lp - t.long_entry_price) * t.long_qty, 6)
+                fees = (t.fee_short_usd or 0) + (t.fee_long_usd or 0)
+                if t.short_pnl_usd is not None and t.long_pnl_usd is not None:
+                    t.net_pnl_usd = round(t.short_pnl_usd + t.long_pnl_usd - fees, 6)
+                update_trade(t)
+                item['auto_closed'] = True
+                item = {**item, **_t(t)}
+                # Уведомление
+                try:
+                    from notifier import notify
+                    pnl = t.net_pnl_usd
+                    await notify(
+                        f"🔒 <b>Авто-закрыто: {t.ticker}</b>\n"
+                        f"Позиции не найдены на биржах\n"
+                        f"💰 PnL: {'${:+.4f}'.format(pnl) if pnl is not None else '—'}"
+                    )
+                except Exception: pass
+
+            # Фандинг
+            sf = s_fund if not isinstance(s_fund, Exception) else None
+            lf = l_fund if not isinstance(l_fund, Exception) else None
+
+            # Обновляем фандинг в записи если изменился
+            sf_rate = sf.get('rate') if sf else None
+            lf_rate = lf.get('rate') if lf else None
+            if sf_rate is not None or lf_rate is not None:
+                if sf_rate is not None: t.funding_short = sf_rate
+                if lf_rate is not None: t.funding_long  = lf_rate
+                update_trade(t)
+
+                # Записываем в историю фандинга
+                if t.id not in _funding_history:
+                    _funding_history[t.id] = []
+                history = _funding_history[t.id]
+                # Добавляем только если данные изменились или прошло >19 минут
+                last = history[-1] if history else None
+                now_iso = datetime.now(timezone.utc).isoformat()
+                should_record = (
+                    not last or
+                    abs((last.get('sf') or 0) - (sf_rate or 0)) > 0.00001 or
+                    abs((last.get('lf') or 0) - (lf_rate or 0)) > 0.00001 or
+                    (datetime.now(timezone.utc) - datetime.fromisoformat(
+                        last['time'].replace('Z', '+00:00')
+                    )).total_seconds() > 19 * 60
+                )
+                if should_record:
+                    history.append({
+                        'time':       now_iso,
+                        'sf':         sf_rate,
+                        'lf':         lf_rate,
+                        'interval_s': sf.get('interval_hours', 8) if sf else 8,
+                        'interval_l': lf.get('interval_hours', 8) if lf else 8,
+                        'next_s':     sf.get('next_time') if sf else None,
+                        'next_l':     lf.get('next_time') if lf else None,
+                        'short_ex':   t.short_exchange,
+                        'long_ex':    t.long_exchange,
+                    })
+                    # Обрезаем историю
+                    if len(history) > MAX_FUNDING_HISTORY:
+                        _funding_history[t.id] = history[-MAX_FUNDING_HISTORY:]
+
+            # Накопленный фандинг с момента открытия
+            fund_earned = 0.0
+            if t.opened_at and t.short_qty and sp:
+                try:
+                    opened = datetime.fromisoformat(str(t.opened_at).replace('Z','+00:00'))
+                    hours_held = (datetime.now(timezone.utc) - opened).total_seconds() / 3600
+                    # SHORT получает фандинг если rate < 0
+                    s_interval = sf.get('interval_hours', 8) if sf else 8
+                    l_interval = lf.get('interval_hours', 8) if lf else 8
+                    s_periods  = hours_held / s_interval
+                    l_periods  = hours_held / l_interval
+                    s_fund_pnl = -(sf_rate or 0) * s_periods * (t.short_qty or 0) * sp
+                    l_fund_pnl = (lf_rate or 0) * l_periods * (t.long_qty or 0) * (lp or sp)
+                    fund_earned = round(s_fund_pnl + l_fund_pnl, 6)
+                except Exception:
+                    pass
+
+            # Суммарный unrealized с учётом фандинга
+            unrealized = None
+            if short_pnl is not None and long_pnl is not None:
+                unrealized = round(short_pnl + long_pnl + fund_earned, 6)
+            elif sp and lp and t.short_entry_price and t.long_entry_price:
+                s_calc = (t.short_entry_price - sp) * (t.short_qty or 0)
+                l_calc = (lp - t.long_entry_price) * (t.long_qty or 0)
+                unrealized = round(s_calc + l_calc + fund_earned, 6)
+
+            item.update({
+                'cur_short_price':   sp,
+                'cur_long_price':    lp,
+                'cur_spread_pct':    cur_spread,
+                'unrealized_pnl':    unrealized,
+                'short_unrealized':  round(short_pnl, 6) if short_pnl is not None else None,
+                'long_unrealized':   round(long_pnl, 6)  if long_pnl  is not None else None,
+                'fund_earned':       fund_earned,
+                'funding_short':     sf_rate,
+                'funding_long':      lf_rate,
+                'funding_short_next': sf.get('next_time') if sf else None,
+                'funding_long_next':  lf.get('next_time') if lf else None,
+                'short_on_exchange': not short_closed,
+                'long_on_exchange':  not long_closed,
+            })
+
         except Exception as e:
-            item['live_error'] = str(e)[:80]
+            item['live_error'] = str(e)[:100]
         result.append(item)
     return result
 
 
-@app.post("/api/positions/{trade_id}/mark-closed")
+@app.get("/api/positions/{trade_id}/funding-history")
+async def api_funding_history(trade_id: int):
+    """История фандинга для конкретной позиции."""
+    history = _funding_history.get(trade_id, [])
+    return list(reversed(history))  # новые сверху
 async def api_mark_closed(trade_id: int):
     """Помечает позицию закрытой вручную (когда закрыли на бирже руками)."""
     if not _db_ok:

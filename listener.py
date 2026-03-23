@@ -253,6 +253,13 @@ class SignalListener:
         try:
             short_ex = create_exchange(signal.short_exchange)
             long_ex  = create_exchange(signal.long_exchange)
+        except ValueError as e:
+            # Тихо пропускаем неизвестные биржи (ourbit, aster и т.д.)
+            if 'Unknown exchange' in str(e):
+                return
+            print(f"[Listener] Ошибка биржи {signal.ticker}: {e}")
+            _seen.pop(signal.ticker, None)
+            return
         except Exception as e:
             print(f"[Listener] Ошибка биржи {signal.ticker}: {e}")
             _seen.pop(signal.ticker, None)
@@ -285,18 +292,24 @@ class SignalListener:
 
         print(f"[Listener] Risk OK: {risk.reason}")
         try:
-            _, msg = await asyncio.wait_for(
+            trade, msg = await asyncio.wait_for(
                 open_position(signal, risk.final_size_usd, signal_received_ms=received_ms),
                 timeout=60
             )
         except asyncio.TimeoutError:
             print(f"[Listener] TIMEOUT open_position {signal.ticker}")
             await notify(f"⏱ Таймаут открытия {signal.ticker} (60с)")
+            _seen.pop(signal.ticker, None)  # сбрасываем дедуп — можно попробовать снова
             return
         except Exception as e:
             print(f"[Listener] Ошибка open_position {signal.ticker}: {e}")
             await notify(f"❌ Ошибка при открытии {signal.ticker}: {e}")
+            _seen.pop(signal.ticker, None)  # сбрасываем дедуп
             return
+
+        # Если сделка не открылась (ошибка биржи) — сбрасываем дедуп
+        if trade is None:
+            _seen.pop(signal.ticker, None)
         # notify уже вызван внутри open_position с кнопкой TradingView
 
     async def _close(self, signal: CloseSignal):
