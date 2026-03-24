@@ -11,8 +11,8 @@ from typing import Optional
 from exchanges import create_exchange
 from db import Trade, save_trade, update_trade, get_open_trade, save_balance_snapshot
 from signal_parser import OpenSignal, CloseSignal
-from notifier import notify, tradingview_url, edit_notify, exchange_url
-from settings import LEVERAGE, BALANCE_ALERT_PCT
+from notifier import notify, tradingview_url, edit_notify, exchange_url, notify_order
+from settings import LEVERAGE, BALANCE_ALERT_PCT, MARGIN_RISK_PCT
 
 
 def _now(): return datetime.now(timezone.utc)
@@ -40,33 +40,73 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
 
     print(f"[Executor] OPEN {signal.ticker}: SHORT ${final_size_usd:.2f}@{signal.short_exchange} LONG ${final_size_usd:.2f}@{signal.long_exchange} lev={LEVERAGE}×")
 
-    # Замеряем время каждой ноги отдельно
-    t_before = _ms()
+    # Открываем ноги ПОСЛЕДОВАТЕЛЬНО: сначала short, потом long.
+    # Если short упал — не открываем long совсем.
+    # Если long упал — сразу откатываем short.
+    short_r: dict | Exception = Exception("not started")
+    long_r:  dict | Exception = Exception("not started")
+
+    # ── 1. Short ──
     try:
-        short_r, long_r = await asyncio.wait_for(
-            asyncio.gather(
-                short_ex.place_market_order(signal.symbol, 'sell', final_size_usd),
-                long_ex.place_market_order( signal.symbol, 'buy',  final_size_usd),
-                return_exceptions=True,
-            ),
-            timeout=30
+        short_r = await asyncio.wait_for(
+            short_ex.place_market_order(signal.symbol, 'sell', final_size_usd),
+            timeout=20
         )
     except asyncio.TimeoutError:
-        trade.status = 'failed'
-        save_trade(trade)
-        print(f"[Executor] TIMEOUT place_market_order для {signal.ticker}")
-        await _close(short_ex, long_ex)
-        return None, f"⏱ Таймаут открытия {signal.ticker} (30с)"
-    t_after = _ms()
-    exec_ms = t_after - t0
+        short_r = Exception(f"timeout 20с")
+    except Exception as e:
+        short_r = e
 
     short_ok = not isinstance(short_r, Exception)
-    long_ok  = not isinstance(long_r,  Exception)
 
     if not short_ok:
         print(f"[Executor] SHORT ошибка {signal.short_exchange}: {short_r}")
+        trade.status = 'failed'
+        save_trade(trade)
+        msg = (f"❌ <b>{signal.ticker}</b>: Short не открылся ({signal.short_exchange.upper()})\n"
+               f"Long не открывался — откат не нужен\n"
+               f"Причина: {short_r}")
+        await _close(short_ex, long_ex)
+        await notify(msg)
+        return None, msg
+
+    # ── 2. Long ──
+    try:
+        long_r = await asyncio.wait_for(
+            long_ex.place_market_order(signal.symbol, 'buy', final_size_usd),
+            timeout=20
+        )
+    except asyncio.TimeoutError:
+        long_r = Exception(f"timeout 20с")
+    except Exception as e:
+        long_r = e
+
+    long_ok = not isinstance(long_r, Exception)
+
+    t_after = _ms()
+    exec_ms = t_after - t0
+
     if not long_ok:
         print(f"[Executor] LONG ошибка {signal.long_exchange}: {long_r}")
+        # Сразу откатываем short
+        try:
+            await asyncio.wait_for(
+                short_ex.close_position(signal.symbol, 'buy', short_r['qty']),
+                timeout=15
+            )
+            rollback_status = "Short откатан ✅"
+        except Exception as e:
+            rollback_status = f"Short откат ПРОВАЛИЛСЯ ⚠️: {e}"
+            print(f"[Executor] rollback short failed: {e}")
+
+        trade.status = 'failed'
+        save_trade(trade)
+        msg = (f"❌ <b>{signal.ticker}</b>: Long не открылся ({signal.long_exchange.upper()})\n"
+               f"{rollback_status}\n"
+               f"Причина: {long_r}")
+        await _close(short_ex, long_ex)
+        await notify(msg)
+        return None, msg
 
     if short_ok and long_ok:
         trade.short_order_id    = short_r['order_id'];  trade.short_entry_price = short_r['price']
@@ -76,6 +116,18 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
         trade.exec_time_short_ms = exec_ms
         trade.exec_time_long_ms  = exec_ms
         save_trade(trade)
+
+        # Логуємо ордери в канал ордерів
+        asyncio.create_task(notify_order(
+            signal.short_exchange, 'short', signal.symbol,
+            short_r['price'], short_r['qty'], final_size_usd,
+            short_r['order_id'], f"↔️ Pair: <b>{signal.ticker}</b> | Trade #{trade.id}"
+        ))
+        asyncio.create_task(notify_order(
+            signal.long_exchange, 'long', signal.symbol,
+            long_r['price'], long_r['qty'], final_size_usd,
+            long_r['order_id'], f"↔️ Pair: <b>{signal.ticker}</b> | Trade #{trade.id}"
+        ))
 
         # Фактический спред по ценам исполнения
         actual_spread = 0.0
@@ -140,24 +192,8 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
         asyncio.create_task(_live_spread_updater())
         return trade, msg
 
-    elif short_ok:
-        try: await short_ex.close_position(signal.symbol, 'buy', short_r['qty'])
-        except Exception as e: print(f"[Executor] rollback short failed: {e}")
-        trade.status = 'failed'; save_trade(trade)
-        msg = f"⚠️ <b>{signal.ticker}</b>: Long не исполнился. Short откатан."
-
-    elif long_ok:
-        try: await long_ex.close_position(signal.symbol, 'sell', long_r['qty'])
-        except Exception as e: print(f"[Executor] rollback long failed: {e}")
-        trade.status = 'failed'; save_trade(trade)
-        msg = f"⚠️ <b>{signal.ticker}</b>: Short не исполнился. Long откатан."
-
-    else:
-        trade.status = 'failed'; save_trade(trade)
-        msg = f"❌ <b>{signal.ticker}</b>: Обе ноги не исполнились.\nShort: {short_r}\nLong: {long_r}"
-
     await _close(short_ex, long_ex)
-    return (trade if trade.status == 'open' else None), msg
+    return trade, msg
 
 
 async def close_position(close_signal: CloseSignal) -> tuple[Optional[Trade], str]:
@@ -181,10 +217,22 @@ async def close_position(close_signal: CloseSignal) -> tuple[Optional[Trade], st
         trade.short_close_price = short_c['price']
         trade.short_close_order_id = short_c['order_id']
         trade.fee_short_usd = (trade.fee_short_usd or 0) + short_c.get('fee', 0)
+        # Логуємо закриття short
+        asyncio.create_task(notify_order(
+            trade.short_exchange, 'buy (close short)', trade.symbol,
+            short_c['price'], trade.short_qty or 0, trade.trade_size_usd or 0,
+            short_c['order_id'], f"🔒 CLOSE | Trade #{trade.id} <b>{trade.ticker}</b>"
+        ))
     if long_ok:
         trade.long_close_price = long_c['price']
         trade.long_close_order_id = long_c['order_id']
         trade.fee_long_usd = (trade.fee_long_usd or 0) + long_c.get('fee', 0)
+        # Логуємо закриття long
+        asyncio.create_task(notify_order(
+            trade.long_exchange, 'sell (close long)', trade.symbol,
+            long_c['price'], trade.long_qty or 0, trade.trade_size_usd or 0,
+            long_c['order_id'], f"🔒 CLOSE | Trade #{trade.id} <b>{trade.ticker}</b>"
+        ))
 
     trade.status = 'closed' if (short_ok and long_ok) else 'partial'
 
@@ -364,12 +412,84 @@ async def _funding_monitor_loop():
 
             for t in trades:
                 try:
-                    await _check_funding_for_trade(t)
+                    # Перевірка маржі (пріоритет над фандингом)
+                    closed = await _check_margin_risk(t)
+                    if not closed:
+                        await _check_funding_for_trade(t)
                 except Exception as e:
                     print(f"[FundingMonitor] ошибка {t.ticker}: {e}")
 
         except Exception as e:
             print(f"[FundingMonitor] loop error: {e}")
+
+
+async def _check_margin_risk(t) -> bool:
+    """Перевіряє чи не вичерпується маржа на одній з позицій.
+
+    Логіка (приклад з умови):
+    Біржа 1: +$4, Біржа 2: -$4, маржа по $5 на кожній.
+    Якщо unrealized loss однієї ноги >= MARGIN_RISK_PCT% від маржі → закриваємо обидві.
+
+    Маржа = trade_size_usd / LEVERAGE
+    Ризик = |unrealized_loss| / margin >= MARGIN_RISK_PCT / 100
+    """
+    from exchanges import create_exchange
+    from signal_parser import CloseSignal
+
+    try:
+        s_ex = create_exchange(t.short_exchange)
+        l_ex = create_exchange(t.long_exchange)
+        s_pos, l_pos = await asyncio.gather(
+            s_ex.get_open_position(t.symbol),
+            l_ex.get_open_position(t.symbol),
+            return_exceptions=True,
+        )
+        await asyncio.gather(s_ex.close(), l_ex.close(), return_exceptions=True)
+    except Exception as e:
+        print(f"[MarginCheck] {t.ticker}: {e}")
+        return False
+
+    if isinstance(s_pos, Exception) or isinstance(l_pos, Exception):
+        return False
+    if not s_pos or not l_pos:
+        return False
+
+    margin_per_side = (t.trade_size_usd or 0) / LEVERAGE
+    if margin_per_side <= 0:
+        return False
+
+    s_pnl = float(s_pos.get('unrealized_pnl', 0))
+    l_pnl = float(l_pos.get('unrealized_pnl', 0))
+    total_pnl = s_pnl + l_pnl
+
+    # Перевіряємо кожну ногу окремо
+    s_loss_pct = abs(s_pnl) / margin_per_side * 100 if s_pnl < 0 else 0
+    l_loss_pct = abs(l_pnl) / margin_per_side * 100 if l_pnl < 0 else 0
+
+    print(f"[MarginCheck] {t.ticker}: margin=${margin_per_side:.2f} "
+          f"short_pnl=${s_pnl:.4f} ({s_loss_pct:.1f}%) "
+          f"long_pnl=${l_pnl:.4f} ({l_loss_pct:.1f}%) "
+          f"total=${total_pnl:.4f}")
+
+    if s_loss_pct >= MARGIN_RISK_PCT or l_loss_pct >= MARGIN_RISK_PCT:
+        risky_side = 'SHORT' if s_loss_pct >= l_loss_pct else 'LONG'
+        risky_pct  = max(s_loss_pct, l_loss_pct)
+        print(f"[MarginCheck] ⚠️ {t.ticker}: {risky_side} loss {risky_pct:.1f}% від маржі! Закриваємо обидві.")
+
+        await notify(
+            f"🚨 <b>МАРЖА ВИЧЕРПУЄТЬСЯ: {t.ticker}</b>\n"
+            f"📉 SHORT ({t.short_exchange.upper()}): ${s_pnl:+.4f} ({s_loss_pct:.1f}% маржі)\n"
+            f"📈 LONG  ({t.long_exchange.upper()}): ${l_pnl:+.4f} ({l_loss_pct:.1f}% маржі)\n"
+            f"💰 Загальний PnL: ${total_pnl:+.4f}\n"
+            f"⚡ Закриваю обидві позиції!"
+        )
+        cs = CloseSignal(ticker=t.ticker, raw_text="auto_close")
+        _, msg = await close_position(cs)
+        await notify(msg)
+        _funding_cache.pop(t.id, None)
+        return True
+
+    return False
 
 
 async def _check_funding_for_trade(t):
@@ -530,7 +650,7 @@ async def _check_funding_for_trade(t):
             f"{close_reason}\n"
             f"⏱ До фандинга: {minutes_until:.0f} мин"
         )
-        cs = CloseSignal(ticker=t.ticker, symbol=t.symbol)
+        cs = CloseSignal(ticker=t.ticker, raw_text="auto_close")
         _, msg = await close_position(cs)
         await notify(msg)
         # Убираем из кэша

@@ -41,6 +41,17 @@ SIGNAL_CHANNEL: str = os.getenv("SIGNAL_CHANNEL", "")
 NOTIFY_BOT_TOKEN: str = os.getenv("NOTIFY_BOT_TOKEN", "")
 NOTIFY_CHAT_ID:   str = os.getenv("NOTIFY_CHAT_ID", "")
 
+# Канал для MEXC сигналів (бот не торгує — тільки повідомляє)
+MEXC_CHAT_ID: str = os.getenv("MEXC_CHAT_ID", os.getenv("NOTIFY_CHAT_ID", ""))
+
+# Канал для логів виконання ордерів (біржа, час, ціна, qty, $, монета)
+ORDERS_CHAT_ID: str = os.getenv("ORDERS_CHAT_ID", os.getenv("NOTIFY_CHAT_ID", ""))
+
+# Поріг закриття при маржинальному ризику:
+# якщо unrealized loss однієї ноги >= MARGIN_RISK_PCT % від виділеної маржі — закриваємо обидві.
+# Приклад: маржа $5, позиція -$4 = 80% → закриваємо. Default = 80.
+MARGIN_RISK_PCT: float = float(os.getenv("MARGIN_RISK_PCT", "80"))
+
 EXCHANGE_KEYS: dict = {
     "binance": {"api_key": os.getenv("BINANCE_API_KEY", ""), "api_secret": os.getenv("BINANCE_API_SECRET", "")},
     "bybit":   {"api_key": os.getenv("BYBIT_API_KEY",   ""), "api_secret": os.getenv("BYBIT_API_SECRET",   "")},

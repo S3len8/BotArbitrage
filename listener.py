@@ -18,7 +18,7 @@ from signal_parser import parse_message, parse_pinned, OpenSignal, CloseSignal
 from risk_manager import check_signal
 from order_executor import open_position, close_position
 from exchanges import create_exchange
-from notifier import notify
+from notifier import notify, notify_mexc
 
 DEDUP_WINDOW_S = 120
 _seen: dict[str, float] = {}
@@ -66,7 +66,7 @@ async def _notify_mexc(signal, reason: str = None):
     if long_url:
         buttons.append({"text": f"📈 {signal.long_exchange.upper()}", "url": long_url})
 
-    await notify(msg, tv_url=tv_url, buttons=buttons)
+    await notify_mexc(msg, tv_url=tv_url, buttons=buttons)
     print(f"[MEXC] Уведомление отправлено: {signal.ticker} {signal.short_exchange}↕{signal.long_exchange}")
 
 

@@ -1,8 +1,20 @@
+"""
+notifier.py — сповіщення через Telegram.
+
+Три окремих канали (один бот, різні chat_id з .env):
+  NOTIFY_CHAT_ID  — відкриття/закриття угод (основний чат)
+  MEXC_CHAT_ID    — сигнали MEXC (бот не торгує — тільки повідомляє)
+  ORDERS_CHAT_ID  — лог виконання ордерів: біржа, час, ціна, qty, $, монета
+
+Якщо MEXC_CHAT_ID / ORDERS_CHAT_ID не задані — fallback на NOTIFY_CHAT_ID.
+"""
+
 import requests
-from settings import NOTIFY_BOT_TOKEN, NOTIFY_CHAT_ID
+from datetime import datetime, timezone
+from settings import NOTIFY_BOT_TOKEN, NOTIFY_CHAT_ID, MEXC_CHAT_ID, ORDERS_CHAT_ID
 from concurrent.futures import ThreadPoolExecutor
 
-_executor = ThreadPoolExecutor(max_workers=2)
+_executor = ThreadPoolExecutor(max_workers=4)
 
 _TV_PREFIX = {
     'binance': 'BINANCE',
@@ -13,7 +25,6 @@ _TV_PREFIX = {
     'kucoin':  'KUCOIN',
 }
 
-# Ссылки на страницы фьючерсной торговли
 _EX_FUTURES_URL = {
     'mexc':    'https://futures.mexc.com/exchange/{symbol}_USDT',
     'binance': 'https://www.binance.com/en/futures/{symbol}USDT',
@@ -25,15 +36,11 @@ _EX_FUTURES_URL = {
 
 
 def exchange_url(exchange: str, ticker: str) -> str:
-    """Возвращает ссылку на страницу фьючерса на бирже."""
-    # Убираем USDT из тикера — шаблон сам добавит нужный суффикс
     symbol = ticker.upper()
     if symbol.endswith('USDT'):
         symbol = symbol[:-4]
     tmpl = _EX_FUTURES_URL.get(exchange.lower(), '')
-    if not tmpl:
-        return ''
-    return tmpl.format(symbol=symbol)
+    return tmpl.format(symbol=symbol) if tmpl else ''
 
 
 def tradingview_url(short_exchange: str, long_exchange: str, ticker: str) -> str:
@@ -47,33 +54,27 @@ def tradingview_url(short_exchange: str, long_exchange: str, ticker: str) -> str
 
 
 def _safe_html(text: str) -> str:
-    """Экранирует символы которые ломают HTML parse в Telegram.
-    Оставляем только разрешённые теги: <b>, </b>, <i>, </i>, <code>, </code>.
-    Все остальные < и > заменяем на &lt; и &gt;
-    """
     import re
-    # Сначала находим разрешённые теги и заменяем их на placeholder
     allowed = re.findall(r'</?(?:b|i|code|pre|s|u)>', text)
     result = text
-    # Заменяем разрешённые теги на временные маркеры
     for i, tag in enumerate(allowed):
         result = result.replace(tag, f'\x00TAG{i}\x00', 1)
-    # Экранируем оставшиеся < и >
     result = result.replace('<', '&lt;').replace('>', '&gt;')
-    # Возвращаем разрешённые теги
     for i, tag in enumerate(allowed):
         result = result.replace(f'\x00TAG{i}\x00', tag, 1)
     return result
 
 
-def _send_sync(text: str, tv_url: str = None, buttons: list = None) -> int | None:
-    """Синхронная отправка. Возвращает message_id для последующего редактирования."""
-    if not NOTIFY_BOT_TOKEN or not NOTIFY_CHAT_ID:
-        print(f"[Notify] {text[:120]}")
+def _send_sync(text: str, chat_id: str = None, tv_url: str = None,
+               buttons: list = None) -> int | None:
+    """Синхронна відправка в зазначений chat_id."""
+    target_chat = chat_id or NOTIFY_CHAT_ID
+    if not NOTIFY_BOT_TOKEN or not target_chat:
+        print(f"[Notify→{target_chat}] {text[:120]}")
         return None
     url = f"https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id":                  NOTIFY_CHAT_ID,
+        "chat_id":                  target_chat,
         "text":                     _safe_html(text),
         "parse_mode":               "HTML",
         "disable_web_page_preview": True,
@@ -103,13 +104,14 @@ def _send_sync(text: str, tv_url: str = None, buttons: list = None) -> int | Non
         return None
 
 
-def _edit_sync(message_id: int, text: str, tv_url: str = None, buttons: list = None):
-    """Редактирует существующее сообщение."""
-    if not NOTIFY_BOT_TOKEN or not NOTIFY_CHAT_ID or not message_id:
+def _edit_sync(message_id: int, text: str, chat_id: str = None,
+               tv_url: str = None, buttons: list = None):
+    target_chat = chat_id or NOTIFY_CHAT_ID
+    if not NOTIFY_BOT_TOKEN or not target_chat or not message_id:
         return
     url = f"https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}/editMessageText"
     payload = {
-        "chat_id":                  NOTIFY_CHAT_ID,
+        "chat_id":                  target_chat,
         "message_id":               message_id,
         "text":                     _safe_html(text),
         "parse_mode":               "HTML",
@@ -137,15 +139,65 @@ def _edit_sync(message_id: int, text: str, tv_url: str = None, buttons: list = N
         print(f"[Notify] edit error: {e}")
 
 
+# ── Публічні async функції ────────────────────────────────────
+
 async def notify(text: str, tv_url: str = None, buttons: list = None) -> int | None:
-    """Отправляет сообщение. Возвращает message_id."""
+    """Відправляє в основний чат (відкриття/закриття угод)."""
     import asyncio
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_executor, _send_sync, text, tv_url, buttons)
+    return await loop.run_in_executor(
+        _executor, _send_sync, text, NOTIFY_CHAT_ID, tv_url, buttons
+    )
 
 
-async def edit_notify(message_id: int, text: str, tv_url: str = None, buttons: list = None):
-    """Редактирует существующее сообщение в Telegram."""
+async def notify_mexc(text: str, tv_url: str = None, buttons: list = None) -> int | None:
+    """Відправляє сигнал MEXC в спеціальний канал."""
     import asyncio
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(_executor, _edit_sync, message_id, text, tv_url, buttons)
+    return await loop.run_in_executor(
+        _executor, _send_sync, text, MEXC_CHAT_ID, tv_url, buttons
+    )
+
+
+async def notify_order(exchange: str, side: str, symbol: str,
+                       price: float, qty, size_usd: float,
+                       order_id: str = '', extra: str = '') -> None:
+    """Лог виконання ордера → ORDERS_CHAT_ID.
+
+    Формат:
+    ⚡ BINANCE | SHORT
+    🪙 BTCUSDT
+    💲 Ціна: $43,215.000000
+    📦 Qty:  0.023
+    💵 ~$994.95
+    🕐 2024-01-15 12:34:56 UTC
+    """
+    import asyncio
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    side_emoji = '📉' if side.lower() in ('sell', 'short') else '📈'
+    msg = (
+        f"⚡ <b>{exchange.upper()}</b> | {side.upper()}\n"
+        f"{side_emoji} <b>{symbol.upper()}</b>\n"
+        f"💲 Ціна: <code>${price:,.6f}</code>\n"
+        f"📦 Qty:  <code>{qty}</code>\n"
+        f"💵 ~<code>${size_usd:,.2f}</code>\n"
+        f"🕐 {now} UTC"
+    )
+    if order_id:
+        msg += f"\n🔑 <code>{order_id}</code>"
+    if extra:
+        msg += f"\n{extra}"
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        _executor, _send_sync, msg, ORDERS_CHAT_ID, None, None
+    )
+
+
+async def edit_notify(message_id: int, text: str, tv_url: str = None,
+                      buttons: list = None):
+    """Редагує повідомлення в основному чаті."""
+    import asyncio
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        _executor, _edit_sync, message_id, text, NOTIFY_CHAT_ID, tv_url, buttons
+    )
