@@ -56,6 +56,12 @@ async def startup():
     if _db_ok:
         _load_exchange_settings_from_db()
     asyncio.create_task(_broadcast_loop())
+    # В startup() добавьте загрузку списка:
+    if _db_ok:
+        from db import get_ignored_symbols
+        from risk_manager import set_ignored_tickers
+        tickers = get_ignored_symbols()
+        set_ignored_tickers(tickers)
 
 
 def _try_db_init() -> bool:
@@ -663,3 +669,28 @@ def _t(t) -> dict:
         "exec_time_short_ms": t.exec_time_short_ms,
         "exec_time_long_ms":  t.exec_time_long_ms,
     }
+
+
+# Добавьте новые эндпоинты:
+@app.get("/api/ignored-symbols")
+async def list_ignored():
+    from db import get_ignored_symbols
+    return get_ignored_symbols()
+
+
+@app.post("/api/ignored-symbols/add")
+async def add_ignored(ticker: str):
+    from db import add_ignored_symbol, get_ignored_symbols
+    from risk_manager import set_ignored_tickers
+    add_ignored_symbol(ticker)
+    set_ignored_tickers(get_ignored_symbols())
+    return {"ok": True}
+
+
+@app.post("/api/ignored-symbols/remove")
+async def remove_ignored(ticker: str):
+    from db import remove_ignored_symbol, get_ignored_symbols
+    from risk_manager import set_ignored_tickers
+    remove_ignored_symbol(ticker)
+    set_ignored_tickers(get_ignored_symbols())
+    return {"ok": True}

@@ -94,6 +94,12 @@ def db_init():
                 exec_time_long_ms     INTEGER
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ignored_symbols (
+                ticker VARCHAR(20) PRIMARY KEY,
+                added_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
         # Добавляем колонки если таблица уже существует (миграция)
         for col, definition in [
             ('exec_time_short_ms', 'INTEGER'),
@@ -322,3 +328,26 @@ def load_exchange_settings() -> dict[str, dict]:
     except Exception as e:
         print(f"[DB] load_exchange_settings error: {e}")
         return {}
+        # Добавьте новые функции в конец файла:
+
+
+def add_ignored_symbol(ticker: str):
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("INSERT INTO ignored_symbols (ticker) VALUES (%s) ON CONFLICT DO NOTHING", (ticker.upper(),))
+        c.commit()
+
+
+def remove_ignored_symbol(ticker: str):
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("DELETE FROM ignored_symbols WHERE ticker=%s", (ticker.upper(),))
+        c.commit()
+
+
+def get_ignored_symbols() -> list[str]:
+    try:
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("SELECT ticker FROM ignored_symbols ORDER BY ticker")
+            rows = cur.fetchall()
+        return [r['ticker'] for r in rows]
+    except Exception:
+        return []

@@ -26,6 +26,18 @@ _disabled_exchanges: set[str] = set()
 # Выделенный капитал на каждой бирже (чистые деньги без плеча, 0 = весь баланс)
 _allocated_capital: dict[str, float] = {}
 
+# Добавьте в начало файла:
+_ignored_tickers: set[str] = set()
+
+
+def set_ignored_tickers(tickers: list[str]):
+    global _ignored_tickers
+    _ignored_tickers = {t.upper() for t in tickers}
+
+
+def is_ticker_ignored(ticker: str) -> bool:
+    return ticker.upper() in _ignored_tickers
+
 
 def set_exchange_enabled(exchange: str, enabled: bool):
     if enabled:
@@ -62,6 +74,10 @@ class RiskResult:
 
 
 async def check_signal(signal: OpenSignal, short_ex: BaseExchange, long_ex: BaseExchange) -> RiskResult:
+    # В функцию check_signal(signal, ...) в самое начало добавьте:
+    # 0. Проверка черного списка
+    if is_ticker_ignored(signal.ticker):
+        return RiskResult(ok=False, reason=f"Тикер {signal.ticker} находится в черном списке.")
 
     # 1. Лимит открытых позиций
     open_trades = get_all_open_trades()

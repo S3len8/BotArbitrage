@@ -151,9 +151,10 @@ async def notify(text: str, tv_url: str = None, buttons: list = None) -> int | N
 
 
 async def notify_mexc(text: str, tv_url: str = None, buttons: list = None) -> int | None:
-    """Відправляє сигнал MEXC в спеціальний канал."""
+    """Отправляет сигнал MEXC в специальный канал (MEXC_CHAT_ID)."""
     import asyncio
     loop = asyncio.get_event_loop()
+    # Мы явно указываем MEXC_CHAT_ID здесь
     return await loop.run_in_executor(
         _executor, _send_sync, text, MEXC_CHAT_ID, tv_url, buttons
     )
@@ -162,32 +163,25 @@ async def notify_mexc(text: str, tv_url: str = None, buttons: list = None) -> in
 async def notify_order(exchange: str, side: str, symbol: str,
                        price: float, qty, size_usd: float,
                        order_id: str = '', extra: str = '') -> None:
-    """Лог виконання ордера → ORDERS_CHAT_ID.
-
-    Формат:
-    ⚡ BINANCE | SHORT
-    🪙 BTCUSDT
-    💲 Ціна: $43,215.000000
-    📦 Qty:  0.023
-    💵 ~$994.95
-    🕐 2024-01-15 12:34:56 UTC
-    """
+    """Лог выполнения ордера -> ORDERS_CHAT_ID."""
     import asyncio
+    from datetime import datetime, timezone
     now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-    side_emoji = '📉' if side.lower() in ('sell', 'short') else '📈'
+    side_emoji = '📉' if side.lower() in ('sell', 'short', 'close_short') else '📈'
+
     msg = (
         f"⚡ <b>{exchange.upper()}</b> | {side.upper()}\n"
         f"{side_emoji} <b>{symbol.upper()}</b>\n"
-        f"💲 Ціна: <code>${price:,.6f}</code>\n"
+        f"💲 Цена: <code>${price:,.6f}</code>\n"
         f"📦 Qty:  <code>{qty}</code>\n"
         f"💵 ~<code>${size_usd:,.2f}</code>\n"
         f"🕐 {now} UTC"
     )
-    if order_id:
-        msg += f"\n🔑 <code>{order_id}</code>"
-    if extra:
-        msg += f"\n{extra}"
+    if order_id: msg += f"\n🔑 ID: <code>{order_id}</code>"
+    if extra: msg += f"\n{extra}"
+
     loop = asyncio.get_event_loop()
+    # Мы явно указываем ORDERS_CHAT_ID здесь
     await loop.run_in_executor(
         _executor, _send_sync, msg, ORDERS_CHAT_ID, None, None
     )

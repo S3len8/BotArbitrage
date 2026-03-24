@@ -206,10 +206,17 @@ class SignalListener:
             return
 
         if isinstance(signal, OpenSignal):
-            in_pinned = signal.ticker in _pinned_tickers
-            is_mexc   = 'mexc' in (signal.short_exchange, signal.long_exchange)
-            other_ex  = signal.long_exchange if signal.short_exchange == 'mexc' else signal.short_exchange
+            # --- НОВЫЙ БЛОК: ПЕРЕХВАТ MEXC ---
+            is_mexc = 'mexc' in (signal.short_exchange.lower(), signal.long_exchange.lower())
 
+            if is_mexc:
+                # Если в паре есть MEXC — только уведомляем в спец. канал и выходим
+                print(f"[Listener] Сигнал MEXC {signal.ticker} перехвачен.")
+                await _notify_mexc(signal)
+                return
+                # --------------------------------
+
+            in_pinned = signal.ticker in _pinned_tickers
             if is_edit:
                 if is_recent:
                     source = "edit+recent"

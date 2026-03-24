@@ -694,8 +694,23 @@
         <span class="section-title">Exchange Balances</span>
         <span class="section-badge" id="bal-updated">—</span>
       </div>
+<!-- Секция балансов -->
       <div class="balance-list" id="balance-list">
-        <!-- injected by JS -->
+        <!-- сюда бот вставляет балансы -->
+      </div>
+
+      <!-- НОВАЯ СЕКЦИЯ: ЧЕРНЫЙ СПИСОК (ВСТАВИТЬ СЮДА) -->
+      <div class="section-header" style="border-top: 1px solid var(--border); margin-top: 15px;">
+        <span class="section-title">Blacklist (Ignore)</span>
+      </div>
+      <div style="padding: 15px; background: var(--bg2);">
+        <div style="display: flex; gap: 8px; margin-bottom: 12px;">
+          <input type="text" id="ignore-input" class="filter-input" style="flex: 1; border: 1px solid var(--border2);" placeholder="Ticker (напр. ZBCN)">
+          <button class="btn-bot start" style="padding: 6px 15px; height: 32px;" onclick="addIgnored()">ADD</button>
+        </div>
+        <div id="ignore-list" style="display: flex; flex-wrap: wrap; gap: 8px; min-height: 20px;">
+          <!-- Сюда JavaScript будет вставлять заблокированные монеты -->
+        </div>
       </div>
     </div>
 
@@ -827,6 +842,7 @@ async function toggleBot() {
   // Статус обновится через WS
   setTimeout(() => { btn.disabled = false; }, 3000);
 }
+
 
 async function retryDb() {
   showToast('Переподключение к PostgreSQL...', 'info');
@@ -1288,6 +1304,8 @@ async function loadTrades() {
     document.getElementById('trade-count').textContent = allTrades.length;
     renderTable();
   } catch(e) { console.error(e); }
+  // ВАЖНО: Добавьте вызов этой функции в блок инициализации (там где loadTrades и т.д.)
+loadIgnored();
 }
 
 function setTab(el, tab) {
@@ -1420,6 +1438,39 @@ setInterval(loadLivePositions, 15000);
     await loadLivePositions();
   } catch(e) { console.error(e); }
 })();
+// Загрузка и отрисовка черного списка
+async function loadIgnored() {
+  const r = await fetch(`${API}/api/ignored-symbols`);
+  const tickers = await r.json();
+  const container = document.getElementById('ignore-list');
+  container.innerHTML = tickers.map(t => `
+    <span class="badge badge-failed" style="display: flex; align-items: center; gap: 5px; cursor: pointer;" onclick="removeIgnored('${t}')">
+      ${t} <span style="font-size: 14px; line-height: 1;">×</span>
+    </span>
+  `).join('');
+}
+
+async function addIgnored() {
+  const input = document.getElementById('ignore-input');
+  const ticker = input.value.trim().upperCase();
+  if (!ticker) return;
+
+  const r = await fetch(`${API}/api/ignored-symbols/add?ticker=${ticker}`, {method: 'POST'});
+  if (r.ok) {
+    input.value = '';
+    loadIgnored();
+    showToast(`Тикер ${ticker} добавлен в черный список`);
+  }
+}
+
+async function removeIgnored(ticker) {
+  if (!confirm(`Удалить ${ticker} из черного списка?`)) return;
+  const r = await fetch(`${API}/api/ignored-symbols/remove?ticker=${ticker}`, {method: 'POST'});
+  if (r.ok) {
+    loadIgnored();
+    showToast(`Тикер ${ticker} удален из списка`);
+  }
+}
 </script>
 </body>
 </html>
