@@ -617,6 +617,16 @@
     .stats-row { grid-template-columns: repeat(2, 1fr); }
     .app { padding: 12px; }
   }
+    /* Плавное изменение цвета и прозрачности для предотвращения мерцания */
+  .unrealized-pnl, .short-price, .long-price {
+      transition: color 0.3s ease, opacity 0.2s ease;
+  }
+
+  /* Фиксированная высота карточек, чтобы список не "прыгал" при загрузке */
+  .position-card {
+      min-height: 180px;
+      contain: content; /* Оптимизация рендеринга браузером */
+  }
 </style>
 </head>
 <body>
@@ -1402,18 +1412,46 @@ loadTrades();
 setInterval(loadTrades, 30000);
 
 // Live позиции — обновляем каждые 15 секунд
-async function loadLivePositions() {
-  try {
-    const positions = await fetch(`${API}/api/positions/live`).then(r=>r.json());
-    renderOpenPositions(positions);
-  } catch(e) {
-    console.error('live positions error:', e);
-    // fallback — загружаем обычные открытые позиции
+// Функция плавного обновления данных без перерисовки всей карточки
+async function updateLivePositions() {
     try {
-      const positions = await fetch(`${API}/api/trades/open`).then(r=>r.json());
-      renderOpenPositions(positions);
-    } catch(e2) {}
-  }
+        const response = await fetch('/api/positions/live');
+        const positions = await response.json();
+
+        const container = document.getElementById('live-positions-container');
+
+        positions.forEach(p => {
+            let card = document.getElementById(`pos-card-${p.id}`);
+
+            // Если карточки еще нет — создаем её один раз
+            if (!card) {
+                container.insertAdjacentHTML('beforeend', createPositionTemplate(p));
+                return;
+            }
+
+            // Если есть — обновляем только цифры через querySelector
+            const uPnlElem = card.querySelector('.unrealized-pnl');
+            uPnlElem.innerText = `$${p.unrealized_pnl}`;
+            uPnlElem.style.color = p.unrealized_pnl >= 0 ? 'var(--green)' : 'var(--red)';
+
+            card.querySelector('.short-price').innerText = p.cur_short_price;
+            card.querySelector('.long-price').innerText = p.cur_long_price;
+            card.querySelector('.short-pnl').innerText = `$${p.short_unrealized}`;
+            card.querySelector('.long-pnl').innerText = `$${p.long_unrealized}`;
+
+            // Статус "Live"
+            card.querySelector('.status-badge').className = `status-badge ${p.short_on_exchange && p.long_on_exchange ? 'bg-success' : 'bg-danger'}`;
+        });
+
+        // Удаляем карточки тех позиций, которых больше нет в списке
+        Array.from(container.children).forEach(child => {
+            const id = child.id.replace('pos-card-', '');
+            if (!positions.find(p => p.id == id)) child.remove();
+        });
+
+    } catch (err) {
+        console.error("Update error:", err);
+    }
 }
 
 loadLivePositions();

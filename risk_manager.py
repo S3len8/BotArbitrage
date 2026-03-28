@@ -111,10 +111,28 @@ async def check_signal(signal: OpenSignal, short_ex: BaseExchange, long_ex: Base
         if isinstance(val, Exception):
             return RiskResult(ok=False, reason=f"Ошибка получения {label}: {val}")
 
-    # 5. Реальный спред
-    real_spread = (short_price / long_price - 1) * 100 if long_price > 0 else 0
-    if real_spread < MIN_SPREAD_PCT:
-        return RiskResult(ok=False, reason=f"Спред упал до {real_spread:.3f}% (мин {MIN_SPREAD_PCT}%). {signal.ticker} пропущен.")
+        # 5. Реальный спред
+        real_spread = (short_price / long_price - 1) * 100 if long_price > 0 else 0
+        if real_spread < MIN_SPREAD_PCT:
+            return RiskResult(ok=False,
+                              reason=f"Спред упал до {real_spread:.3f}% (мин {MIN_SPREAD_PCT}%). {signal.ticker} пропущен.")
+
+        # --- НОВОЕ УСЛОВИЕ: Проверка отклонения от справедливой цены ---
+        # Справедливая цена (fair_price) — это среднее арифметическое цен на обеих биржах
+        fair_price = (short_price + long_price) / 2
+
+        # Расчет отклонения для каждой биржи в процентах
+        deviation_short = abs(short_price - fair_price) / fair_price * 100
+        deviation_long = abs(long_price - fair_price) / fair_price * 100
+
+        # Если отклонение на любой из бирж > 9%, входим в режим ожидания
+        if deviation_short > 9 or deviation_long > 9:
+            return RiskResult(
+                ok=False,
+                reason=(f"Аномальное отклонение цены (>9%): Short({deviation_short:.1f}%), "
+                        f"Long({deviation_long:.1f}%). Ожидаем выравнивания цен.")
+            )
+        # -----------------------------------------------------------------------
 
     # 5b. Фандинг-фильтр — Стратегия #4
     # ✅ Условие A: diff < 0.2%

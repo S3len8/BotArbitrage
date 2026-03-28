@@ -1,18 +1,23 @@
 """
-notifier.py — сповіщення через Telegram.
+notifier.py — уведомления через Telegram.
 
-Три окремих канали (один бот, різні chat_id з .env):
-  NOTIFY_CHAT_ID  — відкриття/закриття угод (основний чат)
-  MEXC_CHAT_ID    — сигнали MEXC (бот не торгує — тільки повідомляє)
-  ORDERS_CHAT_ID  — лог виконання ордерів: біржа, час, ціна, qty, $, монета
+Три независимых бота (токен + chat_id из .env):
+  NOTIFY_BOT_TOKEN / NOTIFY_CHAT_ID   — открытие/закрытие сделок (основной)
+  MEXC_BOT_TOKEN   / MEXC_CHAT_ID     — сигналы MEXC (бот не торгует)
+  ORDERS_BOT_TOKEN / ORDERS_CHAT_ID   — лог исполнения ордеров
 
-Якщо MEXC_CHAT_ID / ORDERS_CHAT_ID не задані — fallback на NOTIFY_CHAT_ID.
+Если MEXC_BOT_TOKEN / ORDERS_BOT_TOKEN не заданы в .env —
+автоматически используется основной бот (NOTIFY_BOT_TOKEN).
 """
 
 import requests
 from datetime import datetime, timezone
-from settings import NOTIFY_BOT_TOKEN, NOTIFY_CHAT_ID, MEXC_CHAT_ID, ORDERS_CHAT_ID
 from concurrent.futures import ThreadPoolExecutor
+from settings import (
+    NOTIFY_BOT_TOKEN, NOTIFY_CHAT_ID,
+    MEXC_BOT_TOKEN,   MEXC_CHAT_ID,
+    ORDERS_BOT_TOKEN, ORDERS_CHAT_ID,
+)
 
 _executor = ThreadPoolExecutor(max_workers=4)
 
@@ -65,107 +70,111 @@ def _safe_html(text: str) -> str:
     return result
 
 
-def _send_sync(text: str, chat_id: str = None, tv_url: str = None,
-               buttons: list = None) -> int | None:
-    """Синхронна відправка в зазначений chat_id."""
-    target_chat = chat_id or NOTIFY_CHAT_ID
-    if not NOTIFY_BOT_TOKEN or not target_chat:
-        print(f"[Notify→{target_chat}] {text[:120]}")
+def _send_sync(text: str, bot_token: str, chat_id: str,
+               tv_url: str = None, buttons: list = None) -> int | None:
+    """Синхронная отправка через указанного бота в указанный чат."""
+    if not bot_token or not chat_id:
+        print(f"[Notify] пропущено — bot_token или chat_id не заданы в .env")
+        print(f"[Notify] {text[:120]}")
         return None
-    url = f"https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}/sendMessage"
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
-        "chat_id":                  target_chat,
+        "chat_id":                  chat_id,
         "text":                     _safe_html(text),
         "parse_mode":               "HTML",
         "disable_web_page_preview": True,
     }
+
     all_buttons = []
     if tv_url:
         all_buttons.append({"text": "📈 TradingView", "url": tv_url})
     if buttons:
         all_buttons.extend(buttons)
     if all_buttons:
-        keyboard = []
         tv_btns = [b for b in all_buttons if 'TradingView' in b['text']]
         ex_btns = [b for b in all_buttons if 'TradingView' not in b['text']]
+        keyboard = []
         if tv_btns:
             keyboard.append(tv_btns)
         if ex_btns:
             keyboard.append(ex_btns)
         payload["reply_markup"] = {"inline_keyboard": keyboard}
+
     try:
         r = requests.post(url, json=payload, timeout=15)
         if not r.ok:
-            print(f"[Notify] error {r.status_code}: {r.text[:100]}")
+            print(f"[Notify] ошибка {r.status_code}: {r.text[:200]}")
             return None
         return r.json().get('result', {}).get('message_id')
     except Exception as e:
-        print(f"[Notify] error: {e}")
+        print(f"[Notify] исключение: {e}")
         return None
 
 
-def _edit_sync(message_id: int, text: str, chat_id: str = None,
+def _edit_sync(message_id: int, text: str, bot_token: str, chat_id: str,
                tv_url: str = None, buttons: list = None):
-    target_chat = chat_id or NOTIFY_CHAT_ID
-    if not NOTIFY_BOT_TOKEN or not target_chat or not message_id:
+    """Синхронное редактирование сообщения."""
+    if not bot_token or not chat_id or not message_id:
         return
-    url = f"https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}/editMessageText"
+
+    url = f"https://api.telegram.org/bot{bot_token}/editMessageText"
     payload = {
-        "chat_id":                  target_chat,
+        "chat_id":                  chat_id,
         "message_id":               message_id,
         "text":                     _safe_html(text),
         "parse_mode":               "HTML",
         "disable_web_page_preview": True,
     }
+
     all_buttons = []
     if tv_url:
         all_buttons.append({"text": "📈 TradingView", "url": tv_url})
     if buttons:
         all_buttons.extend(buttons)
     if all_buttons:
-        keyboard = []
         tv_btns = [b for b in all_buttons if 'TradingView' in b['text']]
         ex_btns = [b for b in all_buttons if 'TradingView' not in b['text']]
+        keyboard = []
         if tv_btns:
             keyboard.append(tv_btns)
         if ex_btns:
             keyboard.append(ex_btns)
         payload["reply_markup"] = {"inline_keyboard": keyboard}
+
     try:
         r = requests.post(url, json=payload, timeout=15)
         if not r.ok and 'message is not modified' not in r.text:
-            print(f"[Notify] edit error {r.status_code}: {r.text[:100]}")
+            print(f"[Notify] edit ошибка {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        print(f"[Notify] edit error: {e}")
+        print(f"[Notify] edit исключение: {e}")
 
 
-# ── Публічні async функції ────────────────────────────────────
+# ── Публичные async функции ───────────────────────────────────
 
 async def notify(text: str, tv_url: str = None, buttons: list = None) -> int | None:
-    """Відправляє в основний чат (відкриття/закриття угод)."""
+    """Основной чат — открытие/закрытие сделок."""
     import asyncio
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
-        _executor, _send_sync, text, NOTIFY_CHAT_ID, tv_url, buttons
+        _executor, _send_sync, text, NOTIFY_BOT_TOKEN, NOTIFY_CHAT_ID, tv_url, buttons
     )
 
 
 async def notify_mexc(text: str, tv_url: str = None, buttons: list = None) -> int | None:
-    """Отправляет сигнал MEXC в специальный канал (MEXC_CHAT_ID)."""
+    """MEXC-бот — сигналы где есть MEXC, торговля не открывается."""
     import asyncio
     loop = asyncio.get_event_loop()
-    # Мы явно указываем MEXC_CHAT_ID здесь
     return await loop.run_in_executor(
-        _executor, _send_sync, text, MEXC_CHAT_ID, tv_url, buttons
+        _executor, _send_sync, text, MEXC_BOT_TOKEN, MEXC_CHAT_ID, tv_url, buttons
     )
 
 
 async def notify_order(exchange: str, side: str, symbol: str,
                        price: float, qty, size_usd: float,
                        order_id: str = '', extra: str = '') -> None:
-    """Лог выполнения ордера -> ORDERS_CHAT_ID."""
+    """Бот ордеров — каждый исполненный ордер с деталями."""
     import asyncio
-    from datetime import datetime, timezone
     now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     side_emoji = '📉' if side.lower() in ('sell', 'short', 'close_short') else '📈'
 
@@ -177,21 +186,22 @@ async def notify_order(exchange: str, side: str, symbol: str,
         f"💵 ~<code>${size_usd:,.2f}</code>\n"
         f"🕐 {now} UTC"
     )
-    if order_id: msg += f"\n🔑 ID: <code>{order_id}</code>"
-    if extra: msg += f"\n{extra}"
+    if order_id:
+        msg += f"\n🔑 ID: <code>{order_id}</code>"
+    if extra:
+        msg += f"\n{extra}"
 
     loop = asyncio.get_event_loop()
-    # Мы явно указываем ORDERS_CHAT_ID здесь
     await loop.run_in_executor(
-        _executor, _send_sync, msg, ORDERS_CHAT_ID, None, None
+        _executor, _send_sync, msg, ORDERS_BOT_TOKEN, ORDERS_CHAT_ID, None, None
     )
 
 
-async def edit_notify(message_id: int, text: str, tv_url: str = None,
-                      buttons: list = None):
-    """Редагує повідомлення в основному чаті."""
+async def edit_notify(message_id: int, text: str,
+                      tv_url: str = None, buttons: list = None):
+    """Редактирует сообщение в основном чате."""
     import asyncio
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(
-        _executor, _edit_sync, message_id, text, NOTIFY_CHAT_ID, tv_url, buttons
+        _executor, _edit_sync, message_id, text, NOTIFY_BOT_TOKEN, NOTIFY_CHAT_ID, tv_url, buttons
     )

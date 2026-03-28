@@ -643,54 +643,103 @@ class BybitExchange(BaseExchange):
 
     def _bybit_order_sync(self, symbol: str, side: str, size_usd: float,
                           reduce_only: bool = False, price: float = None) -> dict:
-        """Прямой REST ордер Bybit Futures v5 — без ccxt."""
+        """Прямой REST ордер Bybit Futures v5 — улучшенная математика и форматирование."""
         import json as _json
-        ticker = _bybit_ticker(symbol)
-        if price is None:
-            price = self._price_sync(symbol)
+        import requests
 
-        # Минимальный шаг qty
+        # 1. Получаем актуальный тикер (PTBUSDT)
+        ticker = symbol.replace('/', '').replace('_', '')
+
+        # 2. Получаем рыночные данные (Lot Size)
         try:
             r = requests.get('https://api.bybit.com/v5/market/instruments-info',
                              params={'category': 'linear', 'symbol': ticker}, timeout=10)
-            items = r.json().get('result', {}).get('list', [])
-            step = float(items[0]['lotSizeFilter']['qtyStep']) if items else 0.01
-        except Exception:
-            step = 0.01
-        qty = _round(size_usd / price, step)
-        if qty <= 0:
-            raise ValueError(f"bybit: qty={qty} <= 0 для {ticker}")
+            res = r.json()
+            instr = res.get('result', {}).get('list', [])[0]
+            lot_filter = instr.get('lotSizeFilter', {})
 
-        ts  = str(_ts())
+            qty_step_str = lot_filter.get('qtyStep', '0.01')
+            step = float(qty_step_str)
+
+            # Определяем точность (количество знаков после запятой) из строки qtyStep
+            # Это предотвращает передачу лишних нулей, которые вызывают ошибку 10001
+            if '.' in qty_step_str:
+                precision = len(qty_step_str.split('.')[-1])
+            else:
+                precision = 0
+        except Exception as e:
+            print(f"[Bybit] Warning: ошибка получения инструментов {e}")
+            step = 0.01
+            precision = 2
+
+        # 3. Определяем цену, если не передана
+        if price is None:
+            try:
+                # Рекомендуется брать цену из тикера для точности
+                rt = requests.get('https://api.bybit.com/v5/market/tickers',
+                                  params={'category': 'linear', 'symbol': ticker})
+                price = float(rt.json()['result']['list'][0]['lastPrice'])
+            except:
+                price = self._price_sync(symbol)
+
+        # 4. РАССЧИТЫВАЕМ QTY
+        # Математически верное округление вниз до ближайшего шага
+        raw_qty = size_usd / price
+        qty = (raw_qty // step) * step
+
+        # ФОРМАТИРОВАНИЕ: Превращаем в строку с ПРАВИЛЬНОЙ точностью
+        # Это КРИТИЧЕСКИЙ момент для исправления ошибки 10001
+        qty_str = format(qty, f'.{precision}f')
+
+        if float(qty_str) <= 0:
+            raise ValueError(f"bybit: рассчитанный qty={qty_str} слишком мал для {ticker}")
+
+        # 5. ПОДГОТОВКА ЗАПРОСА
+        ts = str(int(time.time() * 1000))
         recv_window = '5000'
+
         body = {
-            'category':   'linear',
-            'symbol':     ticker,
-            'side':       'Sell' if side == 'sell' else 'Buy',
-            'orderType':  'Market',
-            'qty':        str(qty),
+            'category': 'linear',
+            'symbol': ticker,
+            'side': 'Sell' if side.lower() == 'sell' else 'Buy',
+            'orderType': 'Market',
+            'qty': qty_str,
             'timeInForce': 'IOC',
         }
+
         if reduce_only:
             body['reduceOnly'] = True
-        body_str  = _json.dumps(body, separators=(',', ':'))
-        sign_str  = ts + self._api_key + recv_window + body_str
+
+        # Важно: separators гарантируют отсутствие пробелов в JSON
+        body_str = _json.dumps(body, separators=(',', ':'))
+
+        # 6. ПОДПИСЬ (Bybit v5: timestamp + api_key + recv_window + body)
+        sign_str = ts + self._api_key + recv_window + body_str
         sig = _sign_hmac_sha256(self._api_secret, sign_str)
+
         headers = {
-            'X-BAPI-API-KEY':     self._api_key,
-            'X-BAPI-SIGN':        sig,
-            'X-BAPI-TIMESTAMP':   ts,
+            'X-BAPI-API-KEY': self._api_key,
+            'X-BAPI-SIGN': sig,
+            'X-BAPI-TIMESTAMP': ts,
             'X-BAPI-RECV-WINDOW': recv_window,
-            'Content-Type':       'application/json',
+            'Content-Type': 'application/json',
         }
+
+        # 7. ОТПРАВКА
         r = requests.post('https://api.bybit.com/v5/order/create',
                           headers=headers, data=body_str, timeout=15)
-        r.raise_for_status()
+
         d = r.json()
         if d.get('retCode') != 0:
-            raise ValueError(f"bybit order error: {d.get('retMsg')} code={d.get('retCode')}")
-        order_id = d.get('result', {}).get('orderId', '')
-        return {'order_id': order_id, 'price': price, 'qty': qty, 'fee': 0.0}
+            # Логируем отправленный qty для отладки
+            raise ValueError(f"bybit order error: {d.get('retMsg')} (code={d.get('retCode')}, qty={qty_str})")
+
+        return {
+            'order_id': d.get('result', {}).get('orderId', ''),
+            'price': price,
+            'qty': float(qty_str),
+            'fee': 0.0
+        }
 
     def _open_params(self, side): return {'positionIdx': 0}
 
@@ -1039,77 +1088,109 @@ class BitgetExchange(BaseExchange):
 
     def _bitget_order_sync(self, symbol: str, side: str, size_usd: float,
                            reduce_only: bool = False, price: float = None) -> dict:
-        """Прямой REST ордер Bitget Futures Mix API v2 — без ccxt."""
-        import base64, json as _json
+        """Ордер Bitget v2 с автоматической настройкой плеча и режима маржи."""
+        import base64, json as _json, hmac, hashlib, time
         ticker = _bitget_ticker(symbol)
         if price is None:
             price = self._price_sync(symbol)
 
-        # Получаем параметры контракта
-        # sizeMultiplier = размер 1 контракта в базовой валюте
-        # minTradeNum    = минимальный размер ордера в контрактах
-        contract_size = 1.0
-        min_trade     = 1.0
-        try:
-            r = requests.get('https://api.bitget.com/api/v2/mix/market/contracts',
-                             params={'symbol': ticker, 'productType': 'USDT-FUTURES'}, timeout=10)
-            data = r.json().get('data', [])
-            if data:
-                contract_size = float(data[0].get('sizeMultiplier') or 1)
-                min_trade     = float(data[0].get('minTradeNum') or 1)
-                print(f"[bitget] {ticker}: contract_size={contract_size} min_trade={min_trade}")
-        except Exception as e:
-            print(f"[bitget] contract info error: {e}")
+        # 1. Вспомогательная функция для подписи и запросов
+        def _do_bitget_request(method, path, params=None, body_dict=None):
+            ts = str(int(time.time() * 1000))
+            body_str = _json.dumps(body_dict, separators=(',', ':')) if body_dict else ''
 
-        # qty в контрактах
-        qty_raw = size_usd / price / contract_size
-        qty = max(min_trade, round(qty_raw / min_trade) * min_trade)
-        if qty <= 0:
-            raise ValueError(f"bitget: qty={qty} <= 0 для {ticker}")
-
-        def _sign_bitget(ts, method, path, body=''):
-            msg = ts + method + path + body
-            return base64.b64encode(
-                hmac.new(self._api_secret.encode(), msg.encode(), hashlib.sha256).digest()
+            # Формируем строку для подписи: TS + METHOD + PATH + BODY
+            sign_str = ts + method.upper() + path + body_str
+            sig = base64.b64encode(
+                hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha256).digest()
             ).decode()
 
-        ts   = str(_ts())
-        path = '/api/v2/mix/order/place-order'
-        body_d = {
-            'symbol':      ticker,
-            'productType': 'USDT-FUTURES',
-            'marginMode':  'isolated',
-            'marginCoin':  'USDT',
-            'side':        'sell' if side == 'sell' else 'buy',
-            'orderType':   'market',
-            'size':        str(qty),
-            'leverage':    str(LEVERAGE),
-        }
-        # tradeSide нужен только в hedge-mode (двусторонние позиции).
-        # В one-way mode (по умолчанию) tradeSide вызывает ошибку 40774.
-        # Пробуем без него — работает для большинства аккаунтов.
-        if reduce_only:
-            body_d['reduceOnly'] = 'YES'
-        body_str = _json.dumps(body_d, separators=(',', ':'))
-        sig = _sign_bitget(ts, 'POST', path, body_str)
-        headers = {
-            'ACCESS-KEY':        self._api_key,
-            'ACCESS-SIGN':       sig,
-            'ACCESS-TIMESTAMP':  ts,
-            'ACCESS-PASSPHRASE': self._passphrase,
-            'Content-Type':      'application/json',
-        }
-        r = requests.post(f'https://api.bitget.com{path}',
-                          headers=headers, data=body_str, timeout=15)
-        if not r.ok:
-            print(f"[bitget] order failed {r.status_code}: {r.text[:300]}")
-            r.raise_for_status()
-        d = r.json()
-        if d.get('code') not in ('00000', 0):
-            raise ValueError(f"bitget order error: {d.get('msg')} code={d.get('code')}")
-        order_id = d.get('data', {}).get('orderId', '')
-        return {'order_id': order_id, 'price': price, 'qty': qty, 'fee': 0.0}
+            headers = {
+                'ACCESS-KEY': self._api_key,
+                'ACCESS-SIGN': sig,
+                'ACCESS-TIMESTAMP': ts,
+                'ACCESS-PASSPHRASE': self._passphrase,
+                'Content-Type': 'application/json',
+            }
+            url = f'https://api.bitget.com{path}'
+            if method.upper() == 'POST':
+                return requests.post(url, headers=headers, data=body_str, timeout=15)
+            else:
+                return requests.get(url, headers=headers, params=params, timeout=15)
 
+        # 2. АВТО-НАСТРОЙКА (только если это не закрытие позиции)
+        if not reduce_only:
+            try:
+                # Устанавливаем Изолированную маржу (isolated)
+                # Примечание: если уже стоит isolated, запрос просто вернет ошибку или успех, это ок.
+                _do_bitget_request('POST', '/api/v2/mix/account/set-margin-mode', body_dict={
+                    'symbol': ticker,
+                    'productType': 'USDT-FUTURES',
+                    'marginMode': 'isolated'
+                })
+
+                # Устанавливаем Плечо (LEVERAGE)
+                _do_bitget_request('POST', '/api/v2/mix/account/set-leverage', body_dict={
+                    'symbol': ticker,
+                    'productType': 'USDT-FUTURES',
+                    'marginCoin': 'USDT',
+                    'leverage': str(LEVERAGE)
+                })
+                print(f"[bitget] Настройки применены: Isolated, {LEVERAGE}x")
+            except Exception as e:
+                print(f"[bitget] Ошибка пред-настройки (возможно, позиция уже открыта): {e}")
+
+        # 3. Получаем параметры контракта для расчета QTY
+        contract_size = 1.0
+        min_trade = 1.0
+        try:
+            r_info = requests.get('https://api.bitget.com/api/v2/mix/market/contracts',
+                                  params={'symbol': ticker, 'productType': 'USDT-FUTURES'}, timeout=10)
+            data = r_info.json().get('data', [])
+            if data:
+                contract_size = float(data[0].get('sizeMultiplier') or 1)
+                min_trade = float(data[0].get('minTradeNum') or 1)
+        except Exception as e:
+            print(f"[bitget] Ошибка получения инфо контракта: {e}")
+
+        # 4. Расчёт QTY и защита от переразмера
+        qty_raw = size_usd / (price * contract_size)
+        qty = round(qty_raw / min_trade) * min_trade
+
+        final_notional = qty * contract_size * price
+        if not reduce_only:
+            if qty < min_trade:
+                raise ValueError(f"bitget: слишком маленький объем для {ticker}")
+            if final_notional > (size_usd * 1.3):
+                raise ValueError(f"bitget: лот ${final_notional:.2f} > лимита ${size_usd}")
+
+        # 5. ОТПРАВКА ОРДЕРА
+        order_body = {
+            'symbol': ticker,
+            'productType': 'USDT-FUTURES',
+            'marginCoin': 'USDT',
+            'side': side.lower(),
+            'orderType': 'market',
+            'size': str(qty)
+        }
+        if reduce_only:
+            order_body['reduceOnly'] = 'YES'
+
+        r_order = _do_bitget_request('POST', '/api/v2/mix/order/place-order', body_dict=order_body)
+
+        if not r_order.ok:
+            raise ValueError(f"bitget order failed: {r_order.text}")
+
+        res = r_order.json()
+        if res.get('code') not in ('00000', 0):
+            raise ValueError(f"bitget API error: {res.get('msg')} (code: {res.get('code')})")
+
+        return {
+            'order_id': res.get('data', {}).get('orderId', ''),
+            'price': price,
+            'qty': qty,
+            'fee': 0.0
+        }
     async def place_market_order(self, symbol: str, side: str, size_usd: float) -> dict:
         await self._setup_symbol(symbol)
         return await _run_sync(self._bitget_order_sync, symbol, side, size_usd)
@@ -1444,6 +1525,30 @@ class GateExchange(CcxtExchange):
         self._api_key    = keys['api_key']
         self._api_secret = keys['api_secret']
 
+    async def _set_margin_and_leverage(self, symbol: str, leverage: int):
+        """Настройка плеча и режима маржи (Isolated) перед открытием."""
+        try:
+            # Gate.io требует, чтобы символ был в формате "PTB_USDT"
+            # 1. Устанавливаем плечо
+            await asyncio.to_thread(
+                self.api.update_position_leverage,
+                symbol=symbol,
+                leverage=str(leverage)
+            )
+            # 2. Устанавливаем режим маржи (0 = Изолированная)
+            await asyncio.to_thread(
+                self.api.update_position_margin,
+                symbol=symbol,
+                change="0"
+            )
+            print(f"[{self.name}] {symbol}: Настройки маржи/плеча ({leverage}x) применены.")
+        except Exception as e:
+            # Если позиция уже открыта или настройки такие же, Gate выдаст ошибку - игнорируем её
+            if "not modified" in str(e).lower() or "position exists" in str(e).lower():
+                pass
+            else:
+                print(f"[{self.name}] Предупреждение при настройке {symbol}: {e}")
+
     def _price_sync(self, symbol: str) -> float:
         ticker = _gate_ticker(symbol)
         r = requests.get('https://api.gateio.ws/api/v4/futures/usdt/tickers',
@@ -1543,119 +1648,143 @@ class GateExchange(CcxtExchange):
 
     def _gate_order_sync(self, symbol: str, side: str, size_usd: float,
                          reduce_only: bool = False, price: float = None) -> dict:
-        """Размещает рыночный ордер Gate через прямой REST.
+        """Размещает рыночный ордер Gate через прямой REST с защитой от Multiplier."""
+        import hashlib as hl
+        import json as _json
+        import hmac  # Добавлен импорт, если его нет выше
 
-        Gate isolated mode: leverage передаётся в теле ордера.
-        Порядок: открываем с leverage → Gate создаёт isolated позицию автоматически.
-        """
-        import hashlib as hl, json as _json
         ticker = _gate_ticker(symbol)
         if price is None:
             price = self._price_sync(symbol)
 
-        # Проверяем баланс и подбираем размер
+        # 1. Получаем параметры контракта
+        quanto_multiplier = 1.0
+        order_size_min = 1
+        try:
+            r = requests.get(f'https://api.gateio.ws/api/v4/futures/usdt/contracts/{ticker}', timeout=10)
+            if r.ok:
+                d = r.json()
+                quanto_multiplier = float(d.get('quanto_multiplier') or d.get('multiplier') or 1)
+                order_size_min = int(d.get('order_size_min') or 1)
+            else:
+                print(f"[gate] contract info {r.status_code} — используем multiplier=1")
+        except Exception as e:
+            print(f"[gate] contract info error: {e} — используем multiplier=1")
+
+        # 2. Расчёт qty (КОРРЕКТИРОВКА)
+        # Сначала считаем, сколько контрактов нам "хотелось бы"
+        qty_raw = size_usd / (price * quanto_multiplier)
+
+        # Округляем до ближайшего целого, кратного шагу
+        qty = round(qty_raw / order_size_min) * order_size_min
+
+        # ПРЕДОХРАНИТЕЛЬ: Проверяем реальную стоимость того, что получилось
+        final_notional = qty * quanto_multiplier * price
+
+        # Если даже 1 контракт стоит слишком дорого (например, > 120% от лимита)
+        # или если после округления qty стал 0
+        if qty < order_size_min or final_notional > (size_usd * 1.2):
+            # Если это закрытие позиции (reduce_only), мы обязаны выполнить ордер,
+            # но для открытия (new position) — блокируем.
+            if not reduce_only:
+                raise ValueError(
+                    f"КРИТИЧЕСКАЯ ОШИБКА ОБЪЕМА: 1 лот на Gate стоит ${final_notional:.2f}, "
+                    f"что значительно больше лимита ${size_usd:.2f}. Сделка отменена."
+                )
+            else:
+                # При закрытии берем минимум 1, чтобы выйти из позиции
+                qty = max(order_size_min, qty)
+
+        # 3. Проверка баланса и плеча
         effective_leverage = LEVERAGE
         if not reduce_only:
             try:
                 available = self._balance_sync()
-                # Gate требует margin = notional / leverage
-                # Берём 75% доступного баланса как максимальную маржу
-                max_margin = available * 0.75
-                max_notional = max_margin * LEVERAGE
-                if size_usd > max_notional:
-                    print(f"[gate] size ${size_usd:.2f} > max ${max_notional:.2f} "
-                          f"(баланс ${available:.2f}×{LEVERAGE}×75%), обрезаем")
-                    size_usd = max_notional
-                # Дополнительная проверка: если даже при нужном leverage маржа не хватает —
-                # снижаем leverage до максимально допустимого
-                required_margin = size_usd / LEVERAGE
+                max_margin = available * 0.95  # Используем 95% для запаса
+
+                # Считаем требуемую маржу для ПОЛУЧЕННОГО qty
+                required_margin = final_notional / effective_leverage
+
                 if required_margin > max_margin:
-                    effective_leverage = max(1, int(size_usd / max_margin))
-                    print(f"[gate] снижаем leverage {LEVERAGE}→{effective_leverage} "
-                          f"(нужна маржа ${required_margin:.2f}, доступно ${max_margin:.2f})")
+                    # Пробуем увеличить плечо или уменьшить qty?
+                    # Безопаснее просто выдать ошибку, чтобы не заходить с плечом 100х случайно
+                    raise ValueError(f"Недостаточно маржи на Gate: надо ${required_margin:.2f}, есть ${max_margin:.2f}")
+            except ValueError:
+                raise
             except Exception as e:
                 print(f"[gate] balance check failed: {e}")
 
-        qty = max(1, int(size_usd / price))
+        print(f"[gate] {ticker} Итоговый qty={qty} (notional=${final_notional:.2f})")
 
-        ts     = str(int(time.time()))
+        # 4. Формирование запроса
+        ts = str(int(time.time()))
         method = 'POST'
-        path   = '/api/v4/futures/usdt/orders'
-        size   = -qty if side == 'sell' else qty
-        body_d: dict = {
-            'contract':  ticker,
-            'size':      size,
-            'price':     '0',
-            'tif':       'ioc',
-            'text':      't-arb',
-            'leverage':  str(effective_leverage),
+        path = '/api/v4/futures/usdt/orders'
+        size = -qty if side.lower() == 'sell' else qty
+
+        body_d = {
+            'contract': ticker,
+            'size': size,
+            'price': '0',
+            'tif': 'ioc',
+            'text': 't-arb',
+            'leverage': str(effective_leverage),
         }
         if reduce_only:
             body_d['reduce_only'] = True
             body_d.pop('leverage', None)
 
-        def _do_request(body_dict):
-            body_     = _json.dumps(body_dict)
-            body_hash = hl.sha512(body_.encode()).hexdigest()
-            sign_str_ = '\n'.join([method, path, '', body_hash, ts])
-            sig_      = hmac.new(self._api_secret.encode(),
-                                 sign_str_.encode(), hashlib.sha512).hexdigest()
-            headers_  = {
-                'KEY': self._api_key, 'SIGN': sig_, 'Timestamp': ts,
-                'Content-Type': 'application/json', 'Accept': 'application/json',
+        # Вспомогательная функция подписи (внутри для чистоты)
+        def _do_request(payload_dict):
+            payload_json = _json.dumps(payload_dict)
+            payload_hash = hl.sha512(payload_json.encode()).hexdigest()
+            # Исправлено: используйте self._api_secret, который передается в класс
+            sign_str = '\n'.join([method, path, '', payload_hash, ts])
+            signature = hmac.new(self._api_secret.encode(), sign_str.encode(), hl.sha512).hexdigest()
+
+            headers = {
+                'KEY': self._api_key,
+                'SIGN': signature,
+                'Timestamp': ts,
+                'Content-Type': 'application/json',
             }
-            return requests.post(f'https://api.gateio.ws{path}',
-                                 headers=headers_, data=body_, timeout=15)
+            return requests.post(f'https://api.gateio.ws{path}', headers=headers, data=payload_json, timeout=15)
 
         r = _do_request(body_d)
 
-        # Если LIQUIDATE_IMMEDIATELY — пробуем с меньшим leverage
+        # 5. Обработка ответа
         if not r.ok:
-            try:
-                err_json = r.json()
-                label    = err_json.get('label', '')
-                msg_     = err_json.get('message', '')
+            err_data = r.json()
+            label = err_data.get('label')
+            msg = err_data.get('message')
+            # Если ошибка в плече (уже установлено другое на бирже вручную)
+            if label == 'INVALID_PARAM_VALUE' and 'leverage' in msg:
+                print("[gate] Ошибка плеча, пробуем отправить без параметра leverage...")
+                body_d.pop('leverage', None)
+                r = _do_request(body_d)
 
-                if label == 'LIQUIDATE_IMMEDIATELY' and effective_leverage > 1:
-                    # Пробуем снизить leverage вдвое
-                    new_lev = max(1, effective_leverage // 2)
-                    print(f"[gate] LIQUIDATE_IMMEDIATELY — retry с leverage {new_lev}")
-                    body_d['leverage'] = str(new_lev)
-                    ts2 = str(int(time.time()))
-                    body_d_copy = dict(body_d)
-                    r = _do_request(body_d_copy)
-                    if not r.ok:
-                        err2 = r.json()
-                        raise ValueError(f"gate order retry failed: "
-                                         f"{err2.get('label')} — {err2.get('message')}")
+            if not r.ok:
+                raise ValueError(f"Gate API Error: {label} - {msg}")
 
-                elif label == 'INSUFFICIENT_AVAILABLE':
-                    raise ValueError(
-                        f"gate: недостаточно маржи ({msg_}). "
-                        f"Пополни баланс или уменьши размер позиции в настройках."
-                    )
-                elif label:
-                    raise ValueError(f"gate order {r.status_code}: {label} — {msg_}")
-                else:
-                    raise ValueError(f"gate order {r.status_code}: {r.text[:200]}")
-            except ValueError:
-                raise
-            except Exception:
-                raise ValueError(f"gate order {r.status_code}: {r.text[:200]}")
-
-        d = r.json()
-        if isinstance(d, dict) and d.get('label'):
-            raise ValueError(f"gate order error: {d.get('label')} — {d.get('message')}")
-        fill_price = float(d.get('fill_price') or price)
-        filled_qty = abs(int(d.get('size', 0)) - int(d.get('left', 0))) or qty
-        return {'order_id': str(d.get('id', '')), 'price': fill_price,
-                'qty': filled_qty, 'fee': 0.0}
+        res = r.json()
+        return {
+            'order_id': str(res.get('id', '')),
+            'price': float(res.get('fill_price') or price),
+            'qty': abs(int(res.get('size', 0))),
+            'fee': 0.0
+        }
 
     async def place_market_order(self, symbol: str, side: str, size_usd: float) -> dict:
+        # 1. Подготовка (базовая инфа о символе)
         await self._setup_symbol(symbol)
+
+        # 2. ПРЕДУСТАНОВКА: Сначала режим маржи и плечо (ОЖИДАЕМ завершения)
+        # На Gate.io лучше сделать это синхронно или через await
+        await self._set_margin_and_leverage(symbol, leverage=LEVERAGE)
+
+        # 3. ИСПОЛНЕНИЕ: Открываем ордер, когда уверены в настройках
         result = await _run_sync(self._gate_order_sync, symbol, side, size_usd)
-        # После открытия — переключаем на isolated (cross_leverage_limit=0)
-        asyncio.create_task(self._set_isolated_after_open(symbol))
+
         return result
 
     async def _set_isolated_after_open(self, symbol: str):
@@ -1688,9 +1817,45 @@ class GateExchange(CcxtExchange):
         await _run_sync(_sync)
 
     async def close_position(self, symbol: str, side: str, qty: float) -> dict:
+        """Закрывает позицию. qty — количество контрактов (как вернулось при открытии)."""
         price = await self.get_price(symbol)
-        return await _run_sync(self._gate_order_sync, symbol, side,
-                               qty * price, reduce_only=True, price=price)
+        # При закрытии передаём qty напрямую как контракты — не пересчитываем через size_usd,
+        # так как _gate_order_sync снова поделил бы на price и quanto_multiplier.
+        return await _run_sync(self._gate_close_sync, symbol, side, int(qty), price)
+
+    def _gate_close_sync(self, symbol: str, side: str,
+                         qty_contracts: int, price: float) -> dict:
+        """Закрывает позицию Gate: qty_contracts — точное количество контрактов."""
+        import hashlib as hl, json as _json
+        ticker = _gate_ticker(symbol)
+        size   = -qty_contracts if side == 'sell' else qty_contracts
+        ts     = str(int(time.time()))
+        path   = '/api/v4/futures/usdt/orders'
+        body_d = {
+            'contract':   ticker,
+            'size':       size,
+            'price':      '0',
+            'tif':        'ioc',
+            'reduce_only': True,
+        }
+        body_     = _json.dumps(body_d)
+        body_hash = hl.sha512(body_.encode()).hexdigest()
+        sign_str  = '\n'.join(['POST', path, '', body_hash, ts])
+        sig       = hmac.new(self._api_secret.encode(),
+                             sign_str.encode(), hashlib.sha512).hexdigest()
+        r = requests.post(f'https://api.gateio.ws{path}',
+                          headers={'KEY': self._api_key, 'SIGN': sig, 'Timestamp': ts,
+                                   'Content-Type': 'application/json'},
+                          data=body_, timeout=15)
+        if not r.ok:
+            err = r.json() if r.content else {}
+            raise ValueError(f"gate close {r.status_code}: "
+                             f"{err.get('label','')} — {err.get('message', r.text[:100])}")
+        d = r.json()
+        if isinstance(d, dict) and d.get('label'):
+            raise ValueError(f"gate close error: {d.get('label')} — {d.get('message')}")
+        fill_price = float(d.get('fill_price') or price)
+        return {'order_id': str(d.get('id', '')), 'price': fill_price, 'fee': 0.0}
 
     async def get_closed_pnl(self, symbol: str) -> Optional[float]:
         """Получает реализованный PnL закрытой позиции с Gate."""

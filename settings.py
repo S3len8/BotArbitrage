@@ -41,11 +41,13 @@ SIGNAL_CHANNEL: str = os.getenv("SIGNAL_CHANNEL", "")
 NOTIFY_BOT_TOKEN: str = os.getenv("NOTIFY_BOT_TOKEN", "")
 NOTIFY_CHAT_ID:   str = os.getenv("NOTIFY_CHAT_ID", "")
 
-# Канал для MEXC сигналів (бот не торгує — тільки повідомляє)
-MEXC_CHAT_ID: str = os.getenv("MEXC_CHAT_ID", os.getenv("NOTIFY_CHAT_ID", ""))
+# Бот и канал для MEXC сигналов (если MEXC_BOT_TOKEN не задан — используется основной)
+MEXC_BOT_TOKEN: str = os.getenv("MEXC_BOT_TOKEN", os.getenv("NOTIFY_BOT_TOKEN", ""))
+MEXC_CHAT_ID:   str = os.getenv("MEXC_CHAT_ID",   os.getenv("NOTIFY_CHAT_ID", ""))
 
-# Канал для логів виконання ордерів (біржа, час, ціна, qty, $, монета)
-ORDERS_CHAT_ID: str = os.getenv("ORDERS_CHAT_ID", os.getenv("NOTIFY_CHAT_ID", ""))
+# Бот и канал для лога ордеров (если ORDERS_BOT_TOKEN не задан — используется основной)
+ORDERS_BOT_TOKEN: str = os.getenv("ORDERS_BOT_TOKEN", os.getenv("NOTIFY_BOT_TOKEN", ""))
+ORDERS_CHAT_ID:   str = os.getenv("ORDERS_CHAT_ID",   os.getenv("NOTIFY_CHAT_ID", ""))
 
 # Поріг закриття при маржинальному ризику:
 # якщо unrealized loss однієї ноги >= MARGIN_RISK_PCT % від виділеної маржі — закриваємо обидві.

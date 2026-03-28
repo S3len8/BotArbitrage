@@ -15,13 +15,6 @@ from notifier import notify, tradingview_url, edit_notify, exchange_url, notify_
 from settings import LEVERAGE, BALANCE_ALERT_PCT, MARGIN_RISK_PCT
 
 
-# --- ВСТАВИТЬ В НАЧАЛО order_executor.py после импортов ---
-_cooldowns = {
-    "close": {},  # trade_id -> timestamp последнего закрытия (защита от дублей)
-    "warn": {}    # trade_id -> timestamp последнего предупреждения
-}
-
-
 def _now(): return datetime.now(timezone.utc)
 def _ms():  return int(time.time() * 1000)
 
@@ -407,172 +400,195 @@ async def _funding_monitor_loop():
     """
     import time as _time
     from db import get_all_open_trades
-
-    iteration = 0
-    print("[Monitor] Цикл запущен: Маржа (15с), Фандинг (60с)")
+    from exchanges import create_exchange
+    from signal_parser import CloseSignal
 
     while True:
+        await asyncio.sleep(60)
         try:
             trades = get_all_open_trades()
-            if trades:
-                for t in trades:
-                    # 1. ПРОВЕРКА МАРЖИ И ЛИКВИДАЦИИ (Каждые 15 секунд)
-                    await _check_margin_and_liquidation(t)
+            if not trades:
+                continue
 
-                    # 2. ПРОВЕРКА ФАНДИНГА (Каждые 60 секунд = каждая 4-я итерация)
-                    if iteration % 4 == 0:
+            for t in trades:
+                try:
+                    # Перевірка маржі (пріоритет над фандингом)
+                    closed = await _check_margin_risk(t)
+                    if not closed:
                         await _check_funding_for_trade(t)
-
-            iteration += 1
-            if iteration >= 1000: iteration = 0  # Сброс счетчика
+                except Exception as e:
+                    print(f"[FundingMonitor] ошибка {t.ticker}: {e}")
 
         except Exception as e:
-            print(f"[Monitor] Ошибка в главном цикле: {e}")
-
-        await asyncio.sleep(15)  # Базовый интервал — 15 секунд
+            print(f"[FundingMonitor] loop error: {e}")
 
 
-# async def _check_margin_risk(t) -> bool:
-#     """Перевіряє чи не вичерпується маржа на одній з позицій.
-#
-#     Логіка (приклад з умови):
-#     Біржа 1: +$4, Біржа 2: -$4, маржа по $5 на кожній.
-#     Якщо unrealized loss однієї ноги >= MARGIN_RISK_PCT% від маржі → закриваємо обидві.
-#
-#     Маржа = trade_size_usd / LEVERAGE
-#     Ризик = |unrealized_loss| / margin >= MARGIN_RISK_PCT / 100
-#     """
-#     from exchanges import create_exchange
-#     from signal_parser import CloseSignal
-#
-#     try:
-#         s_ex = create_exchange(t.short_exchange)
-#         l_ex = create_exchange(t.long_exchange)
-#         s_pos, l_pos = await asyncio.gather(
-#             s_ex.get_open_position(t.symbol),
-#             l_ex.get_open_position(t.symbol),
-#             return_exceptions=True,
-#         )
-#         await asyncio.gather(s_ex.close(), l_ex.close(), return_exceptions=True)
-#     except Exception as e:
-#         print(f"[MarginCheck] {t.ticker}: {e}")
-#         return False
-#
-#     if isinstance(s_pos, Exception) or isinstance(l_pos, Exception):
-#         return False
-#     if not s_pos or not l_pos:
-#         return False
-#
-#     margin_per_side = (t.trade_size_usd or 0) / LEVERAGE
-#     if margin_per_side <= 0:
-#         return False
-#
-#     s_pnl = float(s_pos.get('unrealized_pnl', 0))
-#     l_pnl = float(l_pos.get('unrealized_pnl', 0))
-#     total_pnl = s_pnl + l_pnl
-#
-#     # Перевіряємо кожну ногу окремо
-#     s_loss_pct = abs(s_pnl) / margin_per_side * 100 if s_pnl < 0 else 0
-#     l_loss_pct = abs(l_pnl) / margin_per_side * 100 if l_pnl < 0 else 0
-#
-#     print(f"[MarginCheck] {t.ticker}: margin=${margin_per_side:.2f} "
-#           f"short_pnl=${s_pnl:.4f} ({s_loss_pct:.1f}%) "
-#           f"long_pnl=${l_pnl:.4f} ({l_loss_pct:.1f}%) "
-#           f"total=${total_pnl:.4f}")
-#
-#     if s_loss_pct >= MARGIN_RISK_PCT or l_loss_pct >= MARGIN_RISK_PCT:
-#         risky_side = 'SHORT' if s_loss_pct >= l_loss_pct else 'LONG'
-#         risky_pct  = max(s_loss_pct, l_loss_pct)
-#         print(f"[MarginCheck] ⚠️ {t.ticker}: {risky_side} loss {risky_pct:.1f}% від маржі! Закриваємо обидві.")
-#
-#         await notify(
-#             f"🚨 <b>МАРЖА ВИЧЕРПУЄТЬСЯ: {t.ticker}</b>\n"
-#             f"📉 SHORT ({t.short_exchange.upper()}): ${s_pnl:+.4f} ({s_loss_pct:.1f}% маржі)\n"
-#             f"📈 LONG  ({t.long_exchange.upper()}): ${l_pnl:+.4f} ({l_loss_pct:.1f}% маржі)\n"
-#             f"💰 Загальний PnL: ${total_pnl:+.4f}\n"
-#             f"⚡ Закриваю обидві позиції!"
-#         )
-#         cs = CloseSignal(ticker=t.ticker, raw_text="auto_close")
-#         _, msg = await close_position(cs)
-#         await notify(msg)
-#         _funding_cache.pop(t.id, None)
-#         return True
-#
-#     return False
+# Cooldown щоб не спамити попередженнями: {trade_id: timestamp}
+_margin_warn_cooldown: dict[int, float] = {}
+MARGIN_WARN_COOLDOWN_S = 120  # попередження не частіше ніж раз на 2 хвилини
 
 
-async def _check_margin_and_liquidation(t):
+async def _check_margin_risk(t) -> bool:
+    """Двоступенева перевірка ліквідації та маржинального ризику.
+
+    Ступінь 1 — ПОПЕРЕДЖЕННЯ (відстань до ліквідації ≤ 15%):
+        Відправляємо алерт в Telegram, але НЕ закриваємо.
+        Cooldown: не частіше ніж раз на 2 хвилини.
+
+    Ступінь 2 — АВАРІЙНЕ ЗАКРИТТЯ (відстань до ліквідації ≤ 10%):
+        Негайно закриваємо обидві ноги + сповіщення.
+
+    Також резервна перевірка через unrealized_pnl (якщо get_open_position
+    не повертає entry_price):
+        Якщо збиток однієї ноги >= MARGIN_RISK_PCT% від маржі → закриваємо.
+
+    Формула відстані до ліквідації (isolated margin, simplified):
+        SHORT liq ≈ entry_price × (1 + 1/leverage)
+        LONG  liq ≈ entry_price × (1 - 1/leverage)
+        distance% = |liq_price - current_price| / current_price × 100
+    """
     import time as _time
     from exchanges import create_exchange
     from signal_parser import CloseSignal
 
     now = _time.time()
 
-    # Защита от двойного закрытия (30 сек)
-    if t.id in _cooldowns["close"] and (now - _cooldowns["close"][t.id] < 30):
-        return
-
     try:
         s_ex = create_exchange(t.short_exchange)
         l_ex = create_exchange(t.long_exchange)
 
-        # Получаем данные параллельно
-        s_price, l_price, s_pos, l_pos = await asyncio.gather(
+        # Отримуємо поточні ціни та позиції паралельно
+        s_price_r, l_price_r, s_pos, l_pos = await asyncio.gather(
             s_ex.get_price(t.symbol),
             l_ex.get_price(t.symbol),
             s_ex.get_open_position(t.symbol),
             l_ex.get_open_position(t.symbol),
-            return_exceptions=True
+            return_exceptions=True,
         )
         await asyncio.gather(s_ex.close(), l_ex.close(), return_exceptions=True)
-
-        if isinstance(s_price, Exception) or isinstance(l_price, Exception):
-            return
-
-        # --- FALLBACK ЛОГИКА ---
-        # Если биржа не вернула позицию (None), считаем PnL вручную
-        s_pnl = float(s_pos.get('unrealized_pnl', 0)) if (s_pos and not isinstance(s_pos, Exception)) else (
-                                                                                                                       t.short_entry_price - s_price) * (
-                                                                                                                       t.short_qty or 0)
-        l_pnl = float(l_pos.get('unrealized_pnl', 0)) if (l_pos and not isinstance(l_pos, Exception)) else (
-                                                                                                                       l_price - t.long_entry_price) * (
-                                                                                                                       t.long_qty or 0)
-
-        # --- РАСЧЕТ РАССТОЯНИЯ ДО ЛИКВИДАЦИИ ---
-        # SHORT liq ≈ entry × (1 + 1/leverage)
-        s_liq = t.short_entry_price * (1 + 1 / LEVERAGE)
-        # LONG liq ≈ entry × (1 − 1/leverage)
-        l_liq = t.long_entry_price * (1 - 1 / LEVERAGE)
-
-        # Расстояние в процентах: сколько цене осталось до ликвидации относительно текущей цены
-        s_dist = abs(s_liq - s_price) / s_price * 100
-        l_dist = abs(l_liq - l_price) / l_price * 100
-
-        min_dist = min(s_dist, l_dist)
-        risky_side = "SHORT" if s_dist < l_dist else "LONG"
-        risky_ex = t.short_exchange if s_dist < l_dist else t.long_exchange
-
-        # --- ДВУХСТУПЕНЧАТАЯ СИСТЕМА ---
-
-        # 1. Экстренное закрытие (10%)
-        if min_dist <= 10:
-            _cooldowns["close"][t.id] = now
-            print(f"[!] ЭКСТРЕННОЕ ЗАКРЫТИЕ {t.ticker}: {min_dist:.2f}% до ликвидации на {risky_ex}")
-            await notify(
-                f"🚨 <b>ЭКСТРЕННОЕ ЗАКРЫТИЕ: {t.ticker}</b>\nЦена в {min_dist:.2f}% от ликвидации на {risky_ex.upper()}!\nЗакрываю обе стороны.")
-            await close_position(CloseSignal(ticker=t.ticker, raw_text="emergency_liq"))
-            return
-
-        # 2. Предупреждение (15%) + Защита от спама (120 сек)
-        if min_dist <= 15:
-            last_warn = _cooldowns["warn"].get(t.id, 0)
-            if now - last_warn > 120:
-                _cooldowns["warn"][t.id] = now
-                await notify(
-                    f"⚠️ <b>ОПАСНОСТЬ: {t.ticker}</b>\nДо ликвидации на {risky_ex.upper()} осталось {min_dist:.2f}%.\nРекомендуется проверить баланс.")
-
     except Exception as e:
-        print(f"[Monitor] Ошибка расчета рисков {t.ticker}: {e}")
+        print(f"[MarginCheck] {t.ticker}: помилка отримання даних: {e}")
+        return False
+
+    s_price = float(s_price_r) if not isinstance(s_price_r, Exception) else None
+    l_price = float(l_price_r) if not isinstance(l_price_r, Exception) else None
+
+    if not s_price or not l_price:
+        return False
+
+    # ── Метод 1: відстань до ціни ліквідації ──────────────────
+    # Використовуємо entry_price з позиції (точніше) або з бази (fallback)
+    s_entry = None
+    l_entry = None
+    s_pnl   = None
+    l_pnl   = None
+
+    if not isinstance(s_pos, Exception) and s_pos:
+        s_entry = float(s_pos.get('entry_price') or t.short_entry_price or 0)
+        s_pnl   = float(s_pos.get('unrealized_pnl', 0))
+    else:
+        s_entry = float(t.short_entry_price or 0)
+
+    if not isinstance(l_pos, Exception) and l_pos:
+        l_entry = float(l_pos.get('entry_price') or t.long_entry_price or 0)
+        l_pnl   = float(l_pos.get('unrealized_pnl', 0))
+    else:
+        l_entry = float(t.long_entry_price or 0)
+
+    lev = float(t.leverage or LEVERAGE)
+
+    # Розраховуємо теоретичні ціни ліквідації
+    # SHORT: ціна росте → збиток → ліквідація зверху
+    # LONG:  ціна падає → збиток → ліквідація знизу
+    s_dist_pct = None
+    l_dist_pct = None
+
+    if s_entry and s_entry > 0 and lev > 0:
+        s_liq_price = s_entry * (1 + 1 / lev)   # SHORT: ліквідація вгорі
+        s_dist_pct  = (s_liq_price - s_price) / s_price * 100
+        # Від'ємне = вже за межею (теоретично), мале позитивне = близько до ліквідації
+
+    if l_entry and l_entry > 0 and lev > 0:
+        l_liq_price = l_entry * (1 - 1 / lev)   # LONG: ліквідація внизу
+        l_dist_pct  = (l_price - l_liq_price) / l_price * 100
+
+    # Визначаємо найближчу до ліквідації сторону
+    dists = []
+    if s_dist_pct is not None:
+        dists.append(('SHORT', t.short_exchange, s_dist_pct, s_entry, s_price))
+    if l_dist_pct is not None:
+        dists.append(('LONG',  t.long_exchange,  l_dist_pct, l_entry, l_price))
+
+    if dists:
+        min_side, min_ex, min_dist, min_entry, min_price = min(dists, key=lambda x: x[2])
+
+        print(f"[MarginCheck] {t.ticker}: "
+              f"short dist={s_dist_pct:.1f}% " if s_dist_pct is not None else "",
+              f"long dist={l_dist_pct:.1f}% " if l_dist_pct is not None else "",
+              f"(lev={lev:.0f}×)")
+
+        # ── Ступінь 2: АВАРІЙНЕ ЗАКРИТТЯ ──
+        if min_dist <= 10:
+            print(f"[MarginCheck] 🚨 {t.ticker}: {min_side} в {min_dist:.1f}% від ліквідації! АВАРІЙНЕ ЗАКРИТТЯ.")
+            await notify(
+                f"🚨 <b>АВАРІЙНЕ ЗАКРИТТЯ: {t.ticker}</b>\n"
+                f"⚠️ {min_side} на {min_ex.upper()} в <b>{min_dist:.1f}%</b> від ліквідації\n"
+                f"📍 Ціна входу: ${min_entry:.6f} | Поточна: ${min_price:.6f}\n"
+                f"📊 SHORT dist: {s_dist_pct:.1f}% | LONG dist: {l_dist_pct:.1f}%\n"
+                f"⚡ Закриваю обидві позиції негайно!"
+            )
+            cs = CloseSignal(ticker=t.ticker, raw_text="emergency_liq")
+            _, msg = await close_position(cs)
+            await notify(msg)
+            _funding_cache.pop(t.id, None)
+            return True
+
+        # ── Ступінь 1: ПОПЕРЕДЖЕННЯ ──
+        if min_dist <= 15:
+            cooldown_key = t.id
+            if now - _margin_warn_cooldown.get(cooldown_key, 0) > MARGIN_WARN_COOLDOWN_S:
+                _margin_warn_cooldown[cooldown_key] = now
+                print(f"[MarginCheck] ⚠️ {t.ticker}: {min_side} в {min_dist:.1f}% від ліквідації! Попередження.")
+                await notify(
+                    f"⚠️ <b>УВАГА: {t.ticker}</b>\n"
+                    f"{min_side} на {min_ex.upper()} в <b>{min_dist:.1f}%</b> від ліквідації\n"
+                    f"📍 Ціна входу: ${min_entry:.6f} | Поточна: ${min_price:.6f}\n"
+                    f"📊 SHORT dist: {s_dist_pct:.1f}% | LONG dist: {l_dist_pct:.1f}%\n"
+                    f"ℹ️ Позиції ще відкриті — стежу далі"
+                )
+            return False  # не закриваємо — тільки попереджаємо
+
+    # ── Метод 2 (резервний): unrealized_pnl як % від маржі ────
+    # Спрацьовує якщо entry_price недоступний або lev=0
+    if s_pnl is not None and l_pnl is not None:
+        margin_per_side = (t.trade_size_usd or 0) / lev if lev > 0 else 0
+        if margin_per_side > 0:
+            s_loss_pct = abs(s_pnl) / margin_per_side * 100 if s_pnl < 0 else 0
+            l_loss_pct = abs(l_pnl) / margin_per_side * 100 if l_pnl < 0 else 0
+            total_pnl  = s_pnl + l_pnl
+
+            print(f"[MarginCheck/PnL] {t.ticker}: margin=${margin_per_side:.2f} "
+                  f"short={s_pnl:+.4f} ({s_loss_pct:.1f}%) "
+                  f"long={l_pnl:+.4f} ({l_loss_pct:.1f}%)")
+
+            if s_loss_pct >= MARGIN_RISK_PCT or l_loss_pct >= MARGIN_RISK_PCT:
+                risky_side = 'SHORT' if s_loss_pct >= l_loss_pct else 'LONG'
+                risky_pct  = max(s_loss_pct, l_loss_pct)
+                print(f"[MarginCheck/PnL] ⚠️ {t.ticker}: {risky_side} {risky_pct:.1f}% від маржі! Закриваємо.")
+                await notify(
+                    f"🚨 <b>МАРЖА ВИЧЕРПУЄТЬСЯ: {t.ticker}</b>\n"
+                    f"📉 SHORT ({t.short_exchange.upper()}): ${s_pnl:+.4f} ({s_loss_pct:.1f}% маржі)\n"
+                    f"📈 LONG  ({t.long_exchange.upper()}): ${l_pnl:+.4f} ({l_loss_pct:.1f}% маржі)\n"
+                    f"💰 Загальний PnL: ${total_pnl:+.4f}\n"
+                    f"⚡ Закриваю обидві позиції!"
+                )
+                cs = CloseSignal(ticker=t.ticker, raw_text="margin_pnl_close")
+                _, msg = await close_position(cs)
+                await notify(msg)
+                _funding_cache.pop(t.id, None)
+                return True
+
+    return False
 
 
 async def _check_funding_for_trade(t):
