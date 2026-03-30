@@ -15,7 +15,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Optional
 
-from settings import MAX_OPEN_POSITIONS, MIN_SPREAD_PCT, LEVERAGE, MIN_VOLUME_USD, MAX_FUNDING_DIFF_PCT, MAX_FUNDING_ABS_PCT, MAX_PRICE_DEVIATION_PCT
+from settings import MAX_OPEN_POSITIONS, MIN_SPREAD_PCT, LEVERAGE, MIN_VOLUME_USD, MAX_FUNDING_DIFF_PCT, MAX_FUNDING_ABS_PCT
 from exchanges import BaseExchange
 from db import get_open_trade, get_all_open_trades
 from signal_parser import OpenSignal
@@ -25,6 +25,18 @@ _disabled_exchanges: set[str] = set()
 
 # Выделенный капитал на каждой бирже (чистые деньги без плеча, 0 = весь баланс)
 _allocated_capital: dict[str, float] = {}
+
+# Добавьте в начало файла:
+_ignored_tickers: set[str] = set()
+
+
+def set_ignored_tickers(tickers: list[str]):
+    global _ignored_tickers
+    _ignored_tickers = {t.upper() for t in tickers}
+
+
+def is_ticker_ignored(ticker: str) -> bool:
+    return ticker.upper() in _ignored_tickers
 
 
 def set_exchange_enabled(exchange: str, enabled: bool):
@@ -62,6 +74,10 @@ class RiskResult:
 
 
 async def check_signal(signal: OpenSignal, short_ex: BaseExchange, long_ex: BaseExchange) -> RiskResult:
+    # В функцию check_signal(signal, ...) в самое начало добавьте:
+    # 0. Проверка черного списка
+    if is_ticker_ignored(signal.ticker):
+        return RiskResult(ok=False, reason=f"Тикер {signal.ticker} находится в черном списке.")
 
     # 1. Лимит открытых позиций
     open_trades = get_all_open_trades()
@@ -95,33 +111,28 @@ async def check_signal(signal: OpenSignal, short_ex: BaseExchange, long_ex: Base
         if isinstance(val, Exception):
             return RiskResult(ok=False, reason=f"Ошибка получения {label}: {val}")
 
-    # 5. Реальный спред
-    real_spread = (short_price / long_price - 1) * 100 if long_price > 0 else 0
-    if real_spread < MIN_SPREAD_PCT:
-        return RiskResult(ok=False, reason=f"Спред упал до {real_spread:.3f}% (мин {MIN_SPREAD_PCT}%). {signal.ticker} пропущен.")
+        # 5. Реальный спред
+        real_spread = (short_price / long_price - 1) * 100 if long_price > 0 else 0
+        if real_spread < MIN_SPREAD_PCT:
+            return RiskResult(ok=False,
+                              reason=f"Спред упал до {real_spread:.3f}% (мин {MIN_SPREAD_PCT}%). {signal.ticker} пропущен.")
 
-    # 5a. Перевірка відхилення від справедливої ціни
-    # Справедлива ціна = середнє між цінами на двох біржах.
-    # Якщо одна з цін відхиляється більш ніж на MAX_PRICE_DEVIATION_PCT —
-    # це аномалія (pump/dump, мала ліквідність, маніпуляція).
-    # При такому відхиленні плече ×5 може призвести до швидкої ліквідації.
-    fair_price = (short_price + long_price) / 2
-    dev_short  = abs(short_price - fair_price) / fair_price * 100
-    dev_long   = abs(long_price  - fair_price) / fair_price * 100
-    max_dev    = max(dev_short, dev_long)
+        # --- НОВОЕ УСЛОВИЕ: Проверка отклонения от справедливой цены ---
+        # Справедливая цена (fair_price) — это среднее арифметическое цен на обеих биржах
+        fair_price = (short_price + long_price) / 2
 
-    if max_dev >= MAX_PRICE_DEVIATION_PCT:
-        worse_ex  = signal.short_exchange if dev_short >= dev_long else signal.long_exchange
-        worse_dev = max_dev
-        return RiskResult(
-            ok=False,
-            reason=(
-                f"⚠️ {signal.ticker}: аномальне відхилення ціни {worse_dev:.1f}% від справедливої ${fair_price:.6f} "
-                f"на {worse_ex.upper()} (short={short_price:.6f} long={long_price:.6f}). "
-                f"Рекомендується знизити плече — поточне {LEVERAGE}× робить ліквідацію надто близькою. "
-                f"Сигнал пропущено."
+        # Расчет отклонения для каждой биржи в процентах
+        deviation_short = abs(short_price - fair_price) / fair_price * 100
+        deviation_long = abs(long_price - fair_price) / fair_price * 100
+
+        # Если отклонение на любой из бирж > 9%, входим в режим ожидания
+        if deviation_short > 9 or deviation_long > 9:
+            return RiskResult(
+                ok=False,
+                reason=(f"Аномальное отклонение цены (>9%): Short({deviation_short:.1f}%), "
+                        f"Long({deviation_long:.1f}%). Ожидаем выравнивания цен.")
             )
-        )
+        # -----------------------------------------------------------------------
 
     # 5b. Фандинг-фильтр — Стратегия #4
     # ✅ Условие A: diff < 0.2%
