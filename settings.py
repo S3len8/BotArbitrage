@@ -24,6 +24,14 @@ BALANCE_ALERT_PCT:   float = float(os.getenv("BALANCE_ALERT_PCT", "50"))
 MAX_FUNDING_DIFF_PCT: float = float(os.getenv("MAX_FUNDING_DIFF_PCT", "0.1"))  # было 0.2
 MAX_FUNDING_ABS_PCT:  float = float(os.getenv("MAX_FUNDING_ABS_PCT", "1.5"))
 
+# Максимальне допустиме відхилення ціни на одній біржі від справедливої ціни.
+# Справедлива ціна = середнє між short і long біржею.
+# Якщо одна з бірж відхиляється більш ніж на MAX_PRICE_DEVIATION_PCT% —
+# це аномалія (pump/dump, мала ліквідність). При плечі ×5 ліквідація може
+# настати вже при русі ціни на 20% — тому 9% вже є небезпечним.
+# Для роботи з такими монетами потрібно зменшити LEVERAGE у .env.
+MAX_PRICE_DEVIATION_PCT: float = float(os.getenv("MAX_PRICE_DEVIATION_PCT", "9.0"))
+
 # ── Интервальные исключения ────────────────────────────────────
 # 4H/4H: медиана закрытия 102м, 62% за 4ч — лучший вариант, берём при diff<0.2%
 # 1H/1H: медиана 4493м (75ч!) — крайне плохо, брать только при diff=0% и abs<0.3%
@@ -41,13 +49,11 @@ SIGNAL_CHANNEL: str = os.getenv("SIGNAL_CHANNEL", "")
 NOTIFY_BOT_TOKEN: str = os.getenv("NOTIFY_BOT_TOKEN", "")
 NOTIFY_CHAT_ID:   str = os.getenv("NOTIFY_CHAT_ID", "")
 
-# Бот и канал для MEXC сигналов (если MEXC_BOT_TOKEN не задан — используется основной)
-MEXC_BOT_TOKEN: str = os.getenv("MEXC_BOT_TOKEN", os.getenv("NOTIFY_BOT_TOKEN", ""))
-MEXC_CHAT_ID:   str = os.getenv("MEXC_CHAT_ID",   os.getenv("NOTIFY_CHAT_ID", ""))
+# Канал для MEXC сигналів (бот не торгує — тільки повідомляє)
+MEXC_CHAT_ID: str = os.getenv("MEXC_CHAT_ID", os.getenv("NOTIFY_CHAT_ID", ""))
 
-# Бот и канал для лога ордеров (если ORDERS_BOT_TOKEN не задан — используется основной)
-ORDERS_BOT_TOKEN: str = os.getenv("ORDERS_BOT_TOKEN", os.getenv("NOTIFY_BOT_TOKEN", ""))
-ORDERS_CHAT_ID:   str = os.getenv("ORDERS_CHAT_ID",   os.getenv("NOTIFY_CHAT_ID", ""))
+# Канал для логів виконання ордерів (біржа, час, ціна, qty, $, монета)
+ORDERS_CHAT_ID: str = os.getenv("ORDERS_CHAT_ID", os.getenv("NOTIFY_CHAT_ID", ""))
 
 # Поріг закриття при маржинальному ризику:
 # якщо unrealized loss однієї ноги >= MARGIN_RISK_PCT % від виділеної маржі — закриваємо обидві.
