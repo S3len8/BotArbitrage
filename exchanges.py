@@ -1169,12 +1169,23 @@ class BitgetExchange(BaseExchange):
             'symbol': ticker,
             'productType': 'USDT-FUTURES',
             'marginCoin': 'USDT',
-            'side': side.lower(),
+            'marginMode': 'isolated',
+            'side': side.lower(),  # 'buy' или 'sell'
             'orderType': 'market',
-            'size': str(qty)
+            'size': str(qty),
         }
+
+        # Исправление ошибки 40774:
+        # Для One-way режима (Unilateral) используем tradeSide
+        # Но чтобы код был универсальным или соответствовал настройкам хеджа:
         if reduce_only:
-            order_body['reduceOnly'] = 'YES'
+            order_body['tradeSide'] = 'close'
+            # Если на бирже включен Hedge Mode, нужно указать, какую именно сторону закрываем
+            order_body['posSide'] = 'long' if side.lower() == 'sell' else 'short'
+        else:
+            order_body['tradeSide'] = 'open'
+            # Для открытия в Hedge Mode: если side=buy, то posSide=long
+            order_body['posSide'] = 'long' if side.lower() == 'buy' else 'short'
 
         r_order = _do_bitget_request('POST', '/api/v2/mix/order/place-order', body_dict=order_body)
 
