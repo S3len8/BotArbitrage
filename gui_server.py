@@ -397,8 +397,14 @@ async def api_mark_closed(trade_id: int):
         t = get_trade_by_id(trade_id)
         if not t:
             return {"ok": False, "error": f"trade {trade_id} not found"}
+
+        # 🔧 ИСПРАВЛЕНИЕ: Если позиция уже закрыта — возвращаем успех (идемпотентность)
+        if t.status == 'closed':
+            return {"ok": True, "net_pnl": t.net_pnl_usd, "msg": "Позиция уже закрыта"}
+
         if t.status not in ('open', 'partial'):
-            return {"ok": False, "error": f"trade status is '{t.status}', not open"}
+            return {"ok": False, "error": f"trade status is '{t.status}', cannot close"}
+
         t.status    = 'closed'
         t.closed_at = datetime.now(timezone.utc).isoformat()
         # Пробуем получить текущие цены для расчёта PnL
@@ -420,6 +426,10 @@ async def api_mark_closed(trade_id: int):
         except Exception as e:
             print(f"[GUI] mark-closed price fetch: {e}")
         update_trade(t)
+
+        # 🔧 ИСПРАВЛЕНИЕ: Очищаем историю фандинга для закрытой позиции
+        _funding_history.pop(trade_id, None)
+
         # Уведомление в Telegram
         try:
             from notifier import notify

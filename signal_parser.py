@@ -218,14 +218,11 @@ def _parse_pinned_block(block: str) -> Optional[OpenSignal]:
     if len(exchange_prices) < 2:
         return None
 
-    # В закреплённом: первая биржа = short (дороже), вторая = long (дешевле)
+    # 🔧 ИСПРАВЛЕНИЕ: В закреплённом сообщении порядок бирж УЖЕ правильный
+    # Первая строка = short (дороже), вторая = long (дешевле)
+    # НЕ меняем их местами — доверяем порядку из сообщения
     short_exchange, short_price = exchange_prices[0]
     long_exchange,  long_price  = exchange_prices[1]
-
-    # Проверяем что short > long (иначе меняем местами)
-    if short_price < long_price:
-        short_exchange, short_price, long_exchange, long_price = \
-            long_exchange, long_price, short_exchange, short_price
 
     return OpenSignal(
         ticker=ticker,

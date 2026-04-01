@@ -236,6 +236,9 @@ async def close_position(close_signal: CloseSignal) -> tuple[Optional[Trade], st
 
     trade.status = 'closed' if (short_ok and long_ok) else 'partial'
 
+    # 🔧 ИСПРАВЛЕНИЕ: Сразу сохраняем статус в БД чтобы бот видел что позиция закрыта
+    update_trade(trade)
+
     # Получаем реальный PnL с бирж (через 500мс после закрытия чтобы данные появились)
     await asyncio.sleep(0.5)
     real_short_pnl = None
@@ -298,6 +301,13 @@ async def close_position(close_signal: CloseSignal) -> tuple[Optional[Trade], st
            f"⏱ Удержание: {dur_str}")
     if not (short_ok and long_ok):
         msg += f"\n⚠️ Требуется ручная проверка!"
+
+    # 🔧 ИСПРАВЛЕНИЕ: Очищаем историю фандинга для закрытой позиции
+    try:
+        from gui_server import _funding_history
+        _funding_history.pop(trade.id, None)
+    except Exception:
+        pass  # gui_server может быть не импортирован в тестах
 
     await _close(short_ex, long_ex)
     return trade, msg
