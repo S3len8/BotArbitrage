@@ -166,30 +166,31 @@ def save_trade(trade: Trade) -> int:
     return trade.id
 
 
+# Найти функцию update_trade в db.py и заменить на эту:
 def update_trade(trade: Trade):
     with _conn() as c, c.cursor() as cur:
         cur.execute("""
             UPDATE trades SET
+                status=%s,
                 short_close_order_id=%s, long_close_order_id=%s,
                 short_close_price=%s,    long_close_price=%s,
                 short_pnl_usd=%s,        long_pnl_usd=%s,
                 net_pnl_usd=%s,
                 fee_short_usd=%s,        fee_long_usd=%s,
-                closed_at=%s,            status=%s,
-                short_order_id=%s,       long_order_id=%s,
-                short_entry_price=%s,    long_entry_price=%s,
-                short_qty=%s,            long_qty=%s
+                closed_at=%s,
+                short_qty=%s,            long_qty=%s,
+                short_entry_price=%s,    long_entry_price=%s
             WHERE id=%s
         """, (
+            trade.status,
             trade.short_close_order_id, trade.long_close_order_id,
             trade.short_close_price,    trade.long_close_price,
             trade.short_pnl_usd,        trade.long_pnl_usd,
             trade.net_pnl_usd,
             trade.fee_short_usd,        trade.fee_long_usd,
-            trade.closed_at,            trade.status,
-            trade.short_order_id,       trade.long_order_id,
-            trade.short_entry_price,    trade.long_entry_price,
+            trade.closed_at,
             trade.short_qty,            trade.long_qty,
+            trade.short_entry_price,    trade.long_entry_price,
             trade.id,
         ))
         c.commit()

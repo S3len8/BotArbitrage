@@ -438,36 +438,36 @@ _margin_warn_cooldown: dict[int, float] = {}
 MARGIN_WARN_COOLDOWN_S = 120  # попередження не частіше ніж раз на 2 хвилини
 
 
+# В order_executor.py найти функцию _check_margin_risk и заменить её:
+
 async def _check_margin_risk(t) -> bool:
     """Двоступенева перевірка ліквідації та маржинального ризику.
 
-    Ступінь 1 — ПОПЕРЕДЖЕННЯ (відстань до ліквідації ≤ 15%):
-        Відправляємо алерт в Telegram, але НЕ закриваємо.
-        Cooldown: не частіше ніж раз на 2 хвилини.
+        Ступінь 1 — ПОПЕРЕДЖЕННЯ (відстань до ліквідації ≤ 15%):
+            Відправляємо алерт в Telegram, але НЕ закриваємо.
+            Cooldown: не частіше ніж раз на 2 хвилини.
 
-    Ступінь 2 — АВАРІЙНЕ ЗАКРИТТЯ (відстань до ліквідації ≤ 10%):
-        Негайно закриваємо обидві ноги + сповіщення.
+        Ступінь 2 — АВАРІЙНЕ ЗАКРИТТЯ (відстань до ліквідації ≤ 10%):
+            Негайно закриваємо обидві ноги + сповіщення.
 
-    Також резервна перевірка через unrealized_pnl (якщо get_open_position
-    не повертає entry_price):
-        Якщо збиток однієї ноги >= MARGIN_RISK_PCT% від маржі → закриваємо.
+        Також резервна перевірка через unrealized_pnl (якщо get_open_position
+        не повертає entry_price):
+            Якщо збиток однієї ноги >= MARGIN_RISK_PCT% від маржі → закриваємо.
 
-    Формула відстані до ліквідації (isolated margin, simplified):
-        SHORT liq ≈ entry_price × (1 + 1/leverage)
-        LONG  liq ≈ entry_price × (1 - 1/leverage)
-        distance% = |liq_price - current_price| / current_price × 100
+        Формула відстані до ліквідації (isolated margin, simplified):
+            SHORT liq ≈ entry_price × (1 + 1/leverage)
+            LONG  liq ≈ entry_price × (1 - 1/leverage)
+            distance% = |liq_price - current_price| / current_price × 100
     """
     import time as _time
     from exchanges import create_exchange
     from signal_parser import CloseSignal
 
     now = _time.time()
-
     try:
         s_ex = create_exchange(t.short_exchange)
         l_ex = create_exchange(t.long_exchange)
 
-        # Отримуємо поточні ціни та позиції паралельно
         s_price_r, l_price_r, s_pos, l_pos = await asyncio.gather(
             s_ex.get_price(t.symbol),
             l_ex.get_price(t.symbol),
@@ -477,8 +477,19 @@ async def _check_margin_risk(t) -> bool:
         )
         await asyncio.gather(s_ex.close(), l_ex.close(), return_exceptions=True)
     except Exception as e:
-        print(f"[MarginCheck] {t.ticker}: помилка отримання даних: {e}")
+        print(f"[MarginCheck] {t.ticker}: ошибка данных: {e}")
         return False
+
+    # --- ЛОГИКА САМОЛЕЧЕНИЯ ---
+    # Если на обеих биржах позиций нет, а в базе статус open/partial - закрываем в базе
+    if (s_pos is None or isinstance(s_pos, Exception)) and \
+            (l_pos is None or isinstance(l_pos, Exception)):
+        print(f"[MarginCheck] {t.ticker}: Позиции не найдены на биржах. Синхронизирую БД...")
+        t.status = 'closed'
+        t.closed_at = datetime.now(timezone.utc).isoformat()
+        update_trade(t)
+        return True
+        # --------------------------
 
     s_price = float(s_price_r) if not isinstance(s_price_r, Exception) else None
     l_price = float(l_price_r) if not isinstance(l_price_r, Exception) else None

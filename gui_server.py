@@ -387,27 +387,28 @@ async def api_funding_history(trade_id: int):
     """История фандинга для конкретной позиции."""
     history = _funding_history.get(trade_id, [])
     return list(reversed(history))  # новые сверху
+
+
+@app.post("/api/positions/{trade_id}/mark-closed")
 async def api_mark_closed(trade_id: int):
-    """Помечает позицию закрытой вручную (когда закрыли на бирже руками)."""
+    """Принудительно помечает позицию закрытой в БД и останавливает мониторинг рисков."""
     if not _db_ok:
-        return {"ok": False, "error": "db not ready"}
+        return {"ok": False, "error": "БД не подключена"}
     try:
         from db import get_trade_by_id, update_trade
-        from datetime import datetime, timezone
         t = get_trade_by_id(trade_id)
         if not t:
-            return {"ok": False, "error": f"trade {trade_id} not found"}
+            return {"ok": False, "error": f"Сделка #{trade_id} не найдена"}
 
-        # 🔧 ИСПРАВЛЕНИЕ: Если позиция уже закрыта — возвращаем успех (идемпотентность)
+        # Если уже закрыта - ничего не делаем
         if t.status == 'closed':
-            return {"ok": True, "net_pnl": t.net_pnl_usd, "msg": "Позиция уже закрыта"}
+            return {"ok": True, "msg": "Уже закрыта"}
 
-        if t.status not in ('open', 'partial'):
-            return {"ok": False, "error": f"trade status is '{t.status}', cannot close"}
-
-        t.status    = 'closed'
+        # 1. Меняем статус на закрытый принудительно
+        t.status = 'closed'
         t.closed_at = datetime.now(timezone.utc).isoformat()
-        # Пробуем получить текущие цены для расчёта PnL
+
+        # 2. Пытаемся получить последние цены для финального отчета (необязательно)
         try:
             from exchanges import create_exchange
             s_ex = create_exchange(t.short_exchange)
@@ -415,26 +416,36 @@ async def api_mark_closed(trade_id: int):
             sp, lp = await asyncio.gather(s_ex.get_price(t.symbol), l_ex.get_price(t.symbol))
             await asyncio.gather(s_ex.close(), l_ex.close())
             t.short_close_price = sp
-            t.long_close_price  = lp
+            t.long_close_price = lp
+
+            # Считаем примерный PnL
+            fees = (t.fee_short_usd or 0) + (t.fee_long_usd or 0)
             if t.short_entry_price and t.short_qty:
                 t.short_pnl_usd = round((t.short_entry_price - sp) * t.short_qty, 6)
             if t.long_entry_price and t.long_qty:
-                t.long_pnl_usd  = round((lp - t.long_entry_price) * t.long_qty, 6)
-            fees = (t.fee_short_usd or 0) + (t.fee_long_usd or 0)
+                t.long_pnl_usd = round((lp - t.long_entry_price) * t.long_qty, 6)
             if t.short_pnl_usd is not None and t.long_pnl_usd is not None:
                 t.net_pnl_usd = round(t.short_pnl_usd + t.long_pnl_usd - fees, 6)
         except Exception as e:
-            print(f"[GUI] mark-closed price fetch: {e}")
+            print(f"[GUI] Не удалось обновить цены при ручном закрытии: {e}")
+
+        # 3. Сохраняем изменения в БД
         update_trade(t)
 
-        # 🔧 ИСПРАВЛЕНИЕ: Очищаем историю фандинга для закрытой позиции
+        # 4. ОЧИЩАЕМ КЭШИ (Чтобы алерты сразу прекратились!)
         _funding_history.pop(trade_id, None)
+        try:
+            from order_executor import _funding_cache, _margin_warn_cooldown
+            _funding_cache.pop(trade_id, None)
+            _margin_warn_cooldown.pop(trade_id, None)
+        except:
+            pass
 
         # Уведомление в Telegram
         try:
             from notifier import notify
             pnl = t.net_pnl_usd
-            pnl_str  = f"${pnl:+.4f}" if pnl is not None else "—"
+            pnl_str = f"${pnl:+.4f}" if pnl is not None else "—"
             pnl_emoji = "💰" if pnl and pnl > 0 else "💸"
             await notify(
                 f"🔒 <b>Закрыто вручную: {t.ticker}</b>\n"
@@ -442,15 +453,17 @@ async def api_mark_closed(trade_id: int):
                 f"${t.short_close_price:.6f if t.short_close_price else '—'}\n"
                 f"📈 LONG  {t.long_exchange.upper()} @ "
                 f"${t.long_close_price:.6f if t.long_close_price else '—'}\n"
-                f"PnL: short {'+' if (t.short_pnl_usd or 0)>=0 else ''}${t.short_pnl_usd:.4f if t.short_pnl_usd else 0} | "
-                f"long {'+' if (t.long_pnl_usd or 0)>=0 else ''}${t.long_pnl_usd:.4f if t.long_pnl_usd else 0}\n"
+                f"PnL: short {'+' if (t.short_pnl_usd or 0) >= 0 else ''}${t.short_pnl_usd:.4f if t.short_pnl_usd else 0} | "
+                f"long {'+' if (t.long_pnl_usd or 0) >= 0 else ''}${t.long_pnl_usd:.4f if t.long_pnl_usd else 0}\n"
                 f"{pnl_emoji} <b>Чистая прибыль: {pnl_str}</b>"
             )
         except Exception as e:
             print(f"[GUI] notify mark-closed: {e}")
         return {"ok": True, "net_pnl": t.net_pnl_usd}
+
+        # return {"ok": True, "msg": "Статус обновлен"}
     except Exception as e:
-        print(f"[GUI] mark-closed error: {e}")
+        print(f"[GUI] Ошибка в mark_closed: {e}")
         return {"ok": False, "error": str(e)}
 
 
