@@ -978,18 +978,12 @@ class BitgetExchange(BaseExchange):
 
     def __init__(self):
         keys = get_exchange_keys('bitget')
-        self._api_key    = keys['api_key']
+        self._api_key = keys['api_key']
         self._api_secret = keys['api_secret']
         self._passphrase = keys.get('api_password', '')
 
     async def get_price(self, symbol: str) -> float:
         return await _run_sync(self._price_sync, symbol)
-
-    async def get_max_position_size(self, symbol: str) -> Optional[float]:
-        return None
-
-    async def close(self):
-        pass
 
     def _price_sync(self, symbol: str) -> float:
         ticker = _bitget_ticker(symbol)
@@ -999,244 +993,137 @@ class BitgetExchange(BaseExchange):
         data = r.json().get('data', {})
         if isinstance(data, list): data = data[0] if data else {}
         price = data.get('askPrice') or data.get('lastPr') or data.get('bidPrice')
-        if not price:
-            raise ValueError(f"bitget: no price for {ticker}, data: {data}")
         return float(price)
+
+    async def get_futures_balance(self) -> float:
+        return await _run_sync(self._balance_sync)
 
     def _balance_sync(self) -> float:
         import base64
-        ts       = str(_ts())
-        method   = 'GET'
-        path     = '/api/v2/mix/account/accounts?productType=USDT-FUTURES'
-        sign_str = ts + method + path
-        sig = base64.b64encode(
-            hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha256).digest()
-        ).decode()
+        ts = str(_ts())
+        path = '/api/v2/mix/account/accounts?productType=USDT-FUTURES'
+        sign_str = ts + 'GET' + path
+        sig = base64.b64encode(hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha256).digest()).decode()
         data = _req('GET', f'https://api.bitget.com{path}',
-                    headers={
-                        'ACCESS-KEY':        self._api_key,
-                        'ACCESS-SIGN':       sig,
-                        'ACCESS-TIMESTAMP':  ts,
-                        'ACCESS-PASSPHRASE': self._passphrase,
-                        'Content-Type':      'application/json',
-                    })
+                    headers={'ACCESS-KEY': self._api_key, 'ACCESS-SIGN': sig, 'ACCESS-TIMESTAMP': ts,
+                             'ACCESS-PASSPHRASE': self._passphrase, 'Content-Type': 'application/json'})
         for item in (data.get('data') or []):
             if item.get('marginCoin') == 'USDT':
                 return float(item.get('available') or item.get('usdtEquity') or 0)
         return 0.0
 
-    async def get_futures_balance(self) -> float:
-        return await _run_sync(self._balance_sync)
-
-    async def get_24h_volume(self, symbol: str) -> Optional[float]:
-        def _sync():
-            ticker = _bitget_ticker(symbol)
-            r = requests.get('https://api.bitget.com/api/v2/mix/market/ticker',
-                             params={'symbol': ticker, 'productType': 'USDT-FUTURES'}, timeout=10)
-            r.raise_for_status()
-            data = r.json().get('data', {})
-            if isinstance(data, list): data = data[0] if data else {}
-            return float(data.get('usdtVolume') or data.get('quoteVolume') or 0) or None
-        return await _run_sync(_sync)
-
     async def _setup_symbol(self, symbol: str):
-        """Bitget: изолированная маржа + leverage через Mix API v2."""
+        """Bitget: Принудительная установка Изолированной маржи, Плеча и Режима Хеджирования."""
         import base64, json as _json
         ticker = _bitget_ticker(symbol)
 
-        def _sign_bitget(ts, method, path, body=''):
-            msg = ts + method + path + body
-            return base64.b64encode(
-                hmac.new(self._api_secret.encode(), msg.encode(), hashlib.sha256).digest()
-            ).decode()
-
-        def _hdrs(ts, sig):
-            return {
-                'ACCESS-KEY':        self._api_key,
-                'ACCESS-SIGN':       sig,
-                'ACCESS-TIMESTAMP':  ts,
-                'ACCESS-PASSPHRASE': self._passphrase,
-                'Content-Type':      'application/json',
-            }
+        def _do_bitget_post(path, body_dict):
+            ts = str(_ts())
+            body_str = _json.dumps(body_dict, separators=(',', ':'))
+            sign_str = ts + 'POST' + path + body_str
+            sig = base64.b64encode(
+                hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha256).digest()).decode()
+            headers = {'ACCESS-KEY': self._api_key, 'ACCESS-SIGN': sig, 'ACCESS-TIMESTAMP': ts,
+                       'ACCESS-PASSPHRASE': self._passphrase, 'Content-Type': 'application/json'}
+            return requests.post(f'https://api.bitget.com{path}', headers=headers, data=body_str, timeout=10)
 
         def _sync():
-            # 1. Переключаем на isolated маржу
-            ts   = str(_ts())
-            path = '/api/v2/mix/account/set-margin-mode'
-            body = _json.dumps({'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginMode': 'isolated'})
+            # 1. Переключаем на Режим Хеджирования (Hedge Mode) - исправляет ошибку 40774
             try:
-                requests.post(f'https://api.bitget.com{path}',
-                    headers=_hdrs(ts, _sign_bitget(ts, 'POST', path, body)),
-                    data=body, timeout=10)
-            except Exception as e:
-                print(f"[bitget] marginMode: {e}")
+                _do_bitget_post('/api/v2/mix/account/set-position-mode',
+                                {'productType': 'USDT-FUTURES', 'posMode': 'hedge_mode'})
+            except:
+                pass
 
-            # 2. Выставляем leverage
-            ts2  = str(_ts())
-            path2 = '/api/v2/mix/account/set-leverage'
-            body2 = _json.dumps({'symbol': ticker, 'productType': 'USDT-FUTURES',
-                                 'marginCoin': 'USDT', 'leverage': str(LEVERAGE)})
+            # 2. Устанавливаем изолированную маржу
             try:
-                requests.post(f'https://api.bitget.com{path2}',
-                    headers=_hdrs(ts2, _sign_bitget(ts2, 'POST', path2, body2)),
-                    data=body2, timeout=10)
-            except Exception as e:
-                print(f"[bitget] leverage: {e}")
+                _do_bitget_post('/api/v2/mix/account/set-margin-mode',
+                                {'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginMode': 'isolated'})
+            except:
+                pass
+
+            # 3. Устанавливаем плечо
+            try:
+                _do_bitget_post('/api/v2/mix/account/set-leverage',
+                                {'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginCoin': 'USDT',
+                                 'leverage': str(LEVERAGE)})
+            except:
+                pass
 
         await _run_sync(_sync)
-        print(f"[bitget] {ticker}: ISOLATED, {LEVERAGE}×")
 
-    def _bitget_order_sync(self, symbol: str, side: str, size_usd: float,
-                           reduce_only: bool = False, price: float = None) -> dict:
-        """Ордер Bitget v2 с автоматической настройкой плеча и режима маржи."""
-        import base64, json as _json, hmac, hashlib, time
+    def _bitget_order_sync(self, symbol: str, side: str, size_usd: float, reduce_only: bool = False,
+                           price: float = None) -> dict:
+        import base64, json as _json
         ticker = _bitget_ticker(symbol)
-        if price is None:
-            price = self._price_sync(symbol)
+        if price is None: price = self._price_sync(symbol)
 
-        # 1. Вспомогательная функция для подписи и запросов
-        def _do_bitget_request(method, path, params=None, body_dict=None):
-            ts = str(int(time.time() * 1000))
-            body_str = _json.dumps(body_dict, separators=(',', ':')) if body_dict else ''
+        # Расчет qty
+        qty = round(size_usd / price, 1)  # Упрощенное округление
 
-            # Формируем строку для подписи: TS + METHOD + PATH + BODY
-            sign_str = ts + method.upper() + path + body_str
-            sig = base64.b64encode(
-                hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha256).digest()
-            ).decode()
+        ts = str(_ts())
+        path = '/api/v2/mix/order/place-order'
 
-            headers = {
-                'ACCESS-KEY': self._api_key,
-                'ACCESS-SIGN': sig,
-                'ACCESS-TIMESTAMP': ts,
-                'ACCESS-PASSPHRASE': self._passphrase,
-                'Content-Type': 'application/json',
-            }
-            url = f'https://api.bitget.com{path}'
-            if method.upper() == 'POST':
-                return requests.post(url, headers=headers, data=body_str, timeout=15)
-            else:
-                return requests.get(url, headers=headers, params=params, timeout=15)
-
-        # 2. АВТО-НАСТРОЙКА (только если это не закрытие позиции)
-        if not reduce_only:
-            try:
-                # Устанавливаем Изолированную маржу (isolated)
-                # Примечание: если уже стоит isolated, запрос просто вернет ошибку или успех, это ок.
-                _do_bitget_request('POST', '/api/v2/mix/account/set-margin-mode', body_dict={
-                    'symbol': ticker,
-                    'productType': 'USDT-FUTURES',
-                    'marginMode': 'isolated'
-                })
-
-                # Устанавливаем Плечо (LEVERAGE)
-                _do_bitget_request('POST', '/api/v2/mix/account/set-leverage', body_dict={
-                    'symbol': ticker,
-                    'productType': 'USDT-FUTURES',
-                    'marginCoin': 'USDT',
-                    'leverage': str(LEVERAGE)
-                })
-                print(f"[bitget] Настройки применены: Isolated, {LEVERAGE}x")
-            except Exception as e:
-                print(f"[bitget] Ошибка пред-настройки (возможно, позиция уже открыта): {e}")
-
-        # 3. Получаем параметры контракта для расчета QTY
-        contract_size = 1.0
-        min_trade = 1.0
-        try:
-            r_info = requests.get('https://api.bitget.com/api/v2/mix/market/contracts',
-                                  params={'symbol': ticker, 'productType': 'USDT-FUTURES'}, timeout=10)
-            data = r_info.json().get('data', [])
-            if data:
-                contract_size = float(data[0].get('sizeMultiplier') or 1)
-                min_trade = float(data[0].get('minTradeNum') or 1)
-        except Exception as e:
-            print(f"[bitget] Ошибка получения инфо контракта: {e}")
-
-        # 4. Расчёт QTY и защита от переразмера
-        qty_raw = size_usd / (price * contract_size)
-        qty = round(qty_raw / min_trade) * min_trade
-
-        final_notional = qty * contract_size * price
-        if not reduce_only:
-            if qty < min_trade:
-                raise ValueError(f"bitget: слишком маленький объем для {ticker}")
-            if final_notional > (size_usd * 1.3):
-                raise ValueError(f"bitget: лот ${final_notional:.2f} > лимита ${size_usd}")
-
-        # 5. ОТПРАВКА ОРДЕРА
-        order_body = {
-            'symbol': ticker,
-            'productType': 'USDT-FUTURES',
-            'marginCoin': 'USDT',
-            'marginMode': 'isolated',
-            'side': side.lower(),  # 'buy' или 'sell'
-            'orderType': 'market',
-            'size': str(qty),
-        }
-
-        # Исправление ошибки 40774:
-        # Для One-way режима (Unilateral) используем tradeSide
-        # Но чтобы код был универсальным или соответствовал настройкам хеджа:
+        # Логика для Hedge Mode
         if reduce_only:
-            order_body['tradeSide'] = 'close'
-            # Если на бирже включен Hedge Mode, нужно указать, какую именно сторону закрываем
-            order_body['posSide'] = 'long' if side.lower() == 'sell' else 'short'
+            trade_side = 'close'
+            pos_side = 'long' if side.lower() == 'sell' else 'short'
         else:
-            order_body['tradeSide'] = 'open'
-            # Для открытия в Hedge Mode: если side=buy, то posSide=long
-            order_body['posSide'] = 'long' if side.lower() == 'buy' else 'short'
+            trade_side = 'open'
+            pos_side = 'long' if side.lower() == 'buy' else 'short'
 
-        r_order = _do_bitget_request('POST', '/api/v2/mix/order/place-order', body_dict=order_body)
-
-        if not r_order.ok:
-            raise ValueError(f"bitget order failed: {r_order.text}")
-
-        res = r_order.json()
-        if res.get('code') not in ('00000', 0):
-            raise ValueError(f"bitget API error: {res.get('msg')} (code: {res.get('code')})")
-
-        return {
-            'order_id': res.get('data', {}).get('orderId', ''),
-            'price': price,
-            'qty': qty,
-            'fee': 0.0
+        body = {
+            'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginCoin': 'USDT',
+            'marginMode': 'isolated', 'side': side.lower(), 'orderType': 'market',
+            'size': str(qty), 'tradeSide': trade_side, 'posSide': pos_side
         }
+
+        body_str = _json.dumps(body, separators=(',', ':'))
+        sign_str = ts + 'POST' + path + body_str
+        sig = base64.b64encode(hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha256).digest()).decode()
+
+        r = requests.post(f'https://api.bitget.com{path}',
+                          headers={'ACCESS-KEY': self._api_key, 'ACCESS-SIGN': sig, 'ACCESS-TIMESTAMP': ts,
+                                   'ACCESS-PASSPHRASE': self._passphrase, 'Content-Type': 'application/json'},
+                          data=body_str, timeout=15)
+
+        res = r.json()
+        if res.get('code') != '00000':
+            raise ValueError(f"bitget order failed: {res.get('msg')} ({res.get('code')})")
+
+        return {'order_id': res.get('data', {}).get('orderId'), 'price': price, 'qty': qty, 'fee': 0.0}
+
     async def place_market_order(self, symbol: str, side: str, size_usd: float) -> dict:
         await self._setup_symbol(symbol)
         return await _run_sync(self._bitget_order_sync, symbol, side, size_usd)
 
     async def close_position(self, symbol: str, side: str, qty: float) -> dict:
         price = await self.get_price(symbol)
-        result = await _run_sync(self._bitget_order_sync, symbol, side,
-                                 qty * price, reduce_only=True, price=price)
-        result['price'] = price
-        return result
+        return await _run_sync(self._bitget_order_sync, symbol, side, qty * price, reduce_only=True, price=price)
 
-    async def get_closed_pnl(self, symbol: str) -> Optional[float]:
-        """Получает реализованный PnL закрытой позиции с Bitget."""
+    async def get_open_position(self, symbol: str) -> Optional[dict]:
         import base64
         def _sync():
             ticker = _bitget_ticker(symbol)
-            ts   = str(_ts())
-            path = f'/api/v2/mix/order/history?symbol={ticker}&productType=USDT-FUTURES&limit=5'
-            msg  = ts + 'GET' + path
-            sig  = base64.b64encode(
-                hmac.new(self._api_secret.encode(), msg.encode(), hashlib.sha256).digest()
-            ).decode()
+            ts = str(_ts())
+            path = f'/api/v2/mix/position/single-position?symbol={ticker}&productType=USDT-FUTURES&marginCoin=USDT'
+            sign_str = ts + 'GET' + path
+            sig = base64.b64encode(
+                hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha256).digest()).decode()
             r = requests.get(f'https://api.bitget.com{path}',
-                             headers={'ACCESS-KEY': self._api_key, 'ACCESS-SIGN': sig,
-                                      'ACCESS-TIMESTAMP': ts, 'ACCESS-PASSPHRASE': self._passphrase,
-                                      'Content-Type': 'application/json'}, timeout=10)
-            r.raise_for_status()
-            orders = r.json().get('data', {}).get('orderList', []) or []
-            if not orders: return None
-            # Суммируем pnl последних закрытых ордеров
-            return sum(float(o.get('pnl', 0) or 0) for o in orders[:5])
-        try:
-            return await _run_sync(_sync)
-        except Exception:
+                             headers={'ACCESS-KEY': self._api_key, 'ACCESS-SIGN': sig, 'ACCESS-TIMESTAMP': ts,
+                                      'ACCESS-PASSPHRASE': self._passphrase, 'Content-Type': 'application/json'},
+                             timeout=10)
+            data = r.json().get('data', [])
+            for p in (data if isinstance(data, list) else [data]):
+                size = float(p.get('total', 0) or 0)
+                if size > 0:
+                    return {'size': size, 'side': p.get('holdSide'), 'entry_price': float(p.get('openPriceAvg', 0)),
+                            'unrealized_pnl': float(p.get('unrealizedPL', 0)),
+                            'leverage': int(float(p.get('leverage', 5)))}
             return None
+
+        return await _run_sync(_sync)
 
     async def get_funding_rate(self, symbol: str) -> Optional[dict]:
         def _sync():
