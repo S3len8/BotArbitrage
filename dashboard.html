@@ -39,7 +39,6 @@
     overflow-x: hidden;
   }
 
-  /* ── Scanlines overlay ── */
   body::before {
     content: '';
     position: fixed; inset: 0;
@@ -51,7 +50,6 @@
     z-index: 1000;
   }
 
-  /* ── Header ── */
   header {
     display: flex;
     align-items: center;
@@ -102,7 +100,6 @@
     color: var(--text2);
   }
 
-  /* ── Bot control button ── */
   .btn-bot {
     display: flex; align-items: center; gap: 7px;
     padding: 6px 18px;
@@ -144,7 +141,6 @@
   }
   .btn-bot.stop .btn-dot { animation: pulse 1.2s infinite; }
 
-  /* ── DB status badge ── */
   .db-pill {
     display: flex; align-items: center; gap: 5px;
     padding: 4px 10px;
@@ -157,7 +153,6 @@
   .db-pill.err { background: rgba(255,82,82,0.07);  border: 1px solid rgba(255,82,82,0.25);  color: var(--red); cursor: pointer; }
   .db-pill .db-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
 
-  /* ── Bot error banner ── */
   .bot-error-banner {
     background: rgba(255,82,82,0.08);
     border: 1px solid rgba(255,82,82,0.25);
@@ -171,13 +166,11 @@
   }
   .bot-error-banner.visible { display: block; }
 
-  /* ── Layout ── */
   .app { padding: 20px 24px; max-width: 1600px; margin: 0 auto; }
 
-  /* ── Stats row ── */
   .stats-row {
     display: grid;
-    grid-template-columns: repeat(6, 1fr);
+    grid-template-columns: repeat(7, 1fr);
     gap: 12px;
     margin-bottom: 20px;
   }
@@ -214,7 +207,6 @@
     font-family: var(--mono);
   }
 
-  /* ── Main grid ── */
   .main-grid {
     display: grid;
     grid-template-columns: 380px 1fr;
@@ -222,7 +214,6 @@
     margin-bottom: 16px;
   }
 
-  /* ── Section ── */
   .section {
     background: var(--bg1);
     border: 1px solid var(--border);
@@ -252,7 +243,6 @@
     border: 1px solid var(--border);
   }
 
-  /* ── Balance cards ── */
   .balance-list { padding: 8px; }
   .balance-item {
     display: flex; align-items: center; justify-content: space-between;
@@ -260,7 +250,6 @@
     border-radius: 6px;
     margin-bottom: 4px;
     transition: background .15s;
-    cursor: default;
   }
   .balance-item:hover { background: var(--bg2); }
   .balance-item:last-child { margin-bottom: 0; }
@@ -288,12 +277,6 @@
     font-weight: 600;
     color: var(--text);
   }
-  .balance-position {
-    font-family: var(--mono);
-    font-size: 10px;
-    color: var(--text3);
-    margin-top: 1px;
-  }
   .balance-bar-wrap {
     flex: 1;
     margin: 0 12px;
@@ -308,7 +291,6 @@
     transition: width .5s ease;
   }
 
-  /* Алерт баланса */
   .balance-item.alert {
     background: rgba(255,82,82,0.06);
     border: 1px solid rgba(255,82,82,0.2);
@@ -325,13 +307,9 @@
     margin-left: 6px;
   }
 
-  /* Выключенная биржа */
-  .balance-item.disabled {
-    opacity: 0.45;
-  }
+  .balance-item.disabled { opacity: 0.45; }
   .balance-item.disabled .balance-usd { color: var(--text3); }
 
-  /* Выделенный капитал */
   .alloc-row {
     display: flex; align-items: center; gap: 4px;
     margin-top: 4px;
@@ -370,7 +348,6 @@
     margin-top: 2px;
   }
 
-  /* Переключатель биржи */
   .ex-toggle {
     position: relative;
     width: 32px; height: 17px;
@@ -469,7 +446,7 @@
   .leg-long  .leg-label { color: var(--green); }
 
   .pos-meta {
-    display: flex; gap: 16px;
+    display: flex; gap: 16px; flex-wrap: wrap;
     font-family: var(--mono);
     font-size: 10px;
     color: var(--text3);
@@ -485,7 +462,14 @@
   }
   .empty-state .icon { font-size: 32px; margin-bottom: 10px; }
 
-  /* ── Trades table ── */
+  /* loading spinner for live data */
+  .live-loading {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text3);
+    font-style: italic;
+  }
+
   .trades-section { margin-bottom: 16px; }
   .table-wrap { overflow-x: auto; }
 
@@ -533,7 +517,6 @@
   .badge-partial { background:rgba(255,215,64,.1); color:var(--yellow);border:1px solid rgba(255,215,64,.2); }
   .badge-failed  { background:rgba(255,82,82,.1);  color:var(--red);   border:1px solid rgba(255,82,82,.2); }
 
-  /* ── Tabs ── */
   .tabs {
     display: flex; gap: 4px;
     padding: 8px 16px;
@@ -558,7 +541,6 @@
     border-color: rgba(64,196,255,.2);
   }
 
-  /* ── Filters ── */
   .filters {
     display: flex; gap: 8px; align-items: center;
     padding: 10px 16px;
@@ -578,7 +560,6 @@
   .filter-input:focus { border-color: var(--blue2); }
   .filter-input::placeholder { color: var(--text3); }
 
-  /* ── Toast ── */
   #toast-container {
     position: fixed;
     bottom: 20px; right: 20px;
@@ -603,12 +584,10 @@
     to   { opacity:1; transform: translateX(0); }
   }
 
-  /* ── Scrollbar ── */
   ::-webkit-scrollbar { width: 5px; height: 5px; }
   ::-webkit-scrollbar-track { background: var(--bg); }
   ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
 
-  /* ── Responsive ── */
   @media(max-width:1100px) {
     .main-grid { grid-template-columns: 1fr; }
     .stats-row { grid-template-columns: repeat(3, 1fr); }
@@ -617,21 +596,10 @@
     .stats-row { grid-template-columns: repeat(2, 1fr); }
     .app { padding: 12px; }
   }
-    /* Плавное изменение цвета и прозрачности для предотвращения мерцания */
-  .unrealized-pnl, .short-price, .long-price {
-      transition: color 0.3s ease, opacity 0.2s ease;
-  }
-
-  /* Фиксированная высота карточек, чтобы список не "прыгал" при загрузке */
-  .position-card {
-      min-height: 180px;
-      contain: content; /* Оптимизация рендеринга браузером */
-  }
 </style>
 </head>
 <body>
 
-<!-- Header -->
 <header>
   <div class="logo">ARB<span>//</span>BOT</div>
   <div class="header-meta">
@@ -653,10 +621,8 @@
 
 <div class="app">
 
-  <!-- Bot / DB error banner -->
   <div class="bot-error-banner" id="error-banner"></div>
 
-  <!-- Stats row -->
   <div class="stats-row" id="stats-row">
     <div class="stat-card">
       <div class="stat-label">Total PnL</div>
@@ -695,40 +661,38 @@
     </div>
   </div>
 
-  <!-- Main grid: balances + open positions -->
   <div class="main-grid">
 
-    <!-- Left: Balances -->
+    <!-- Left: Balances + Blacklist -->
     <div class="section">
       <div class="section-header">
         <span class="section-title">Exchange Balances</span>
         <span class="section-badge" id="bal-updated">—</span>
       </div>
-<!-- Секция балансов -->
-      <div class="balance-list" id="balance-list">
-        <!-- сюда бот вставляет балансы -->
-      </div>
+      <div class="balance-list" id="balance-list"></div>
 
-      <!-- НОВАЯ СЕКЦИЯ: ЧЕРНЫЙ СПИСОК (ВСТАВИТЬ СЮДА) -->
-      <div class="section-header" style="border-top: 1px solid var(--border); margin-top: 15px;">
+      <div class="section-header" style="border-top: 1px solid var(--border); margin-top: 8px;">
         <span class="section-title">Blacklist (Ignore)</span>
       </div>
-      <div style="padding: 15px; background: var(--bg2);">
-        <div style="display: flex; gap: 8px; margin-bottom: 12px;">
-          <input type="text" id="ignore-input" class="filter-input" style="flex: 1; border: 1px solid var(--border2);" placeholder="Ticker (напр. ZBCN)">
-          <button class="btn-bot start" style="padding: 6px 15px; height: 32px;" onclick="addIgnored()">ADD</button>
+      <div style="padding: 12px; background: var(--bg2);">
+        <div style="display: flex; gap: 8px; margin-bottom: 10px;">
+          <input type="text" id="ignore-input" class="filter-input" style="flex: 1;"
+            placeholder="Ticker (напр. ZBCN)"
+            onkeydown="if(event.key==='Enter') addIgnored()">
+          <button class="btn-bot start" style="padding: 5px 14px; font-size: 11px;" onclick="addIgnored()">ADD</button>
         </div>
-        <div id="ignore-list" style="display: flex; flex-wrap: wrap; gap: 8px; min-height: 20px;">
-          <!-- Сюда JavaScript будет вставлять заблокированные монеты -->
-        </div>
+        <div id="ignore-list" style="display: flex; flex-wrap: wrap; gap: 6px; min-height: 24px;"></div>
       </div>
     </div>
 
-    <!-- Right: Open positions -->
+    <!-- Right: Open positions (live) -->
     <div class="section">
       <div class="section-header">
         <span class="section-title">Open Positions</span>
-        <span class="section-badge" id="open-count">0</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span class="section-badge" id="open-count">0</span>
+          <span id="live-refresh-status" style="font-family:var(--mono);font-size:10px;color:var(--text3)"></span>
+        </div>
       </div>
       <div class="open-positions" id="open-positions">
         <div class="empty-state">
@@ -747,7 +711,7 @@
       <span class="section-badge" id="trade-count">0</span>
     </div>
     <div class="tabs">
-      <div class="tab active" data-tab="all"   onclick="setTab(this,'all')">All</div>
+      <div class="tab active" data-tab="all"    onclick="setTab(this,'all')">All</div>
       <div class="tab"        data-tab="closed" onclick="setTab(this,'closed')">Closed</div>
       <div class="tab"        data-tab="open"   onclick="setTab(this,'open')">Open</div>
       <div class="tab"        data-tab="failed" onclick="setTab(this,'failed')">Failed</div>
@@ -759,28 +723,14 @@
       <table>
         <thead>
           <tr>
-            <th>#</th>
-            <th>Ticker</th>
-            <th>Short Ex</th>
-            <th>Long Ex</th>
-            <th>Size $</th>
-            <th>Lev</th>
-            <th>Entry Short</th>
-            <th>Entry Long</th>
-            <th>Close Short</th>
-            <th>Close Long</th>
-            <th>PnL Short</th>
-            <th>PnL Long</th>
-            <th>Fees</th>
-            <th>Net PnL</th>
-            <th>Fund Short</th>
-            <th>Fund Long</th>
-            <th>Spread%</th>
-            <th>Exec ms</th>
-            <th>Opened</th>
-            <th>Closed</th>
-            <th>Duration</th>
-            <th>Status</th>
+            <th>#</th><th>Ticker</th><th>Short Ex</th><th>Long Ex</th>
+            <th>Size $</th><th>Lev</th>
+            <th>Entry Short</th><th>Entry Long</th>
+            <th>Close Short</th><th>Close Long</th>
+            <th>PnL Short</th><th>PnL Long</th><th>Fees</th><th>Net PnL</th>
+            <th>Fund Short</th><th>Fund Long</th>
+            <th>Spread%</th><th>Exec ms</th>
+            <th>Opened</th><th>Closed</th><th>Duration</th><th>Status</th>
           </tr>
         </thead>
         <tbody id="trades-tbody"></tbody>
@@ -790,36 +740,44 @@
 
 </div>
 
-<!-- Toast -->
 <div id="toast-container"></div>
 
 <script>
-const API = window.location.origin;
+const API    = window.location.origin;
 const WS_URL = `${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws`;
 
-let allTrades    = [];
-let currentTab   = 'all';
+let allTrades       = [];
+let currentTab      = 'all';
 let initialBalances = {};
-let botRunning   = false;
-let dbOk         = false;
+let botRunning      = false;
+let dbOk            = false;
+let disabledExchanges = new Set();
+let allocatedCapital  = {};
+let lastBalances      = {};
+let currentLeverage   = 5;
+
+// ─── Live positions state ───────────────────────────────────────
+// Stores the last fetched live positions so we can update
+// individual fields without full re-render (prevents flicker)
+let _livePositions = {};   // { id: positionObject }
+let _liveLoading   = false;
 
 const EX_COLORS = {
   binance: '#f0b90b', bybit: '#f7a600', bitget: '#00c4b4',
   mexc: '#1976d2', kucoin: '#2dbd85', gate: '#e74c3c',
 };
 
-// ── Clock ──
+// ── Clock ──────────────────────────────────────────────────────
 setInterval(() => {
-  document.getElementById('clock').textContent = new Date().toUTCString().slice(17,25) + ' UTC';
+  document.getElementById('clock').textContent =
+    new Date().toUTCString().slice(17,25) + ' UTC';
 }, 1000);
 
-// ── Bot control ──────────────────────────────────────────────
+// ── Bot control ────────────────────────────────────────────────
 async function toggleBot() {
   const btn = document.getElementById('btn-bot');
   btn.disabled = true;
-
   if (botRunning) {
-    // STOP
     try {
       const r = await fetch(`${API}/api/bot/stop`, { method: 'POST' });
       const d = await r.json();
@@ -830,7 +788,6 @@ async function toggleBot() {
       btn.disabled = false;
     }
   } else {
-    // START
     if (!dbOk) {
       showToast('PostgreSQL недоступен. Проверь DATABASE_URL в .env', 'alert');
       btn.disabled = false;
@@ -840,19 +797,14 @@ async function toggleBot() {
       const r = await fetch(`${API}/api/bot/start`, { method: 'POST' });
       const d = await r.json();
       showToast(d.msg, d.ok ? 'info' : 'alert');
-      if (!d.ok) {
-        showError(d.msg);
-        btn.disabled = false;
-      }
+      if (!d.ok) { showError(d.msg); btn.disabled = false; }
     } catch(e) {
       showToast('Ошибка запуска: ' + e, 'alert');
       btn.disabled = false;
     }
   }
-  // Статус обновится через WS
   setTimeout(() => { btn.disabled = false; }, 3000);
 }
-
 
 async function retryDb() {
   showToast('Переподключение к PostgreSQL...', 'info');
@@ -863,22 +815,15 @@ async function retryDb() {
     updateDbPill(d.ok);
     showToast(d.msg, d.ok ? 'info' : 'alert');
     if (d.ok) hideError();
-  } catch(e) {
-    showToast('Ошибка: ' + e, 'alert');
-  }
+  } catch(e) { showToast('Ошибка: ' + e, 'alert'); }
 }
 
 function updateBotButton(running) {
   botRunning = running;
   const btn   = document.getElementById('btn-bot');
   const label = document.getElementById('btn-label');
-  if (running) {
-    btn.className = 'btn-bot stop';
-    label.textContent = 'STOP';
-  } else {
-    btn.className = 'btn-bot start';
-    label.textContent = 'START';
-  }
+  btn.className = running ? 'btn-bot stop' : 'btn-bot start';
+  label.textContent = running ? 'STOP' : 'START';
   btn.disabled = false;
 }
 
@@ -889,9 +834,7 @@ function updateDbPill(ok) {
   pill.className = 'db-pill ' + (ok ? 'ok' : 'err');
   label.textContent = ok ? 'DB OK' : 'DB ERR';
   pill.title = ok ? 'PostgreSQL подключён' : 'Нажми чтобы переподключиться';
-  if (!ok) {
-    showError('PostgreSQL недоступен. Убедись что PostgreSQL запущен и DATABASE_URL в .env корректен. Нажми «DB ERR» или перезапусти приложение после исправления.');
-  }
+  if (!ok) showError('PostgreSQL недоступен. Убедись что PostgreSQL запущен и DATABASE_URL в .env корректен.');
 }
 
 function showError(msg) {
@@ -903,7 +846,7 @@ function hideError() {
   document.getElementById('error-banner').classList.remove('visible');
 }
 
-// ── WebSocket ────────────────────────────────────────────────
+// ── WebSocket ──────────────────────────────────────────────────
 let ws, wsPing;
 function connectWS() {
   ws = new WebSocket(WS_URL);
@@ -914,7 +857,7 @@ function connectWS() {
   ws.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
-      if (msg.type === 'state') handleState(msg);
+      if (msg.type === 'state')      handleState(msg);
       if (msg.type === 'bot_status') handleBotStatus(msg);
     } catch {}
   };
@@ -926,20 +869,21 @@ function connectWS() {
 }
 
 function setConnStatus(ok) {
-  document.getElementById('conn-dot').style.background  = ok ? 'var(--green)' : 'var(--red)';
-  document.getElementById('conn-dot').style.animation   = ok ? 'pulse 2s infinite' : 'none';
-  document.getElementById('conn-label').textContent     = ok ? 'LIVE' : 'RECONNECTING';
+  document.getElementById('conn-dot').style.background = ok ? 'var(--green)' : 'var(--red)';
+  document.getElementById('conn-dot').style.animation  = ok ? 'pulse 2s infinite' : 'none';
+  document.getElementById('conn-label').textContent    = ok ? 'LIVE' : 'RECONNECTING';
 }
 
 function handleState(msg) {
-  if (msg.bot_status) handleBotStatus(msg.bot_status);
+  if (msg.bot_status)         handleBotStatus(msg.bot_status);
   if (msg.disabled_exchanges) disabledExchanges = new Set(msg.disabled_exchanges);
-  if (msg.allocated) Object.assign(allocatedCapital, msg.allocated);
-  if (msg.stats?.leverage) currentLeverage = msg.stats.leverage;
+  if (msg.allocated)          Object.assign(allocatedCapital, msg.allocated);
+  if (msg.stats?.leverage)    currentLeverage = msg.stats.leverage;
   renderBalances(msg.balances);
-  renderOpenPositions(msg.open_trades);
   renderStats(msg.stats);
-  document.getElementById('bal-updated').textContent = 'updated ' + new Date().toTimeString().slice(0,8);
+  document.getElementById('bal-updated').textContent =
+    'updated ' + new Date().toTimeString().slice(0,8);
+  // WS дает базовые данные из БД; live данные загружаем отдельно
 }
 
 function handleBotStatus(s) {
@@ -949,29 +893,26 @@ function handleBotStatus(s) {
   else if (s.running) hideError();
 }
 
-// ── Exchange toggles + allocated capital ─────────────────────
-let disabledExchanges = new Set();
-let allocatedCapital  = {};   // ex -> number (чистые $, 0 = не задан)
-let lastBalances      = {};
-let currentLeverage   = 5;
-
+// ── Exchange toggles ───────────────────────────────────────────
 async function toggleExchange(ex) {
-  const newEnabled = disabledExchanges.has(ex); // был выключен → включаем
+  const newEnabled = disabledExchanges.has(ex);
   try {
-    const r = await fetch(`${API}/api/exchanges/toggle?exchange=${ex}&enabled=${newEnabled}`, {method:'POST'});
+    const r = await fetch(
+      `${API}/api/exchanges/toggle?exchange=${ex}&enabled=${newEnabled}`,
+      { method: 'POST' }
+    );
     const d = await r.json();
     if (d.ok) {
       if (!newEnabled) disabledExchanges.add(ex);
-      else disabledExchanges.delete(ex);
+      else             disabledExchanges.delete(ex);
       renderBalances(lastBalances);
       showToast(`${ex.toUpperCase()} ${newEnabled ? '🟢 включена' : '🔴 выключена'}`);
     } else {
       showToast(`Ошибка: ${d.msg}`, 'alert');
     }
-  } catch(e) { console.error(e); showToast('Ошибка соединения', 'alert'); }
+  } catch(e) { showToast('Ошибка соединения', 'alert'); }
 }
 
-// Дебаунс — отправляем на сервер через 600мс после последнего нажатия
 const _allocTimers = {};
 function onAllocInput(ex) {
   clearTimeout(_allocTimers[ex]);
@@ -988,37 +929,41 @@ function updateAllocPreview(ex) {
   if (!inp || !lbl) return;
   const v = parseFloat(inp.value) || 0;
   lbl.textContent = v > 0 ? `× ${currentLeverage} = $${(v * currentLeverage).toFixed(2)}` : '';
-  lbl.style.color = v > 0 ? 'var(--blue)' : 'var(--text3)';
 }
 
 async function saveAlloc(ex, val) {
   const amount = Math.max(0, parseFloat(val) || 0);
   try {
-    const r = await fetch(`${API}/api/exchanges/allocated?exchange=${ex}&amount=${amount}`, {method:'POST'});
+    const r = await fetch(
+      `${API}/api/exchanges/allocated?exchange=${ex}&amount=${amount}`,
+      { method: 'POST' }
+    );
     const d = await r.json();
     if (d.ok) {
       allocatedCapital[ex] = amount;
       const msg = amount > 0
-        ? `${ex.toUpperCase()}: $${amount} × ${currentLeverage} = $${(amount * currentLeverage).toFixed(2)} позиция`
+        ? `${ex.toUpperCase()}: $${amount} × ${currentLeverage} = $${(amount*currentLeverage).toFixed(2)} позиция`
         : `${ex.toUpperCase()}: используется весь баланс`;
       showToast(msg);
     }
   } catch(e) { console.error(e); }
 }
 
-// ── Balances ─────────────────────────────────────────────────
+// ── Balances ───────────────────────────────────────────────────
 const ALERT_PCT = 50;
+const _alertsShown = new Set();
+
 function renderBalances(balances) {
   if (!balances || !Object.keys(balances).length) return;
   lastBalances = balances;
   const container = document.getElementById('balance-list');
+  const lev = currentLeverage;
 
   Object.entries(balances).forEach(([ex, val]) => {
     if (val > 0 && !initialBalances[ex]) initialBalances[ex] = val;
   });
 
   const maxBal = Math.max(...Object.values(balances).filter(v => v > 0), 1);
-  const lev = currentLeverage;
 
   container.innerHTML = Object.entries(balances).map(([ex, bal]) => {
     const color      = EX_COLORS[ex] || '#4a5568';
@@ -1028,14 +973,18 @@ function renderBalances(balances) {
     const isAlert    = initial > 0 && pct <= ALERT_PCT && bal > 0;
     const isDisabled = disabledExchanges.has(ex);
     const alloc      = allocatedCapital[ex] || 0;
-    // Размер позиции: если задан alloc — alloc×lev, иначе balance×lev
     const posSize    = alloc > 0 ? (alloc * lev).toFixed(2) : (bal * lev).toFixed(2);
     const posLabel   = alloc > 0
       ? `$${alloc.toFixed(2)} × ${lev} = $${posSize}`
       : `$${bal.toFixed(2)} × ${lev} = $${posSize}`;
     const allocVal   = alloc > 0 ? alloc : '';
     const preview    = alloc > 0 ? `× ${lev} = $${posSize}` : '';
-    if (isAlert) showToast(`⚠️ ALERT: ${ex.toUpperCase()} balance at ${pct.toFixed(0)}%`, 'alert');
+
+    if (isAlert && !_alertsShown.has(ex)) {
+      _alertsShown.add(ex);
+      showToast(`⚠️ ALERT: ${ex.toUpperCase()} balance at ${pct.toFixed(0)}%`, 'alert');
+    }
+
     return `
       <div class="balance-item ${isAlert ? 'alert' : ''} ${isDisabled ? 'disabled' : ''}">
         <div class="ex-name">
@@ -1055,13 +1004,14 @@ function renderBalances(balances) {
               value="${allocVal}"
               placeholder="весь"
               oninput="onAllocInput('${ex}')"
-              onclick="event.stopPropagation()"
-            >
+              onclick="event.stopPropagation()">
             <span class="alloc-preview" id="alloc-preview-${ex}">${preview}</span>
           </div>
           <div class="pos-size-label">${posLabel}</div>
         </div>
-        <div class="ex-toggle ${isDisabled ? '' : 'on'}" onclick="toggleExchange('${ex}')" title="${isDisabled ? 'Включить' : 'Выключить'} биржу">
+        <div class="ex-toggle ${isDisabled ? '' : 'on'}"
+          onclick="toggleExchange('${ex}')"
+          title="${isDisabled ? 'Включить' : 'Выключить'} биржу">
           <div class="ex-toggle-track"></div>
           <div class="ex-toggle-thumb"></div>
         </div>
@@ -1069,165 +1019,256 @@ function renderBalances(balances) {
   }).join('');
 }
 
-// ── Open Positions ───────────────────────────────────────────
-function renderOpenPositions(positions) {
-  const c = document.getElementById('open-positions');
-  document.getElementById('open-count').textContent = positions.length;
-  if (!positions.length) {
-    c.innerHTML = `<div class="empty-state"><div class="icon">⬜</div>No open positions</div>`;
-    return;
-  }
-  c.innerHTML = positions.map(p => {
-    const dur     = p.opened_at ? elapsed(p.opened_at) : '—';
-    const sigSpread = p.signal_spread_pct?.toFixed(2) || '—';
+// ── Open Positions (Live) ──────────────────────────────────────
+// loadLivePositions fetches /api/positions/live which returns
+// real-time prices and PnL from exchanges, then renders cards.
+// On subsequent calls we update only changed numeric fields
+// to avoid full re-render flicker.
 
-    // Фандинг
-    const sf = p.funding_short != null ? (p.funding_short*100).toFixed(3)+'%' : '—';
-    const lf = p.funding_long  != null ? (p.funding_long *100).toFixed(3)+'%' : '—';
+async function loadLivePositions() {
+  if (_liveLoading) return;
+  _liveLoading = true;
 
-    // Время до следующего фандинга
-    function nextFundStr(ts) {
-      if (!ts) return '—';
-      const diff = ts - Math.floor(Date.now()/1000);
-      if (diff <= 0) return 'скоро';
-      const h = Math.floor(diff/3600), m = Math.floor((diff%3600)/60);
-      return h > 0 ? `${h}ч ${m}м` : `${m}м`;
-    }
-    const nextFund = Math.min(
-      p.funding_short_next || 9e9,
-      p.funding_long_next  || 9e9
-    );
-    const nextFundLabel = nextFundStr(nextFund < 9e9 ? nextFund : null);
-    const fundWarn = nextFund < 9e9 && (nextFund - Date.now()/1000) < 360; // < 6 минут
+  const statusEl = document.getElementById('live-refresh-status');
+  if (statusEl) statusEl.textContent = '↻ обновляю...';
 
-    // Статус позиций на биржах
-    const sOnEx = p.short_on_exchange;
-    const lOnEx = p.long_on_exchange;
-    const shortStatus = sOnEx === false ? '🔴 нет' : sOnEx === true ? '🟢' : '…';
-    const longStatus  = lOnEx === false ? '🔴 нет' : lOnEx === true ? '🟢' : '…';
-
-    // Live данные
-    const hasLive   = p.cur_spread_pct != null;
-    const curSpread = hasLive ? p.cur_spread_pct.toFixed(2) : '…';
-    const spreadColor = hasLive && p.cur_spread_pct < 0.5 ? 'color:var(--green)' :
-                        hasLive && p.cur_spread_pct < 1.5 ? 'color:var(--yellow)' : '';
-
-    // Unrealized PnL (с фандингом)
-    const uPnl      = p.unrealized_pnl;
-    const uPnlStr   = uPnl != null ? (uPnl >= 0 ? '+' : '') + '$' + Math.abs(uPnl).toFixed(4) : '…';
-    const uPnlClass = uPnl == null ? '' : uPnl > 0 ? 'color:var(--green)' : uPnl < 0 ? 'color:var(--red)' : '';
-
-    const sPnl      = p.short_unrealized != null ? (p.short_unrealized>=0?'+':'')+'$'+Math.abs(p.short_unrealized).toFixed(4) : '…';
-    const lPnl      = p.long_unrealized  != null ? (p.long_unrealized>=0?'+':'')+'$'+Math.abs(p.long_unrealized).toFixed(4)  : '…';
-    const sPnlClass = p.short_unrealized > 0 ? 'color:var(--green)' : p.short_unrealized < 0 ? 'color:var(--red)' : '';
-    const lPnlClass = p.long_unrealized  > 0 ? 'color:var(--green)' : p.long_unrealized  < 0 ? 'color:var(--red)' : '';
-
-    const curShort  = p.cur_short_price ? '$'+fmt(p.cur_short_price) : '…';
-    const curLong   = p.cur_long_price  ? '$'+fmt(p.cur_long_price)  : '…';
-
-    const fundEarned = p.fund_earned;
-    const fundStr    = fundEarned != null ? (fundEarned>=0?'+':'')+'$'+Math.abs(fundEarned).toFixed(4) : '';
-    const fundClass  = fundEarned > 0 ? 'color:var(--green)' : fundEarned < 0 ? 'color:var(--red)' : '';
-
-    return `
-      <div class="position-card" id="pos-${p.id}">
-        <div class="pos-header">
-          <span class="pos-ticker">${p.ticker}</span>
-          <span style="display:flex;gap:8px;align-items:center">
-            <span class="pos-status ${p.status}">${p.status.toUpperCase()}</span>
-            <button onclick="toggleFundingHistory(${p.id})"
-              style="background:var(--bg3);border:1px solid var(--border2);color:var(--blue);
-                     padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;
-                     font-family:var(--mono)">
-              📊 фандинг
-            </button>
-            <button onclick="markClosed(${p.id},'${p.ticker}')"
-              style="background:var(--red2);border:none;color:#fff;padding:2px 10px;
-                     border-radius:4px;cursor:pointer;font-size:11px;font-family:var(--mono)">
-              ✕ закрыто
-            </button>
-          </span>
-        </div>
-        <div class="pos-legs">
-          <div class="pos-leg leg-short">
-            <div class="leg-label">SHORT ${shortStatus}</div>
-            <div class="leg-exchange">${(p.short_exchange||'').toUpperCase()}</div>
-            <div class="leg-price">entry $${fmt(p.short_entry_price)}</div>
-            <div style="font-size:11px;color:var(--text2)">now ${curShort}</div>
-            <div style="font-size:11px;${sPnlClass}">${sPnl}</div>
-            <div style="font-size:10px;color:var(--text3)">fund ${sf}</div>
-          </div>
-          <div class="pos-leg leg-long">
-            <div class="leg-label">LONG ${longStatus}</div>
-            <div class="leg-exchange">${(p.long_exchange||'').toUpperCase()}</div>
-            <div class="leg-price">entry $${fmt(p.long_entry_price)}</div>
-            <div style="font-size:11px;color:var(--text2)">now ${curLong}</div>
-            <div style="font-size:11px;${lPnlClass}">${lPnl}</div>
-            <div style="font-size:10px;color:var(--text3)">fund ${lf}</div>
-          </div>
-        </div>
-        <div class="pos-meta">
-          <span>size <span>$${p.trade_size_usd?.toFixed(2)||'—'}</span></span>
-          <span>lev <span>${p.leverage||5}×</span></span>
-          <span>спред сигн. <span>${sigSpread}%</span></span>
-          <span>спред тек. <span style="${spreadColor}">${curSpread}%</span></span>
-          <span style="${fundWarn?'color:var(--red)':''}">след. фанд. <span>${nextFundLabel}</span></span>
-          <span>open <span>${dur}</span></span>
-        </div>
-        <div style="display:flex;justify-content:space-between;padding:6px 8px;
-                    border-top:1px solid var(--border);margin-top:4px;font-size:12px">
-          <span>Unrealized PnL <span style="${uPnlClass};font-weight:600">${uPnlStr}</span></span>
-          ${fundStr ? `<span>Фандинг <span style="${fundClass}">${fundStr}</span></span>` : ''}
-        </div>
-        <!-- Панель истории фандинга (скрыта по умолчанию) -->
-        <div id="fund-history-${p.id}" style="display:none;border-top:1px solid var(--border);
-             margin-top:4px;padding:6px 8px">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-            <span style="font-size:11px;color:var(--text2);font-family:var(--mono)">
-              ИСТОРИЯ ФАНДИНГА
-            </span>
-            <button onclick="refreshFundingHistory(${p.id})"
-              style="background:none;border:1px solid var(--border2);color:var(--text2);
-                     padding:1px 6px;border-radius:3px;cursor:pointer;font-size:10px">
-              ↻ обновить
-            </button>
-          </div>
-          <div id="fund-history-rows-${p.id}" style="font-size:10px;font-family:var(--mono)">
-            <span style="color:var(--text3)">Загрузка...</span>
-          </div>
-        </div>
-        ${p.live_error ? `<div style="font-size:10px;color:var(--red);padding:4px 8px">${p.live_error}</div>` : ''}
-        ${p.auto_closed ? `<div style="font-size:10px;color:var(--yellow);padding:4px 8px">⚠️ Авто-закрыто: позиция не найдена на биржах</div>` : ''}
-      </div>`;
-  }).join('');
-}
-
-async function markClosed(tradeId, ticker) {
-  if (!confirm(`Пометить ${ticker} как закрытую? Это обновит статус в базе и отправит уведомление.`)) return;
   try {
-    const r = await fetch(`${API}/api/positions/${tradeId}/mark-closed`, {method:'POST'});
-    const d = await r.json();
-    if (d.ok) {
-      loadLivePositions();
-    } else {
-      alert('Ошибка: ' + (d.error || 'unknown'));
+    const resp = await fetch(`${API}/api/positions/live`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const positions = await resp.json();
+
+    document.getElementById('open-count').textContent = positions.length;
+
+    const container = document.getElementById('open-positions');
+
+    if (!positions.length) {
+      container.innerHTML = `<div class="empty-state"><div class="icon">⬜</div>No open positions</div>`;
+      _livePositions = {};
+      if (statusEl) statusEl.textContent = '';
+      _liveLoading = false;
+      return;
     }
-  } catch(e) { alert('Ошибка: ' + e); }
+
+    // Build a map of new data
+    const newMap = {};
+    positions.forEach(p => { newMap[p.id] = p; });
+
+    // Check if we need full re-render (new positions added/removed)
+    const oldIds  = Object.keys(_livePositions).sort().join(',');
+    const newIds  = Object.keys(newMap).sort().join(',');
+    const needsFullRender = oldIds !== newIds;
+
+    if (needsFullRender) {
+      // Full render
+      container.innerHTML = positions.map(p => buildPositionCard(p)).join('');
+    } else {
+      // Soft update — only change numeric values to prevent flicker
+      positions.forEach(p => updatePositionCardInPlace(p));
+    }
+
+    _livePositions = newMap;
+    if (statusEl) statusEl.textContent = 'обновлено ' + new Date().toTimeString().slice(0,8);
+
+  } catch(e) {
+    console.error('[Live positions]', e);
+    if (statusEl) statusEl.textContent = '⚠ ошибка обновления';
+  }
+
+  _liveLoading = false;
 }
 
+// Build full HTML for one position card
+function buildPositionCard(p) {
+  const dur = p.opened_at ? elapsed(p.opened_at) : '—';
+
+  // Entry prices
+  const shortEntry = p.short_entry_price != null ? '$' + fmt(p.short_entry_price) : '—';
+  const longEntry  = p.long_entry_price  != null ? '$' + fmt(p.long_entry_price)  : '—';
+
+  // Current prices (live)
+  const curShort = p.cur_short_price != null ? '$' + fmt(p.cur_short_price) : '…';
+  const curLong  = p.cur_long_price  != null ? '$' + fmt(p.cur_long_price)  : '…';
+
+  // Funding rates
+  const sf = p.funding_short != null ? (p.funding_short * 100).toFixed(3) + '%' : '—';
+  const lf = p.funding_long  != null ? (p.funding_long  * 100).toFixed(3) + '%' : '—';
+
+  // PnL per leg
+  const sPnl      = fmtPnl(p.short_unrealized);
+  const lPnl      = fmtPnl(p.long_unrealized);
+  const sPnlColor = pnlColor(p.short_unrealized);
+  const lPnlColor = pnlColor(p.long_unrealized);
+
+  // Total unrealized
+  const uPnl      = p.unrealized_pnl;
+  const uPnlStr   = uPnl != null ? fmtPnl(uPnl) : '…';
+  const uPnlColor = pnlColor(uPnl);
+
+  // Spread (current)
+  const curSpread = (p.cur_short_price != null && p.cur_long_price != null && p.cur_long_price > 0)
+    ? ((p.cur_short_price / p.cur_long_price - 1) * 100)
+    : null;
+  const curSpreadStr   = curSpread != null ? curSpread.toFixed(2) + '%' : '…';
+  const curSpreadColor = curSpread != null
+    ? (curSpread < 0.5 ? 'color:var(--green)' : curSpread < 1.5 ? 'color:var(--yellow)' : '')
+    : '';
+
+  // Exchange status
+  const sOnEx     = p.short_on_exchange;
+  const lOnEx     = p.long_on_exchange;
+  const shortStat = sOnEx === false ? '🔴 нет' : sOnEx === true ? '🟢' : '';
+  const longStat  = lOnEx === false ? '🔴 нет' : lOnEx === true ? '🟢' : '';
+
+  // Next funding countdown
+  const nextFundStr = buildNextFundLabel(p);
+
+  const sigSpread = p.signal_spread_pct != null ? Number(p.signal_spread_pct).toFixed(2) : '—';
+
+  return `
+    <div class="position-card" id="poscard-${p.id}">
+      <div class="pos-header">
+        <span class="pos-ticker">${p.ticker}</span>
+        <span style="display:flex;gap:6px;align-items:center">
+          <span class="pos-status ${p.status || 'open'}">${(p.status || 'open').toUpperCase()}</span>
+          <button onclick="toggleFundingHistory(${p.id})"
+            style="background:var(--bg3);border:1px solid var(--border2);color:var(--blue);
+                   padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;font-family:var(--mono)">
+            📊 фандинг
+          </button>
+          <button onclick="markClosed(${p.id},'${p.ticker}')"
+            style="background:rgba(255,23,68,0.15);border:1px solid rgba(255,23,68,0.4);
+                   color:var(--red);padding:2px 10px;border-radius:4px;cursor:pointer;
+                   font-size:11px;font-family:var(--mono)">
+            ✕ закрыто
+          </button>
+        </span>
+      </div>
+
+      <div class="pos-legs">
+        <div class="pos-leg leg-short">
+          <div class="leg-label">SHORT ${shortStat}</div>
+          <div class="leg-exchange">${(p.short_exchange || '').toUpperCase()}</div>
+          <div class="leg-price">entry ${shortEntry}</div>
+          <div style="font-family:var(--mono);font-size:11px;color:var(--text2)"
+               id="poscard-${p.id}-short-cur">now ${curShort}</div>
+          <div style="font-family:var(--mono);font-size:11px;${sPnlColor}"
+               id="poscard-${p.id}-short-pnl">${sPnl}</div>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--text3)">fund ${sf}</div>
+        </div>
+        <div class="pos-leg leg-long">
+          <div class="leg-label">LONG ${longStat}</div>
+          <div class="leg-exchange">${(p.long_exchange || '').toUpperCase()}</div>
+          <div class="leg-price">entry ${longEntry}</div>
+          <div style="font-family:var(--mono);font-size:11px;color:var(--text2)"
+               id="poscard-${p.id}-long-cur">now ${curLong}</div>
+          <div style="font-family:var(--mono);font-size:11px;${lPnlColor}"
+               id="poscard-${p.id}-long-pnl">${lPnl}</div>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--text3)">fund ${lf}</div>
+        </div>
+      </div>
+
+      <div class="pos-meta">
+        <span>size <span>$${Number(p.trade_size_usd || 0).toFixed(2)}</span></span>
+        <span>lev <span>${p.leverage || 5}×</span></span>
+        <span>спред сигн. <span>${sigSpread}%</span></span>
+        <span>спред тек. <span id="poscard-${p.id}-spread" style="${curSpreadColor}">${curSpreadStr}</span></span>
+        <span id="poscard-${p.id}-nextfund">след. фанд. <span>${nextFundStr}</span></span>
+        <span>open <span id="poscard-${p.id}-dur">${dur}</span></span>
+      </div>
+
+      <div style="display:flex;justify-content:space-between;padding:6px 8px;
+                  border-top:1px solid var(--border);margin-top:4px;
+                  font-family:var(--mono);font-size:12px">
+        <span>Unrealized PnL
+          <span id="poscard-${p.id}-upnl" style="${uPnlColor};font-weight:600">${uPnlStr}</span>
+        </span>
+      </div>
+
+      <!-- Funding history panel (hidden by default) -->
+      <div id="fund-history-${p.id}" style="display:none;border-top:1px solid var(--border);
+           margin-top:4px;padding:6px 8px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <span style="font-size:11px;color:var(--text2);font-family:var(--mono)">ИСТОРИЯ ФАНДИНГА</span>
+          <button onclick="refreshFundingHistory(${p.id})"
+            style="background:none;border:1px solid var(--border2);color:var(--text2);
+                   padding:1px 6px;border-radius:3px;cursor:pointer;font-size:10px">↻ обновить</button>
+        </div>
+        <div id="fund-history-rows-${p.id}" style="font-size:10px;font-family:var(--mono)">
+          <span style="color:var(--text3)">Нажмите ↻ чтобы загрузить</span>
+        </div>
+      </div>
+
+      ${p.live_error ? `<div style="font-size:10px;color:var(--red);padding:4px 8px;font-family:var(--mono)">⚠ ${p.live_error}</div>` : ''}
+    </div>`;
+}
+
+// Update only the live-data fields inside an existing card (no DOM rebuild)
+function updatePositionCardInPlace(p) {
+  const setEl = (id, html, style) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (html  !== undefined) el.innerHTML = html;
+    if (style !== undefined) el.style.cssText = style;
+  };
+
+  // Current prices
+  const curShort = p.cur_short_price != null ? 'now $' + fmt(p.cur_short_price) : 'now …';
+  const curLong  = p.cur_long_price  != null ? 'now $' + fmt(p.cur_long_price)  : 'now …';
+  setEl(`poscard-${p.id}-short-cur`, curShort);
+  setEl(`poscard-${p.id}-long-cur`,  curLong);
+
+  // Per-leg PnL
+  setEl(`poscard-${p.id}-short-pnl`, fmtPnl(p.short_unrealized), pnlColor(p.short_unrealized));
+  setEl(`poscard-${p.id}-long-pnl`,  fmtPnl(p.long_unrealized),  pnlColor(p.long_unrealized));
+
+  // Total unrealized PnL
+  const uPnl = p.unrealized_pnl;
+  setEl(`poscard-${p.id}-upnl`,
+    uPnl != null ? fmtPnl(uPnl) : '…',
+    `${pnlColor(uPnl)};font-weight:600`
+  );
+
+  // Current spread
+  const curSpread = (p.cur_short_price != null && p.cur_long_price != null && p.cur_long_price > 0)
+    ? ((p.cur_short_price / p.cur_long_price - 1) * 100) : null;
+  const curSpreadStr   = curSpread != null ? curSpread.toFixed(2) + '%' : '…';
+  const curSpreadColor = curSpread != null
+    ? (curSpread < 0.5 ? 'color:var(--green)' : curSpread < 1.5 ? 'color:var(--yellow)' : '') : '';
+  setEl(`poscard-${p.id}-spread`, curSpreadStr, curSpreadColor);
+
+  // Duration
+  const durEl = document.getElementById(`poscard-${p.id}-dur`);
+  if (durEl && p.opened_at) durEl.textContent = elapsed(p.opened_at);
+}
+
+function buildNextFundLabel(p) {
+  const nextFund = Math.min(
+    p.funding_short_next || 9e9,
+    p.funding_long_next  || 9e9
+  );
+  if (nextFund >= 9e9) return '—';
+  const diff = nextFund - Math.floor(Date.now() / 1000);
+  if (diff <= 0) return 'скоро';
+  const h = Math.floor(diff / 3600);
+  const m = Math.floor((diff % 3600) / 60);
+  return h > 0 ? `${h}ч ${m}м` : `${m}м`;
+}
+
+// ── Funding history ────────────────────────────────────────────
 async function toggleFundingHistory(tradeId) {
   const panel = document.getElementById(`fund-history-${tradeId}`);
   if (!panel) return;
-  const isHidden = panel.style.display === 'none';
-  panel.style.display = isHidden ? 'block' : 'none';
-  if (isHidden) await refreshFundingHistory(tradeId);
+  const hidden = panel.style.display === 'none';
+  panel.style.display = hidden ? 'block' : 'none';
+  if (hidden) await refreshFundingHistory(tradeId);
 }
 
 async function refreshFundingHistory(tradeId) {
   const container = document.getElementById(`fund-history-rows-${tradeId}`);
   if (!container) return;
+  container.innerHTML = '<span style="color:var(--text3)">Загрузка...</span>';
   try {
-    const data = await fetch(`${API}/api/positions/${tradeId}/funding-history`).then(r=>r.json());
+    const data = await fetch(`${API}/api/positions/${tradeId}/funding-history`).then(r => r.json());
     if (!data || !data.length) {
       container.innerHTML = '<span style="color:var(--text3)">Нет данных — фандинг обновляется каждые 20 минут</span>';
       return;
@@ -1237,11 +1278,11 @@ async function refreshFundingHistory(tradeId) {
         <thead>
           <tr style="color:var(--text3);border-bottom:1px solid var(--border)">
             <th style="text-align:left;padding:2px 4px">Время</th>
-            <th style="text-align:left;padding:2px 4px">Биржа (Short)</th>
-            <th style="text-align:right;padding:2px 4px">Фандинг</th>
+            <th style="text-align:left;padding:2px 4px">Short</th>
+            <th style="text-align:right;padding:2px 4px">Ставка</th>
             <th style="text-align:right;padding:2px 4px">Следующее</th>
-            <th style="text-align:left;padding:2px 4px">Биржа (Long)</th>
-            <th style="text-align:right;padding:2px 4px">Фандинг</th>
+            <th style="text-align:left;padding:2px 4px">Long</th>
+            <th style="text-align:right;padding:2px 4px">Ставка</th>
             <th style="text-align:right;padding:2px 4px">Следующее</th>
             <th style="text-align:right;padding:2px 4px">Интервал</th>
             <th style="text-align:right;padding:2px 4px">Разница</th>
@@ -1249,40 +1290,57 @@ async function refreshFundingHistory(tradeId) {
         </thead>
         <tbody>
           ${data.map(row => {
-            const t   = new Date(row.time);
+            const t    = new Date(row.time);
             const tStr = t.toLocaleTimeString('ru-RU', {hour:'2-digit',minute:'2-digit',second:'2-digit'})
                        + ' ' + t.toLocaleDateString('ru-RU', {day:'2-digit',month:'2-digit'});
-            const sf  = (row.sf * 100).toFixed(4) + '%';
-            const lf  = (row.lf * 100).toFixed(4) + '%';
+            const sf   = (row.sf * 100).toFixed(4) + '%';
+            const lf   = (row.lf * 100).toFixed(4) + '%';
             const diff = Math.abs((row.sf - row.lf) * 100).toFixed(4) + '%';
-            const sfColor = row.sf < 0 ? 'color:var(--green)' : row.sf > 0 ? 'color:var(--red)' : '';
-            const lfColor = row.lf < 0 ? 'color:var(--green)' : row.lf > 0 ? 'color:var(--red)' : '';
-            const diffColor = Math.abs(row.sf - row.lf) * 100 > 0.2 ? 'color:var(--yellow)' : '';
-            const nextS = row.next_s ? new Date(row.next_s*1000).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}) : '—';
-            const nextL = row.next_l ? new Date(row.next_l*1000).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}) : '—';
-            const interval = row.interval_s === row.interval_l
-              ? row.interval_s + 'ч'
-              : row.interval_s + 'ч / ' + row.interval_l + 'ч';
+            const sfC  = row.sf < 0 ? 'color:var(--green)' : row.sf > 0 ? 'color:var(--red)' : '';
+            const lfC  = row.lf < 0 ? 'color:var(--green)' : row.lf > 0 ? 'color:var(--red)' : '';
+            const dC   = Math.abs(row.sf - row.lf) * 100 > 0.2 ? 'color:var(--yellow)' : '';
+            const nS   = row.next_s
+              ? new Date(row.next_s * 1000).toLocaleTimeString('ru-RU', {hour:'2-digit',minute:'2-digit'}) : '—';
+            const nL   = row.next_l
+              ? new Date(row.next_l * 1000).toLocaleTimeString('ru-RU', {hour:'2-digit',minute:'2-digit'}) : '—';
+            const intv = row.interval_s === row.interval_l
+              ? row.interval_s + 'ч' : row.interval_s + 'ч / ' + row.interval_l + 'ч';
             return `<tr style="border-bottom:1px solid var(--border);line-height:1.8">
               <td style="padding:2px 4px;color:var(--text2)">${tStr}</td>
               <td style="padding:2px 4px;color:var(--text)">${(row.short_ex||'').toUpperCase()}</td>
-              <td style="padding:2px 4px;text-align:right;${sfColor}">${sf}</td>
-              <td style="padding:2px 4px;text-align:right;color:var(--text2)">${nextS}</td>
+              <td style="padding:2px 4px;text-align:right;${sfC}">${sf}</td>
+              <td style="padding:2px 4px;text-align:right;color:var(--text2)">${nS}</td>
               <td style="padding:2px 4px;color:var(--text)">${(row.long_ex||'').toUpperCase()}</td>
-              <td style="padding:2px 4px;text-align:right;${lfColor}">${lf}</td>
-              <td style="padding:2px 4px;text-align:right;color:var(--text2)">${nextL}</td>
-              <td style="padding:2px 4px;text-align:right;color:var(--text2)">${interval}</td>
-              <td style="padding:2px 4px;text-align:right;${diffColor}">${diff}</td>
+              <td style="padding:2px 4px;text-align:right;${lfC}">${lf}</td>
+              <td style="padding:2px 4px;text-align:right;color:var(--text2)">${nL}</td>
+              <td style="padding:2px 4px;text-align:right;color:var(--text2)">${intv}</td>
+              <td style="padding:2px 4px;text-align:right;${dC}">${diff}</td>
             </tr>`;
           }).join('')}
         </tbody>
       </table>`;
   } catch(e) {
-    if (container) container.innerHTML = `<span style="color:var(--red)">Ошибка: ${e}</span>`;
+    container.innerHTML = `<span style="color:var(--red)">Ошибка: ${e}</span>`;
   }
 }
 
-// ── Stats ────────────────────────────────────────────────────
+// ── Mark closed ────────────────────────────────────────────────
+async function markClosed(tradeId, ticker) {
+  if (!confirm(`Пометить ${ticker} как закрытую?\nЭто обновит статус в базе и отправит уведомление.`)) return;
+  try {
+    const r = await fetch(`${API}/api/positions/${tradeId}/mark-closed`, { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) {
+      showToast(`${ticker} помечена закрытой. PnL: ${d.net_pnl != null ? '$'+Number(d.net_pnl).toFixed(4) : '—'}`);
+      await loadLivePositions();
+      await loadTrades();
+    } else {
+      showToast('Ошибка: ' + (d.error || 'unknown'), 'alert');
+    }
+  } catch(e) { showToast('Ошибка: ' + e, 'alert'); }
+}
+
+// ── Stats ──────────────────────────────────────────────────────
 function renderStats(s) {
   if (!s) return;
   if (s.leverage) currentLeverage = s.leverage;
@@ -1299,14 +1357,14 @@ function renderStats(s) {
   document.getElementById('s-maxopen').textContent= `max ${s.max_open_positions||3}`;
   document.getElementById('s-lev').textContent    = `${s.leverage||5}×`;
   document.getElementById('s-failed').textContent = s.failed || 0;
-  // Среднее время исполнения
-  const execEl = document.getElementById('s-exec');
   const execMs = s.avg_exec_short_ms || s.avg_exec_long_ms;
+  const execEl = document.getElementById('s-exec');
   execEl.textContent = execMs ? Math.round(execMs) + 'ms' : '—';
-  execEl.className = 'stat-value ' + (execMs ? (execMs < 500 ? 'green' : execMs < 1500 ? 'blue' : 'red') : 'blue');
+  execEl.className   = 'stat-value ' + (execMs
+    ? (execMs < 500 ? 'green' : execMs < 1500 ? 'blue' : 'red') : 'blue');
 }
 
-// ── Trades table ─────────────────────────────────────────────
+// ── Trades table ───────────────────────────────────────────────
 async function loadTrades() {
   try {
     const r = await fetch(`${API}/api/trades?limit=500`);
@@ -1314,8 +1372,6 @@ async function loadTrades() {
     document.getElementById('trade-count').textContent = allTrades.length;
     renderTable();
   } catch(e) { console.error(e); }
-  // ВАЖНО: Добавьте вызов этой функции в блок инициализации (там где loadTrades и т.д.)
-loadIgnored();
 }
 
 function setTab(el, tab) {
@@ -1327,14 +1383,15 @@ function setTab(el, tab) {
 
 function renderTable() {
   const search = document.getElementById('search-input').value.toLowerCase();
-  const rows = allTrades.filter(t => {
+  const rows   = allTrades.filter(t => {
     if (currentTab !== 'all' && t.status !== currentTab) return false;
     if (search && !t.ticker.toLowerCase().includes(search)) return false;
     return true;
   });
   const tbody = document.getElementById('trades-tbody');
   if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="22" style="text-align:center;padding:30px;color:var(--text3);font-family:var(--mono)">No trades found</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="22" style="text-align:center;padding:30px;
+      color:var(--text3);font-family:var(--mono)">No trades found</td></tr>`;
     return;
   }
   tbody.innerHTML = rows.map(t => {
@@ -1344,11 +1401,14 @@ function renderTable() {
     const spnl     = t.short_pnl_usd != null ? (t.short_pnl_usd>=0?'+':'')+'$'+Number(t.short_pnl_usd).toFixed(4) : '—';
     const lpnl     = t.long_pnl_usd  != null ? (t.long_pnl_usd >=0?'+':'')+'$'+Number(t.long_pnl_usd).toFixed(4)  : '—';
     const fees     = (Number(t.fee_short_usd||0) + Number(t.fee_long_usd||0)).toFixed(4);
-    const dur      = (t.opened_at && t.closed_at) ? duration(t.opened_at, t.closed_at) : (t.opened_at ? elapsed(t.opened_at) : '—');
+    const dur      = (t.opened_at && t.closed_at)
+      ? duration(t.opened_at, t.closed_at) : (t.opened_at ? elapsed(t.opened_at) : '—');
     const fund_s   = t.funding_short != null ? (t.funding_short*100).toFixed(4)+'%' : '—';
     const fund_l   = t.funding_long  != null ? (t.funding_long *100).toFixed(4)+'%' : '—';
     const execMs   = t.exec_time_short_ms || t.exec_time_long_ms;
-    const execStr  = execMs ? `<span style="color:${execMs<500?'var(--green)':execMs<1500?'var(--blue)':'var(--red)'}">${execMs}ms</span>` : '—';
+    const execStr  = execMs
+      ? `<span style="color:${execMs<500?'var(--green)':execMs<1500?'var(--blue)':'var(--red)'}">${execMs}ms</span>`
+      : '—';
     return `<tr>
       <td style="color:var(--text3)">${t.id}</td>
       <td class="ticker">${t.ticker}</td>
@@ -1376,139 +1436,138 @@ function renderTable() {
   }).join('');
 }
 
-// ── Toast ────────────────────────────────────────────────────
-const shownAlerts = new Set();
-function showToast(msg, type='info') {
-  if (shownAlerts.has(msg)) return;
-  shownAlerts.add(msg);
-  setTimeout(() => shownAlerts.delete(msg), 60000);
+// ── Blacklist ──────────────────────────────────────────────────
+async function loadIgnored() {
+  try {
+    const r    = await fetch(`${API}/api/ignored-symbols`);
+    const list = await r.json();
+    const c    = document.getElementById('ignore-list');
+    if (!list.length) {
+      c.innerHTML = '<span style="font-family:var(--mono);font-size:10px;color:var(--text3)">список пуст</span>';
+      return;
+    }
+    c.innerHTML = list.map(t => `
+      <span class="badge badge-failed"
+        style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;padding:3px 8px;"
+        onclick="removeIgnored('${t}')" title="Удалить ${t}">
+        ${t} <span style="font-size:13px;line-height:1;opacity:0.7">×</span>
+      </span>`).join('');
+  } catch(e) { console.error(e); }
+}
+
+async function addIgnored() {
+  const input  = document.getElementById('ignore-input');
+  const ticker = (input.value || '').trim().toUpperCase();
+  if (!ticker) return;
+  try {
+    const r = await fetch(`${API}/api/ignored-symbols/add?ticker=${ticker}`, { method: 'POST' });
+    if (r.ok) {
+      input.value = '';
+      await loadIgnored();
+      showToast(`${ticker} добавлен в черный список`);
+    }
+  } catch(e) { showToast('Ошибка: ' + e, 'alert'); }
+}
+
+async function removeIgnored(ticker) {
+  if (!confirm(`Удалить ${ticker} из черного списка?`)) return;
+  try {
+    const r = await fetch(`${API}/api/ignored-symbols/remove?ticker=${ticker}`, { method: 'POST' });
+    if (r.ok) {
+      await loadIgnored();
+      showToast(`${ticker} удален из списка`);
+    }
+  } catch(e) { showToast('Ошибка: ' + e, 'alert'); }
+}
+
+// ── Toast ──────────────────────────────────────────────────────
+const _toastShown = new Set();
+function showToast(msg, type = 'info') {
+  const key = type + msg;
+  if (_toastShown.has(key)) return;
+  _toastShown.add(key);
+  setTimeout(() => _toastShown.delete(key), 60000);
   const c  = document.getElementById('toast-container');
   const el = document.createElement('div');
-  el.className = `toast ${type==='alert'?'alert-toast':''}`;
+  el.className = `toast ${type === 'alert' ? 'alert-toast' : ''}`;
   el.textContent = msg;
   c.appendChild(el);
   setTimeout(() => el.remove(), 6000);
 }
 
-// ── Helpers ──────────────────────────────────────────────────
-function fmt(v) { return v == null ? '—' : parseFloat(v).toPrecision(6); }
-function fmtTime(iso) { if (!iso) return '—'; return String(iso).slice(0,16).replace('T',' '); }
+// ── Helpers ────────────────────────────────────────────────────
+function fmt(v) {
+  if (v == null) return '—';
+  const n = parseFloat(v);
+  if (isNaN(n)) return '—';
+  // Show up to 8 significant digits, strip trailing zeros
+  return n.toPrecision(6).replace(/\.?0+$/, '');
+}
+
+function fmtPnl(v) {
+  if (v == null) return '…';
+  const n = parseFloat(v);
+  if (isNaN(n)) return '—';
+  return (n >= 0 ? '+' : '') + '$' + Math.abs(n).toFixed(4);
+}
+
+function pnlColor(v) {
+  if (v == null) return '';
+  const n = parseFloat(v);
+  if (isNaN(n)) return '';
+  return n > 0 ? 'color:var(--green)' : n < 0 ? 'color:var(--red)' : '';
+}
+
+function fmtTime(iso) {
+  if (!iso) return '—';
+  return String(iso).slice(0, 16).replace('T', ' ');
+}
+
 function elapsed(iso) {
   const s = Math.floor((Date.now() - new Date(iso)) / 1000);
-  if (s < 60) return s + 's';
-  if (s < 3600) return Math.floor(s/60) + 'm';
-  return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+  if (s < 0)    return '0s';
+  if (s < 60)   return s + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm';
+  return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
 }
+
 function duration(open, close) {
   const s = Math.floor((new Date(close) - new Date(open)) / 1000);
-  if (s < 60) return s + 's';
-  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
+  if (s < 0)    return '—';
+  if (s < 60)   return s + 's';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
-// ── Init ─────────────────────────────────────────────────────
+// ── Init ───────────────────────────────────────────────────────
 connectWS();
 loadTrades();
+loadIgnored();
+loadLivePositions();
+
+// Refresh live positions every 15 seconds
+setInterval(loadLivePositions, 15000);
+// Refresh trade history every 30 seconds
 setInterval(loadTrades, 30000);
 
-// Live позиции — обновляем каждые 15 секунд
-// Функция плавного обновления данных без перерисовки всей карточки
-async function updateLivePositions() {
-    try {
-        const response = await fetch('/api/positions/live');
-        const positions = await response.json();
-
-        const container = document.getElementById('live-positions-container');
-
-        positions.forEach(p => {
-            let card = document.getElementById(`pos-card-${p.id}`);
-
-            // Если карточки еще нет — создаем её один раз
-            if (!card) {
-                container.insertAdjacentHTML('beforeend', createPositionTemplate(p));
-                return;
-            }
-
-            // Если есть — обновляем только цифры через querySelector
-            const uPnlElem = card.querySelector('.unrealized-pnl');
-            uPnlElem.innerText = `$${p.unrealized_pnl}`;
-            uPnlElem.style.color = p.unrealized_pnl >= 0 ? 'var(--green)' : 'var(--red)';
-
-            card.querySelector('.short-price').innerText = p.cur_short_price;
-            card.querySelector('.long-price').innerText = p.cur_long_price;
-            card.querySelector('.short-pnl').innerText = `$${p.short_unrealized}`;
-            card.querySelector('.long-pnl').innerText = `$${p.long_unrealized}`;
-
-            // Статус "Live"
-            card.querySelector('.status-badge').className = `status-badge ${p.short_on_exchange && p.long_on_exchange ? 'bg-success' : 'bg-danger'}`;
-        });
-
-        // Удаляем карточки тех позиций, которых больше нет в списке
-        Array.from(container.children).forEach(child => {
-            const id = child.id.replace('pos-card-', '');
-            if (!positions.find(p => p.id == id)) child.remove();
-        });
-
-    } catch (err) {
-        console.error("Update error:", err);
-    }
-}
-
-loadLivePositions();
-setInterval(loadLivePositions, 15000);
-
-// Загружаем начальное состояние
+// Initial load of stats + balances + bot status
 (async () => {
   try {
     const [statsR, balR, botR] = await Promise.all([
-      fetch(`${API}/api/stats`).then(r=>r.json()),
-      fetch(`${API}/api/balances`).then(r=>r.json()),
-      fetch(`${API}/api/bot/status`).then(r=>r.json()),
+      fetch(`${API}/api/stats`).then(r => r.json()),
+      fetch(`${API}/api/balances`).then(r => r.json()),
+      fetch(`${API}/api/bot/status`).then(r => r.json()),
     ]);
     renderStats(statsR);
     const bals = {};
-    Object.entries(balR).forEach(([ex, v]) => bals[ex] = v.display || 0);
+    Object.entries(balR).forEach(([ex, v]) => { bals[ex] = v.display || 0; });
     renderBalances(bals);
     updateBotButton(botR.running);
     updateDbPill(botR.db_ok);
     if (botR.error) showError('Ошибка бота: ' + botR.error);
-    // Live позиции загружаются отдельно
-    await loadLivePositions();
   } catch(e) { console.error(e); }
 })();
-// Загрузка и отрисовка черного списка
-async function loadIgnored() {
-  const r = await fetch(`${API}/api/ignored-symbols`);
-  const tickers = await r.json();
-  const container = document.getElementById('ignore-list');
-  container.innerHTML = tickers.map(t => `
-    <span class="badge badge-failed" style="display: flex; align-items: center; gap: 5px; cursor: pointer;" onclick="removeIgnored('${t}')">
-      ${t} <span style="font-size: 14px; line-height: 1;">×</span>
-    </span>
-  `).join('');
-}
-
-async function addIgnored() {
-  const input = document.getElementById('ignore-input');
-  const ticker = input.value.trim().upperCase();
-  if (!ticker) return;
-
-  const r = await fetch(`${API}/api/ignored-symbols/add?ticker=${ticker}`, {method: 'POST'});
-  if (r.ok) {
-    input.value = '';
-    loadIgnored();
-    showToast(`Тикер ${ticker} добавлен в черный список`);
-  }
-}
-
-async function removeIgnored(ticker) {
-  if (!confirm(`Удалить ${ticker} из черного списка?`)) return;
-  const r = await fetch(`${API}/api/ignored-symbols/remove?ticker=${ticker}`, {method: 'POST'});
-  if (r.ok) {
-    loadIgnored();
-    showToast(`Тикер ${ticker} удален из списка`);
-  }
-}
 </script>
 </body>
 </html>

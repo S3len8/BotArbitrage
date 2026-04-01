@@ -20,10 +20,6 @@ def _ms():  return int(time.time() * 1000)
 
 
 async def open_position(signal: OpenSignal, final_size_usd: float, signal_received_ms: int = None) -> tuple[Optional[Trade], str]:
-    """
-    signal_received_ms — время получения сигнала в ms (time.time()*1000).
-    Если не передан — замер начинается с момента вызова функции.
-    """
     t0 = signal_received_ms or _ms()
 
     short_ex = create_exchange(signal.short_exchange)
@@ -40,9 +36,6 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
 
     print(f"[Executor] OPEN {signal.ticker}: SHORT ${final_size_usd:.2f}@{signal.short_exchange} LONG ${final_size_usd:.2f}@{signal.long_exchange} lev={LEVERAGE}×")
 
-    # Открываем ноги ПОСЛЕДОВАТЕЛЬНО: сначала short, потом long.
-    # Если short упал — не открываем long совсем.
-    # Если long упал — сразу откатываем short.
     short_r: dict | Exception = Exception("not started")
     long_r:  dict | Exception = Exception("not started")
 
@@ -88,7 +81,6 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
 
     if not long_ok:
         print(f"[Executor] LONG ошибка {signal.long_exchange}: {long_r}")
-        # Сразу откатываем short
         try:
             await asyncio.wait_for(
                 short_ex.close_position(signal.symbol, 'buy', short_r['qty']),
@@ -117,7 +109,6 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
         trade.exec_time_long_ms  = exec_ms
         save_trade(trade)
 
-        # Логуємо ордери в канал ордерів
         asyncio.create_task(notify_order(
             signal.short_exchange, 'short', signal.symbol,
             short_r['price'], short_r['qty'], final_size_usd,
@@ -129,12 +120,11 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
             long_r['order_id'], f"↔️ Pair: <b>{signal.ticker}</b> | Trade #{trade.id}"
         ))
 
-        # Фактический спред по ценам исполнения
         actual_spread = 0.0
         if trade.long_entry_price and trade.long_entry_price > 0:
             actual_spread = (trade.short_entry_price / trade.long_entry_price - 1) * 100
 
-        tv_url   = tradingview_url(signal.short_exchange, signal.long_exchange, signal.ticker)
+        tv_url    = tradingview_url(signal.short_exchange, signal.long_exchange, signal.ticker)
         short_url = exchange_url(signal.short_exchange, signal.ticker)
         long_url  = exchange_url(signal.long_exchange, signal.ticker)
         ex_buttons = []
@@ -160,18 +150,17 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
         msg = _build_msg()
         msg_id = await notify(msg, tv_url=tv_url, buttons=ex_buttons)
 
-        # Live-обновление спреда каждые 30 секунд пока позиция открыта
         async def _live_spread_updater():
             if not msg_id:
                 return
             from exchanges import create_exchange
-            for _ in range(20):  # максимум 20 обновлений = 10 минут
+            for _ in range(20):
                 await asyncio.sleep(30)
                 try:
                     from db import get_open_trade
                     open_t = get_open_trade(trade.id)
                     if not open_t or open_t.status != 'open':
-                        break  # позиция закрыта — прекращаем
+                        break
                     s_ex = create_exchange(signal.short_exchange)
                     l_ex = create_exchange(signal.long_exchange)
                     try:
@@ -214,20 +203,18 @@ async def close_position(close_signal: CloseSignal) -> tuple[Optional[Trade], st
 
     trade.closed_at = _now()
     if short_ok:
-        trade.short_close_price = short_c['price']
+        trade.short_close_price    = short_c['price']
         trade.short_close_order_id = short_c['order_id']
         trade.fee_short_usd = (trade.fee_short_usd or 0) + short_c.get('fee', 0)
-        # Логуємо закриття short
         asyncio.create_task(notify_order(
             trade.short_exchange, 'buy (close short)', trade.symbol,
             short_c['price'], trade.short_qty or 0, trade.trade_size_usd or 0,
             short_c['order_id'], f"🔒 CLOSE | Trade #{trade.id} <b>{trade.ticker}</b>"
         ))
     if long_ok:
-        trade.long_close_price = long_c['price']
+        trade.long_close_price    = long_c['price']
         trade.long_close_order_id = long_c['order_id']
         trade.fee_long_usd = (trade.fee_long_usd or 0) + long_c.get('fee', 0)
-        # Логуємо закриття long
         asyncio.create_task(notify_order(
             trade.long_exchange, 'sell (close long)', trade.symbol,
             long_c['price'], trade.long_qty or 0, trade.trade_size_usd or 0,
@@ -235,11 +222,8 @@ async def close_position(close_signal: CloseSignal) -> tuple[Optional[Trade], st
         ))
 
     trade.status = 'closed' if (short_ok and long_ok) else 'partial'
-
-    # 🔧 ИСПРАВЛЕНИЕ: Сразу сохраняем статус в БД чтобы бот видел что позиция закрыта
     update_trade(trade)
 
-    # Получаем реальный PnL с бирж (через 500мс после закрытия чтобы данные появились)
     await asyncio.sleep(0.5)
     real_short_pnl = None
     real_long_pnl  = None
@@ -260,31 +244,27 @@ async def close_position(close_signal: CloseSignal) -> tuple[Optional[Trade], st
     except Exception as e:
         print(f"[Executor] get_closed_pnl error: {e}")
 
-    # Если получили реальные данные с бирж — используем их
     fees = (trade.fee_short_usd or 0) + (trade.fee_long_usd or 0)
     if real_short_pnl is not None and real_long_pnl is not None:
         trade.short_pnl_usd = round(real_short_pnl, 6)
         trade.long_pnl_usd  = round(real_long_pnl, 6)
         trade.net_pnl_usd   = round(real_short_pnl + real_long_pnl - fees, 6)
     else:
-        # Fallback — считаем через нотиональную стоимость
         _calc_pnl(trade)
 
     update_trade(trade)
-
     await _snapshot_balances([trade.short_exchange, trade.long_exchange])
 
     pnl  = f"${trade.net_pnl_usd:+.4f}" if trade.net_pnl_usd is not None else "—"
-    fees = (trade.fee_short_usd or 0) + (trade.fee_long_usd or 0)
     dur_str = ""
     try:
         t1 = datetime.fromisoformat(str(trade.opened_at))
         t2 = datetime.fromisoformat(str(trade.closed_at))
         s  = int((t2 - t1).total_seconds())
         dur_str = f"{s//3600}ч {(s%3600)//60}м {s%60}с" if s >= 3600 else f"{s//60}м {s%60}с"
-    except Exception: pass
+    except Exception:
+        pass
 
-    # Фактический спред по ценам закрытия
     actual_close_spread = ""
     if trade.short_close_price and trade.long_close_price and trade.long_close_price > 0:
         cs = (trade.short_close_price / trade.long_close_price - 1) * 100
@@ -302,12 +282,11 @@ async def close_position(close_signal: CloseSignal) -> tuple[Optional[Trade], st
     if not (short_ok and long_ok):
         msg += f"\n⚠️ Требуется ручная проверка!"
 
-    # 🔧 ИСПРАВЛЕНИЕ: Очищаем историю фандинга для закрытой позиции
     try:
         from gui_server import _funding_history
         _funding_history.pop(trade.id, None)
     except Exception:
-        pass  # gui_server может быть не импортирован в тестах
+        pass
 
     await _close(short_ex, long_ex)
     return trade, msg
@@ -326,19 +305,9 @@ async def check_balance_alerts(exchanges: list[str], initial_balances: dict[str,
 
 
 def _calc_pnl(t: Trade):
-    """Считает PnL арбитражной позиции.
-
-    Формула через нотиональную стоимость:
-    SHORT PnL = size_usd * (entry_short / close_short - 1)
-    LONG  PnL = size_usd * (close_long  / entry_long  - 1)
-
-    Это корректно даже если qty на разных биржах отличается
-    (например Gate контракты vs Binance монеты).
-    """
     size = t.trade_size_usd or 0
     try:
         if t.short_entry_price and t.short_close_price and t.short_entry_price > 0:
-            # SHORT: зарабатываем когда цена падает
             short_return = t.short_entry_price / t.short_close_price - 1
             t.short_pnl_usd = round(size * short_return, 6)
         else:
@@ -348,7 +317,6 @@ def _calc_pnl(t: Trade):
 
     try:
         if t.long_entry_price and t.long_close_price and t.long_entry_price > 0:
-            # LONG: зарабатываем когда цена растёт
             long_return = t.long_close_price / t.long_entry_price - 1
             t.long_pnl_usd = round(size * long_return, 6)
         else:
@@ -366,29 +334,25 @@ async def _snapshot_balances(exchanges: list[str]):
     try:
         for ex, bal in (await get_all_balances(exchanges)).items():
             save_balance_snapshot(ex, bal)
-    except Exception as e: print(f"[snapshot] {e}")
+    except Exception as e:
+        print(f"[snapshot] {e}")
 
 
 async def _close(*exs):
     await asyncio.gather(*[e.close() for e in exs], return_exceptions=True)
 
 
-def _upnl(v): return f"${v:+.4f}" if v is not None else "—"
+def _upnl(v):
+    return f"${v:+.4f}" if v is not None else "—"
 
 
 # ── Фандинг-монитор ───────────────────────────────────────────
-# Проверяет каждые 60с: если diff фандинга > спред и идёт в убыток —
-# закрывает позицию за 5 минут до начисления.
-
 _funding_monitor_task: asyncio.Task | None = None
-
-# Кэш фандинга: {trade_id: {'sf': rate, 'lf': rate, 'interval': h, 'updated': ts}}
 _funding_cache: dict = {}
-FUNDING_CACHE_TTL = 20 * 60  # обновляем каждые 20 минут
+FUNDING_CACHE_TTL = 20 * 60
 
 
 async def start_funding_monitor():
-    """Запускает фоновый мониторинг фандинга для всех открытых позиций."""
     global _funding_monitor_task
     if _funding_monitor_task and not _funding_monitor_task.done():
         return
@@ -397,21 +361,8 @@ async def start_funding_monitor():
 
 
 async def _funding_monitor_loop():
-    """
-    Логика:
-    1. Каждые 60с проверяем открытые позиции
-    2. Каждые 20 минут обновляем фандинг с бирж
-    3. Считаем текущий спред (по ценам с бирж)
-    4. Считаем net_funding_per_period = сколько % платим/получаем за 1 период
-    5. Если фандинг в убыток:
-       - Считаем сколько периодов пройдёт пока фандинг "съест" спред
-       - Закрываем за 5 минут до того как накопленный фандинг >= текущего спреда
-    6. Всегда закрываем за 5 минут до начисления если общий убыток > спреда
-    """
     import time as _time
     from db import get_all_open_trades
-    from exchanges import create_exchange
-    from signal_parser import CloseSignal
 
     while True:
         await asyncio.sleep(60)
@@ -419,49 +370,34 @@ async def _funding_monitor_loop():
             trades = get_all_open_trades()
             if not trades:
                 continue
-
             for t in trades:
                 try:
-                    # Перевірка маржі (пріоритет над фандингом)
                     closed = await _check_margin_risk(t)
                     if not closed:
                         await _check_funding_for_trade(t)
                 except Exception as e:
                     print(f"[FundingMonitor] ошибка {t.ticker}: {e}")
-
         except Exception as e:
             print(f"[FundingMonitor] loop error: {e}")
 
 
-# Cooldown щоб не спамити попередженнями: {trade_id: timestamp}
 _margin_warn_cooldown: dict[int, float] = {}
-MARGIN_WARN_COOLDOWN_S = 120  # попередження не частіше ніж раз на 2 хвилини
+MARGIN_WARN_COOLDOWN_S = 120
 
-
-# В order_executor.py найти функцию _check_margin_risk и заменить её:
 
 async def _check_margin_risk(t) -> bool:
-    """Двоступенева перевірка ліквідації та маржинального ризику.
+    """Двуступенчатая проверка ликвидации и маржинального риска.
 
-        Ступінь 1 — ПОПЕРЕДЖЕННЯ (відстань до ліквідації ≤ 15%):
-            Відправляємо алерт в Telegram, але НЕ закриваємо.
-            Cooldown: не частіше ніж раз на 2 хвилини.
+    Ступень 1 — ПРЕДУПРЕЖДЕНИЕ (расстояние до ликвидации <= 15%):
+        Отправляем алерт в Telegram, НЕ закрываем.
 
-        Ступінь 2 — АВАРІЙНЕ ЗАКРИТТЯ (відстань до ліквідації ≤ 10%):
-            Негайно закриваємо обидві ноги + сповіщення.
+    Ступень 2 — АВАРИЙНОЕ ЗАКРЫТИЕ (расстояние до ликвидации <= 10%):
+        Немедленно закрываем обе ноги.
 
-        Також резервна перевірка через unrealized_pnl (якщо get_open_position
-        не повертає entry_price):
-            Якщо збиток однієї ноги >= MARGIN_RISK_PCT% від маржі → закриваємо.
-
-        Формула відстані до ліквідації (isolated margin, simplified):
-            SHORT liq ≈ entry_price × (1 + 1/leverage)
-            LONG  liq ≈ entry_price × (1 - 1/leverage)
-            distance% = |liq_price - current_price| / current_price × 100
+    Резервная проверка через unrealized_pnl:
+        Если убыток >= MARGIN_RISK_PCT% от маржи → закрываем.
     """
     import time as _time
-    from exchanges import create_exchange
-    from signal_parser import CloseSignal
 
     now = _time.time()
     try:
@@ -481,15 +417,15 @@ async def _check_margin_risk(t) -> bool:
         return False
 
     # --- ЛОГИКА САМОЛЕЧЕНИЯ ---
-    # Если на обеих биржах позиций нет, а в базе статус open/partial - закрываем в базе
-    if (s_pos is None or isinstance(s_pos, Exception)) and \
-            (l_pos is None or isinstance(l_pos, Exception)):
-        print(f"[MarginCheck] {t.ticker}: Позиции не найдены на биржах. Синхронизирую БД...")
+    # Если на обеих биржах позиций нет, а в базе статус open/partial — закрываем в базе
+    s_pos_missing = isinstance(s_pos, Exception) or s_pos is None
+    l_pos_missing = isinstance(l_pos, Exception) or l_pos is None
+    if s_pos_missing and l_pos_missing:
+        print(f"[MarginCheck] {t.ticker}: позиции не найдены на биржах. Синхронизирую БД...")
         t.status = 'closed'
         t.closed_at = datetime.now(timezone.utc).isoformat()
         update_trade(t)
         return True
-        # --------------------------
 
     s_price = float(s_price_r) if not isinstance(s_price_r, Exception) else None
     l_price = float(l_price_r) if not isinstance(l_price_r, Exception) else None
@@ -497,8 +433,7 @@ async def _check_margin_risk(t) -> bool:
     if not s_price or not l_price:
         return False
 
-    # ── Метод 1: відстань до ціни ліквідації ──────────────────
-    # Використовуємо entry_price з позиції (точніше) або з бази (fallback)
+    # ── Метод 1: расстояние до цены ликвидации ────────────────
     s_entry = None
     l_entry = None
     s_pnl   = None
@@ -518,22 +453,22 @@ async def _check_margin_risk(t) -> bool:
 
     lev = float(t.leverage or LEVERAGE)
 
-    # Розраховуємо теоретичні ціни ліквідації
-    # SHORT: ціна росте → збиток → ліквідація зверху
-    # LONG:  ціна падає → збиток → ліквідація знизу
     s_dist_pct = None
     l_dist_pct = None
 
     if s_entry and s_entry > 0 and lev > 0:
-        s_liq_price = s_entry * (1 + 1 / lev)   # SHORT: ліквідація вгорі
+        s_liq_price = s_entry * (1 + 1 / lev)
         s_dist_pct  = (s_liq_price - s_price) / s_price * 100
-        # Від'ємне = вже за межею (теоретично), мале позитивне = близько до ліквідації
 
     if l_entry and l_entry > 0 and lev > 0:
-        l_liq_price = l_entry * (1 - 1 / lev)   # LONG: ліквідація внизу
+        l_liq_price = l_entry * (1 - 1 / lev)
         l_dist_pct  = (l_price - l_liq_price) / l_price * 100
 
-    # Визначаємо найближчу до ліквідації сторону
+    # FIX: исправлен синтаксис print — убраны conditional expressions внутри f-string
+    s_dist_str = f"{s_dist_pct:.1f}%" if s_dist_pct is not None else "n/a"
+    l_dist_str = f"{l_dist_pct:.1f}%" if l_dist_pct is not None else "n/a"
+    print(f"[MarginCheck] {t.ticker}: short_dist={s_dist_str} long_dist={l_dist_str} (lev={lev:.0f}×)")
+
     dists = []
     if s_dist_pct is not None:
         dists.append(('SHORT', t.short_exchange, s_dist_pct, s_entry, s_price))
@@ -543,19 +478,17 @@ async def _check_margin_risk(t) -> bool:
     if dists:
         min_side, min_ex, min_dist, min_entry, min_price = min(dists, key=lambda x: x[2])
 
-        print(f"[MarginCheck] {t.ticker}: "
-              f"short dist={s_dist_pct:.1f}% " if s_dist_pct is not None else "",
-              f"long dist={l_dist_pct:.1f}% " if l_dist_pct is not None else "",
-              f"(lev={lev:.0f}×)")
-
-        # ── Ступінь 2: АВАРІЙНЕ ЗАКРИТТЯ ──
+        # ── Ступень 2: АВАРИЙНОЕ ЗАКРЫТИЕ ──
         if min_dist <= 10:
-            print(f"[MarginCheck] 🚨 {t.ticker}: {min_side} в {min_dist:.1f}% від ліквідації! АВАРІЙНЕ ЗАКРИТТЯ.")
+            print(f"[MarginCheck] 🚨 {t.ticker}: {min_side} в {min_dist:.1f}% от ликвидации! АВАРИЙНОЕ ЗАКРЫТИЕ.")
+            # FIX: строки для обеих бирж всегда присутствуют
+            s_dist_info = f"{s_dist_pct:.1f}%" if s_dist_pct is not None else "n/a"
+            l_dist_info = f"{l_dist_pct:.1f}%" if l_dist_pct is not None else "n/a"
             await notify(
                 f"🚨 <b>АВАРІЙНЕ ЗАКРИТТЯ: {t.ticker}</b>\n"
                 f"⚠️ {min_side} на {min_ex.upper()} в <b>{min_dist:.1f}%</b> від ліквідації\n"
                 f"📍 Ціна входу: ${min_entry:.6f} | Поточна: ${min_price:.6f}\n"
-                f"📊 SHORT dist: {s_dist_pct:.1f}% | LONG dist: {l_dist_pct:.1f}%\n"
+                f"📊 SHORT dist: {s_dist_info} | LONG dist: {l_dist_info}\n"
                 f"⚡ Закриваю обидві позиції негайно!"
             )
             cs = CloseSignal(ticker=t.ticker, raw_text="emergency_liq")
@@ -564,23 +497,24 @@ async def _check_margin_risk(t) -> bool:
             _funding_cache.pop(t.id, None)
             return True
 
-        # ── Ступінь 1: ПОПЕРЕДЖЕННЯ ──
+        # ── Ступень 1: ПРЕДУПРЕЖДЕНИЕ ──
         if min_dist <= 15:
             cooldown_key = t.id
             if now - _margin_warn_cooldown.get(cooldown_key, 0) > MARGIN_WARN_COOLDOWN_S:
                 _margin_warn_cooldown[cooldown_key] = now
                 print(f"[MarginCheck] ⚠️ {t.ticker}: {min_side} в {min_dist:.1f}% від ліквідації! Попередження.")
+                s_dist_info = f"{s_dist_pct:.1f}%" if s_dist_pct is not None else "n/a"
+                l_dist_info = f"{l_dist_pct:.1f}%" if l_dist_pct is not None else "n/a"
                 await notify(
                     f"⚠️ <b>УВАГА: {t.ticker}</b>\n"
                     f"{min_side} на {min_ex.upper()} в <b>{min_dist:.1f}%</b> від ліквідації\n"
                     f"📍 Ціна входу: ${min_entry:.6f} | Поточна: ${min_price:.6f}\n"
-                    f"📊 SHORT dist: {s_dist_pct:.1f}% | LONG dist: {l_dist_pct:.1f}%\n"
+                    f"📊 SHORT dist: {s_dist_info} | LONG dist: {l_dist_info}\n"
                     f"ℹ️ Позиції ще відкриті — стежу далі"
                 )
-            return False  # не закриваємо — тільки попереджаємо
+            return False
 
-    # ── Метод 2 (резервний): unrealized_pnl як % від маржі ────
-    # Спрацьовує якщо entry_price недоступний або lev=0
+    # ── Метод 2 (резервний): unrealized_pnl как % от маржи ────
     if s_pnl is not None and l_pnl is not None:
         margin_per_side = (t.trade_size_usd or 0) / lev if lev > 0 else 0
         if margin_per_side > 0:
@@ -614,10 +548,8 @@ async def _check_margin_risk(t) -> bool:
 
 async def _check_funding_for_trade(t):
     import time as _time
-    from exchanges import create_exchange
-    from signal_parser import CloseSignal
 
-    now = int(_time.time())
+    now   = int(_time.time())
     cache = _funding_cache.get(t.id, {})
 
     # Обновляем фандинг каждые 20 минут
@@ -638,22 +570,42 @@ async def _check_funding_for_trade(t):
         if not s_fund or not l_fund:
             return
 
-        # Интервал фандинга (берём наименьший из двух бирж)
         s_interval = s_fund.get('interval_hours', 8)
         l_interval = l_fund.get('interval_hours', 8)
         interval   = min(s_interval, l_interval)
 
         _funding_cache[t.id] = {
-            'sf':          s_fund.get('rate', 0),
-            'lf':          l_fund.get('rate', 0),
-            'interval':    interval,
-            'next_short':  s_fund.get('next_time', 0),
-            'next_long':   l_fund.get('next_time', 0),
-            'cur_short':   float(s_price) if not isinstance(s_price, Exception) else None,
-            'cur_long':    float(l_price) if not isinstance(l_price, Exception) else None,
-            'updated':     now,
+            'sf':         s_fund.get('rate', 0),
+            'lf':         l_fund.get('rate', 0),
+            'interval':   interval,
+            'next_short': s_fund.get('next_time', 0),
+            'next_long':  l_fund.get('next_time', 0),
+            'cur_short':  float(s_price) if not isinstance(s_price, Exception) else None,
+            'cur_long':   float(l_price) if not isinstance(l_price, Exception) else None,
+            'updated':    now,
         }
         cache = _funding_cache[t.id]
+
+        # Сохраняем историю фандинга для GUI
+        try:
+            from gui_server import _funding_history, MAX_FUNDING_HISTORY
+            hist = _funding_history.setdefault(t.id, [])
+            hist.append({
+                'time':       datetime.now(timezone.utc).isoformat(),
+                'sf':         cache['sf'],
+                'lf':         cache['lf'],
+                'interval_s': s_interval,
+                'interval_l': l_interval,
+                'next_s':     cache['next_short'],
+                'next_l':     cache['next_long'],
+                'short_ex':   t.short_exchange,
+                'long_ex':    t.long_exchange,
+            })
+            if len(hist) > MAX_FUNDING_HISTORY:
+                hist[:] = hist[-MAX_FUNDING_HISTORY:]
+        except Exception:
+            pass
+
         print(f"[FundingMonitor] {t.ticker}: обновлён фандинг "
               f"short={cache['sf']*100:+.3f}% long={cache['lf']*100:+.3f}% "
               f"интервал={interval}ч")
@@ -664,45 +616,31 @@ async def _check_funding_for_trade(t):
     sp       = cache.get('cur_short')
     lp       = cache.get('cur_long')
 
-    # Текущий спред по ценам с бирж
     if sp and lp and lp > 0:
         current_spread_pct = (sp / lp - 1) * 100
     else:
         current_spread_pct = t.signal_spread_pct or 0
 
-    # Спред по ценам входа (реальный потенциал прибыли)
     if t.short_entry_price and t.long_entry_price and t.long_entry_price > 0:
         entry_spread_pct = (t.short_entry_price / t.long_entry_price - 1) * 100
     else:
         entry_spread_pct = t.signal_spread_pct or 0
 
-    # Net фандинг за 1 период:
-    # SHORT позиция: если sf_rate > 0 — платим, если < 0 — получаем
-    # LONG позиция:  если lf_rate < 0 — платим, если > 0 — получаем
-    # Итого за период (в % от позиции):
     net_fund_per_period = -(sf_rate * 100) - (lf_rate * 100)
-    # net_fund_per_period > 0 = получаем фандинг (хорошо)
-    # net_fund_per_period < 0 = платим фандинг (плохо)
 
-    # Время до следующего начисления
     next_short = cache.get('next_short', 0)
     next_long  = cache.get('next_long', 0)
-    next_times = [t for t in [next_short, next_long] if t > 0]
+    next_times = [x for x in [next_short, next_long] if x > 0]
     next_fund  = min(next_times) if next_times else 0
     minutes_until = (next_fund - now) / 60 if next_fund > now else 999
 
-    # Время в позиции
-    from datetime import datetime, timezone
     try:
         opened = datetime.fromisoformat(str(t.opened_at).replace('Z', '+00:00'))
         hours_held = (datetime.now(timezone.utc) - opened).total_seconds() / 3600
     except Exception:
         hours_held = 0
 
-    # Сколько периодов уже прошло
-    periods_elapsed = hours_held / interval if interval > 0 else 0
-
-    # Накопленный фандинг с момента входа
+    periods_elapsed  = hours_held / interval if interval > 0 else 0
     accumulated_fund = net_fund_per_period * periods_elapsed
 
     print(f"[FundingMonitor] {t.ticker}: "
@@ -715,29 +653,22 @@ async def _check_funding_for_trade(t):
     close_reason = ""
 
     if net_fund_per_period < 0:
-        # Фандинг идёт в убыток — нужно следить
-
-        # Остаточная прибыль = entry_spread + накопленный фандинг
         remaining_profit = entry_spread_pct + accumulated_fund
 
-        # Через сколько периодов фандинг съест весь спред
         if net_fund_per_period < 0:
             periods_until_loss = entry_spread_pct / abs(net_fund_per_period)
             hours_until_loss   = periods_until_loss * interval
         else:
             hours_until_loss   = 9999
 
-        # Через сколько минут следующее начисление которое убьёт прибыль
-        next_period_fund = net_fund_per_period  # следующее начисление
-        after_next_profit = remaining_profit + next_period_fund
+        next_period_fund   = net_fund_per_period
+        after_next_profit  = remaining_profit + next_period_fund
 
         print(f"[FundingMonitor] {t.ticker}: "
               f"remaining_profit={remaining_profit:.3f}% "
               f"after_next={after_next_profit:.3f}% "
               f"hours_until_loss={hours_until_loss:.1f}ч")
 
-        # Закрываем за 5 минут до начисления если:
-        # 1. После следующего начисления прибыль станет отрицательной
         if after_next_profit < 0 and 0 < minutes_until <= 5:
             should_close = True
             close_reason = (
@@ -745,17 +676,12 @@ async def _check_funding_for_trade(t):
                 f"Entry спред: {entry_spread_pct:.2f}% | Накоплено: {accumulated_fund:+.3f}%\n"
                 f"Net фандинг/период: {net_fund_per_period:+.3f}%"
             )
-
-        # 2. Накопленный фандинг уже съел >80% спреда и фандинг ещё идёт в минус
         elif accumulated_fund < -(entry_spread_pct * 0.8):
             should_close = True
             close_reason = (
                 f"Фандинг съел {abs(accumulated_fund):.3f}% из {entry_spread_pct:.2f}% спреда\n"
                 f"Осталось: {remaining_profit:.3f}%"
             )
-
-        # 3. Логика из примера: фандинг -1%/ч, спред 3% → ждём 2ч и закрываем
-        # Если прошло >= расчётного времени удержания (спред / |fund_rate| периодов)
         elif hours_held >= hours_until_loss * 0.9 and 0 < minutes_until <= 5:
             should_close = True
             close_reason = (
@@ -773,5 +699,4 @@ async def _check_funding_for_trade(t):
         cs = CloseSignal(ticker=t.ticker, raw_text="auto_close")
         _, msg = await close_position(cs)
         await notify(msg)
-        # Убираем из кэша
         _funding_cache.pop(t.id, None)

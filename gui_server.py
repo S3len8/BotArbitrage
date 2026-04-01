@@ -561,12 +561,14 @@ async def root():
 
 # ── Helper ────────────────────────────────────────────────────
 
+# Оновлена функція мапінгу (gui_server.py)
 def _t(t) -> dict:
     return {
         "id": t.id, "ticker": t.ticker, "symbol": t.symbol,
         "short_exchange": t.short_exchange, "long_exchange": t.long_exchange,
         "trade_size_usd": t.trade_size_usd,
         "short_entry_price": t.short_entry_price, "long_entry_price": t.long_entry_price,
+        "short_qty": t.short_qty, "long_qty": t.long_qty, # ДОДАНО
         "short_close_price": t.short_close_price, "long_close_price": t.long_close_price,
         "short_pnl_usd": t.short_pnl_usd, "long_pnl_usd": t.long_pnl_usd,
         "net_pnl_usd": t.net_pnl_usd,
@@ -579,6 +581,7 @@ def _t(t) -> dict:
         "exec_time_short_ms": t.exec_time_short_ms,
         "exec_time_long_ms":  t.exec_time_long_ms,
     }
+
 
 
 # Добавьте новые эндпоинты:

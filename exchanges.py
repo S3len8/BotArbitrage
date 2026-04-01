@@ -1424,18 +1424,45 @@ class GateExchange(CcxtExchange):
         self._api_secret = keys['api_secret']
 
     async def _set_margin_and_leverage(self, symbol: str, leverage: int):
-        """Исправленная настройка плеча и режима маржи через ccxt клиент."""
-        try:
-            ticker = _gate_ticker(symbol)
-            # В CCXT для Gate используется метод set_leverage
-            # Он автоматически пытается выставить и режим маржи, если это поддерживается
-            await self._client.set_leverage(leverage, ticker, {'marginMode': 'isolated'})
-            print(f"[{self.name}] {ticker}: Плечо {leverage}x и Isolated режим применены.")
-        except Exception as e:
-            if "not modified" in str(e).lower():
-                pass
-            else:
-                print(f"[{self.name}] Предупреждение при настройке {symbol}: {e}")
+        """
+        Прямой REST-запрос к Gate.io для установки плеча и ИЗОЛИРОВАННОЙ маржи.
+        Параметр cross_leverage_limit=0 ПРИНУДИТЕЛЬНО включает Isolated mode.
+        """
+        import hashlib as hl
+        ticker = _gate_ticker(symbol)
+
+        def _sync_set():
+            ts = str(int(time.time()))
+            method = 'POST'
+            # Endpoint для изменения позиции
+            path = f'/api/v4/futures/usdt/positions/{ticker}/leverage'
+            # leverage=5 и cross_leverage_limit=0 (это включает Изолированную маржу)
+            query = f'leverage={leverage}&cross_leverage_limit=0'
+
+            body_hash = hl.sha512(b'').hexdigest()
+            sign_str = '\n'.join([method, path, query, body_hash, ts])
+            signature = hmac.new(self._api_secret.encode(), sign_str.encode(), hl.sha512).hexdigest()
+
+            url = f'https://api.gateio.ws{path}?{query}'
+
+            headers = {
+                'KEY': self._api_key,
+                'SIGN': signature,
+                'Timestamp': ts,
+                'Content-Type': 'application/json'
+            }
+
+            try:
+                r = requests.post(url, headers=headers, timeout=10)
+                if r.ok:
+                    print(f"[gate] {ticker}: Успешно установлено плечо {leverage}x и Изолированная маржа.")
+                else:
+                    # Если позиция уже открыта, Gate может вернуть ошибку - это нормально
+                    print(f"[gate] {ticker} настройка: {r.status_code} {r.text}")
+            except Exception as e:
+                print(f"[gate] Ошибка при настройке {ticker}: {e}")
+
+        await _run_sync(_sync_set)
 
     def _price_sync(self, symbol: str) -> float:
         ticker = _gate_ticker(symbol)
@@ -1446,8 +1473,6 @@ class GateExchange(CcxtExchange):
         if not items:
             raise ValueError(f"gate: no ticker data for {ticker}")
         price = items[0].get('lowest_ask') or items[0].get('last') or items[0].get('highest_bid')
-        if not price:
-            raise ValueError(f"gate: no price for {ticker}, data: {items[0]}")
         return float(price)
 
     def _balance_sync(self) -> float:
@@ -1455,43 +1480,19 @@ class GateExchange(CcxtExchange):
         ts = str(int(time.time()))
         method = 'GET'
         path = '/api/v4/futures/usdt/accounts'
-        body = ''
-        body_hash = hl.sha512(body.encode()).hexdigest()
+        body_hash = hl.sha512(b'').hexdigest()
         sign_str = '\n'.join([method, path, '', body_hash, ts])
         sig = hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha512).hexdigest()
         data = _req('GET', f'https://api.gateio.ws{path}',
-                    headers={
-                        'KEY': self._api_key,
-                        'SIGN': sig,
-                        'Timestamp': ts,
-                        'Content-Type': 'application/json',
-                    })
+                    headers={'KEY': self._api_key, 'SIGN': sig, 'Timestamp': ts, 'Content-Type': 'application/json'})
         return float(data.get('available') or data.get('total') or 0)
 
     async def get_futures_balance(self) -> float:
         return await _run_sync(self._balance_sync)
 
-    async def get_24h_volume(self, symbol: str) -> Optional[float]:
-        def _sync():
-            ticker = _gate_ticker(symbol)
-            r = requests.get(f'https://api.gateio.ws/api/v4/futures/usdt/tickers',
-                             params={'contract': ticker}, timeout=10)
-            r.raise_for_status()
-            items = r.json()
-            if items:
-                return float(items[0].get('volume_24h_quote') or items[0].get('volume_24h') or 0) or None
-            return None
-
-        return await _run_sync(_sync)
-
-    async def _setup_symbol(self, symbol: str):
-        """Подготовка тикера (формат Gate)."""
-        ticker = _gate_ticker(symbol)
-        print(f"[gate] {ticker}: Подготовка к сделке...")
-
     def _gate_order_sync(self, symbol: str, side: str, size_usd: float,
                          reduce_only: bool = False, price: float = None) -> dict:
-        """Размещает рыночный ордер Gate с исправленным расчетом объема."""
+        """Размещение ордера (вызывается строго после настройки маржи)"""
         import hashlib as hl
         import json as _json
 
@@ -1499,7 +1500,7 @@ class GateExchange(CcxtExchange):
         if price is None:
             price = self._price_sync(symbol)
 
-        # 1. Получаем параметры контракта
+        # 1. Получаем множитель контракта
         quanto_multiplier = 1.0
         order_size_min = 1
         try:
@@ -1508,33 +1509,16 @@ class GateExchange(CcxtExchange):
                 d = r.json()
                 quanto_multiplier = float(d.get('quanto_multiplier') or d.get('multiplier') or 1)
                 order_size_min = int(d.get('order_size_min') or 1)
-        except Exception as e:
-            print(f"[gate] ошибка параметров контракта: {e}")
+        except:
+            pass
 
-        # 2. РАСЧЕТ МИНИМАЛЬНОЙ СТОИМОСТИ 1 ЛОТА
-        one_lot_cost = price * quanto_multiplier * order_size_min
-
-        # 3. РАСЧЕТ QTY
+        # 2. Расчет количества (qty)
         qty_raw = size_usd / (price * quanto_multiplier)
         qty = round(qty_raw / order_size_min) * order_size_min
+        if not reduce_only and qty < order_size_min:
+            qty = order_size_min
 
-        # ПРОВЕРКИ
-        if not reduce_only:
-            # Если 1 лот стоит дороже чем наш лимит + 20%
-            if one_lot_cost > (size_usd * 1.2):
-                raise ValueError(
-                    f"КРИТИЧЕСКАЯ ОШИБКА ОБЪЕМА: На Gate минимальный лот ({order_size_min}) стоит ${one_lot_cost:.2f}, "
-                    f"а ваш лимит всего ${size_usd:.2f}. Сделка невозможна."
-                )
-
-            # Если после округления получилось 0 лотов, но 1 лот проходит по лимиту - берем 1 лот
-            if qty < order_size_min:
-                qty = order_size_min
-
-        # Итоговая стоимость
-        final_notional = qty * quanto_multiplier * price
-
-        # 4. Формирование запроса
+        # 3. Подготовка ордера
         ts = str(int(time.time()))
         method = 'POST'
         path = '/api/v4/futures/usdt/orders'
@@ -1556,17 +1540,12 @@ class GateExchange(CcxtExchange):
         signature = hmac.new(self._api_secret.encode(), sign_str.encode(), hl.sha512).hexdigest()
 
         headers = {
-            'KEY': self._api_key,
-            'SIGN': signature,
-            'Timestamp': ts,
-            'Content-Type': 'application/json',
+            'KEY': self._api_key, 'SIGN': signature, 'Timestamp': ts, 'Content-Type': 'application/json'
         }
 
         r = requests.post(f'https://api.gateio.ws{path}', headers=headers, data=payload_json, timeout=15)
-
         if not r.ok:
-            err = r.json()
-            raise ValueError(f"Gate API Error: {err.get('label')} - {err.get('message')}")
+            raise ValueError(f"Gate Order Error: {r.text}")
 
         res = r.json()
         return {
@@ -1577,12 +1556,23 @@ class GateExchange(CcxtExchange):
         }
 
     async def place_market_order(self, symbol: str, side: str, size_usd: float) -> dict:
+        """
+        ГЛАВНОЕ ИЗМЕНЕНИЕ:
+        Сначала ждем применения настроек Изолированной маржи и Плеча,
+        и только потом пускаем ордер в исполнение.
+        """
+        # 1. Устанавливаем Изолированную маржу и плечо
         await self._set_margin_and_leverage(symbol, leverage=LEVERAGE)
+
+        # 2. Небольшая пауза для обработки сервером Gate (опционально, но надежнее)
+        await asyncio.sleep(0.2)
+
+        # 3. Открываем саму сделку
         return await _run_sync(self._gate_order_sync, symbol, side, size_usd)
 
     async def close_position(self, symbol: str, side: str, qty: float) -> dict:
         price = await self.get_price(symbol)
-        # При закрытии шлем qty как есть (это количество контрактов)
+        # При закрытии настройки маржи менять не нужно
         return await _run_sync(self._gate_close_sync, symbol, side, int(qty), price)
 
     def _gate_close_sync(self, symbol: str, side: str, qty_contracts: int, price: float) -> dict:
@@ -1591,45 +1581,16 @@ class GateExchange(CcxtExchange):
         size = -qty_contracts if side == 'sell' else qty_contracts
         ts = str(int(time.time()))
         path = '/api/v4/futures/usdt/orders'
-        body_d = {
-            'contract': ticker,
-            'size': int(size),
-            'price': '0',
-            'tif': 'ioc',
-            'reduce_only': True,
-        }
-        body_ = _json.dumps(body_d)
-        body_hash = hl.sha512(body_.encode()).hexdigest()
+        body_d = {'contract': ticker, 'size': int(size), 'price': '0', 'tif': 'ioc', 'reduce_only': True}
+        body_hash = hl.sha512(_json.dumps(body_d).encode()).hexdigest()
         sign_str = '\n'.join(['POST', path, '', body_hash, ts])
         sig = hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha512).hexdigest()
         r = requests.post(f'https://api.gateio.ws{path}',
                           headers={'KEY': self._api_key, 'SIGN': sig, 'Timestamp': ts,
                                    'Content-Type': 'application/json'},
-                          data=body_, timeout=15)
-        r.raise_for_status()
+                          data=_json.dumps(body_d), timeout=15)
         d = r.json()
         return {'order_id': str(d.get('id', '')), 'price': float(d.get('fill_price') or price), 'fee': 0.0}
-
-    async def get_closed_pnl(self, symbol: str) -> Optional[float]:
-        import hashlib as hl
-        def _sync():
-            ticker = _gate_ticker(symbol)
-            ts = str(int(time.time()))
-            path_base = '/api/v4/futures/usdt/my_trades'
-            query = f'contract={ticker}&limit=10'
-            body_hash = hl.sha512(b'').hexdigest()
-            sign_str = '\n'.join(['GET', path_base, query, body_hash, ts])
-            sig = hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha512).hexdigest()
-            r = requests.get('https://api.gateio.ws' + path_base, params={'contract': ticker, 'limit': 10},
-                             headers={'KEY': self._api_key, 'SIGN': sig, 'Timestamp': ts}, timeout=10)
-            r.raise_for_status()
-            trades = r.json()
-            return sum(float(t.get('profit', 0) or 0) for t in trades)
-
-        try:
-            return await _run_sync(_sync)
-        except:
-            return None
 
     async def get_funding_rate(self, symbol: str) -> Optional[dict]:
         def _sync():
