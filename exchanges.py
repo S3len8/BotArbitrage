@@ -1533,29 +1533,19 @@ class GateExchange(CcxtExchange):
     def __init__(self):
         super().__init__('gate', {'options': {'defaultType': 'future'}})
         keys = get_exchange_keys('gate')
-        self._api_key    = keys['api_key']
+        self._api_key = keys['api_key']
         self._api_secret = keys['api_secret']
 
     async def _set_margin_and_leverage(self, symbol: str, leverage: int):
-        """Настройка плеча и режима маржи (Isolated) перед открытием."""
+        """Исправленная настройка плеча и режима маржи через ccxt клиент."""
         try:
-            # Gate.io требует, чтобы символ был в формате "PTB_USDT"
-            # 1. Устанавливаем плечо
-            await asyncio.to_thread(
-                self.api.update_position_leverage,
-                symbol=symbol,
-                leverage=str(leverage)
-            )
-            # 2. Устанавливаем режим маржи (0 = Изолированная)
-            await asyncio.to_thread(
-                self.api.update_position_margin,
-                symbol=symbol,
-                change="0"
-            )
-            print(f"[{self.name}] {symbol}: Настройки маржи/плеча ({leverage}x) применены.")
+            ticker = _gate_ticker(symbol)
+            # В CCXT для Gate используется метод set_leverage
+            # Он автоматически пытается выставить и режим маржи, если это поддерживается
+            await self._client.set_leverage(leverage, ticker, {'marginMode': 'isolated'})
+            print(f"[{self.name}] {ticker}: Плечо {leverage}x и Isolated режим применены.")
         except Exception as e:
-            # Если позиция уже открыта или настройки такие же, Gate выдаст ошибку - игнорируем её
-            if "not modified" in str(e).lower() or "position exists" in str(e).lower():
+            if "not modified" in str(e).lower():
                 pass
             else:
                 print(f"[{self.name}] Предупреждение при настройке {symbol}: {e}")
@@ -1575,17 +1565,17 @@ class GateExchange(CcxtExchange):
 
     def _balance_sync(self) -> float:
         import hashlib as hl
-        ts     = str(int(time.time()))
+        ts = str(int(time.time()))
         method = 'GET'
-        path   = '/api/v4/futures/usdt/accounts'
-        body   = ''
+        path = '/api/v4/futures/usdt/accounts'
+        body = ''
         body_hash = hl.sha512(body.encode()).hexdigest()
-        sign_str  = '\n'.join([method, path, '', body_hash, ts])
+        sign_str = '\n'.join([method, path, '', body_hash, ts])
         sig = hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha512).hexdigest()
         data = _req('GET', f'https://api.gateio.ws{path}',
                     headers={
-                        'KEY':       self._api_key,
-                        'SIGN':      sig,
+                        'KEY': self._api_key,
+                        'SIGN': sig,
                         'Timestamp': ts,
                         'Content-Type': 'application/json',
                     })
@@ -1604,65 +1594,19 @@ class GateExchange(CcxtExchange):
             if items:
                 return float(items[0].get('volume_24h_quote') or items[0].get('volume_24h') or 0) or None
             return None
+
         return await _run_sync(_sync)
 
     async def _setup_symbol(self, symbol: str):
-        """Gate.io Futures: leverage + isolated через query string (як gate-api SDK).
-
-        gate-api SDK робить:
-          POST /futures/usdt/positions/{contract}/leverage?leverage=5&cross_leverage_limit=0
-        Підпис будується по query string, НЕ по тілу — саме так працює офіційний SDK.
-        cross_leverage_limit=0 означає isolated mode.
-        """
-        import hashlib as hl
+        """Подготовка тикера (формат Gate)."""
         ticker = _gate_ticker(symbol)
-
-        def _sign_qs(method: str, path: str, query_str: str) -> tuple:
-            ts        = str(int(time.time()))
-            body_hash = hl.sha512(b'').hexdigest()
-            sign_str  = '\n'.join([method, path, query_str, body_hash, ts])
-            sig = hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha512).hexdigest()
-            return ts, sig
-
-        def _sync():
-            lev_path  = f'/api/v4/futures/usdt/positions/{ticker}/leverage'
-            query_str = f'leverage={LEVERAGE}&cross_leverage_limit=0'
-            ts, sig   = _sign_qs('POST', lev_path, query_str)
-            full_url  = f'https://api.gateio.ws{lev_path}?{query_str}'
-            try:
-                r = requests.post(full_url,
-                    headers={'KEY': self._api_key, 'SIGN': sig, 'Timestamp': ts,
-                             'Content-Type': 'application/json', 'Accept': 'application/json'},
-                    timeout=10)
-                if r.ok:
-                    d   = r.json()
-                    lev = d.get('leverage') if isinstance(d, dict) else '?'
-                    cl  = d.get('cross_leverage_limit') if isinstance(d, dict) else '?'
-                    print(f"[gate] {ticker}: leverage={lev} cross_lev={cl} ✅")
-                else:
-                    # Fallback: тільки leverage без cross_leverage_limit
-                    qs2    = f'leverage={LEVERAGE}'
-                    ts2, sig2 = _sign_qs('POST', lev_path, qs2)
-                    r2 = requests.post(f'https://api.gateio.ws{lev_path}?{qs2}',
-                        headers={'KEY': self._api_key, 'SIGN': sig2, 'Timestamp': ts2,
-                                 'Content-Type': 'application/json'},
-                        timeout=10)
-                    if r2.ok:
-                        print(f"[gate] {ticker}: leverage={LEVERAGE} (fallback) ✅")
-                    else:
-                        print(f"[gate] leverage warn: {r.status_code} {r.text[:120]}")
-            except Exception as e:
-                print(f"[gate] leverage: {e}")
-
-        await _run_sync(_sync)
-        print(f"[gate] {ticker}: {LEVERAGE}× isolated (query string)")
+        print(f"[gate] {ticker}: Подготовка к сделке...")
 
     def _gate_order_sync(self, symbol: str, side: str, size_usd: float,
                          reduce_only: bool = False, price: float = None) -> dict:
-        """Размещает рыночный ордер Gate через прямой REST с защитой от Multiplier."""
+        """Размещает рыночный ордер Gate с исправленным расчетом объема."""
         import hashlib as hl
         import json as _json
-        import hmac  # Добавлен импорт, если его нет выше
 
         ticker = _gate_ticker(symbol)
         if price is None:
@@ -1677,55 +1621,31 @@ class GateExchange(CcxtExchange):
                 d = r.json()
                 quanto_multiplier = float(d.get('quanto_multiplier') or d.get('multiplier') or 1)
                 order_size_min = int(d.get('order_size_min') or 1)
-            else:
-                print(f"[gate] contract info {r.status_code} — используем multiplier=1")
         except Exception as e:
-            print(f"[gate] contract info error: {e} — используем multiplier=1")
+            print(f"[gate] ошибка параметров контракта: {e}")
 
-        # 2. Расчёт qty (КОРРЕКТИРОВКА)
-        # Сначала считаем, сколько контрактов нам "хотелось бы"
+        # 2. РАСЧЕТ МИНИМАЛЬНОЙ СТОИМОСТИ 1 ЛОТА
+        one_lot_cost = price * quanto_multiplier * order_size_min
+
+        # 3. РАСЧЕТ QTY
         qty_raw = size_usd / (price * quanto_multiplier)
-
-        # Округляем до ближайшего целого, кратного шагу
         qty = round(qty_raw / order_size_min) * order_size_min
 
-        # ПРЕДОХРАНИТЕЛЬ: Проверяем реальную стоимость того, что получилось
-        final_notional = qty * quanto_multiplier * price
-
-        # Если даже 1 контракт стоит слишком дорого (например, > 120% от лимита)
-        # или если после округления qty стал 0
-        if qty < order_size_min or final_notional > (size_usd * 1.2):
-            # Если это закрытие позиции (reduce_only), мы обязаны выполнить ордер,
-            # но для открытия (new position) — блокируем.
-            if not reduce_only:
-                raise ValueError(
-                    f"КРИТИЧЕСКАЯ ОШИБКА ОБЪЕМА: 1 лот на Gate стоит ${final_notional:.2f}, "
-                    f"что значительно больше лимита ${size_usd:.2f}. Сделка отменена."
-                )
-            else:
-                # При закрытии берем минимум 1, чтобы выйти из позиции
-                qty = max(order_size_min, qty)
-
-        # 3. Проверка баланса и плеча
-        effective_leverage = LEVERAGE
+        # ПРОВЕРКИ
         if not reduce_only:
-            try:
-                available = self._balance_sync()
-                max_margin = available * 0.95  # Используем 95% для запаса
+            # Если 1 лот стоит дороже чем наш лимит + 20%
+            if one_lot_cost > (size_usd * 1.2):
+                raise ValueError(
+                    f"КРИТИЧЕСКАЯ ОШИБКА ОБЪЕМА: На Gate минимальный лот ({order_size_min}) стоит ${one_lot_cost:.2f}, "
+                    f"а ваш лимит всего ${size_usd:.2f}. Сделка невозможна."
+                )
 
-                # Считаем требуемую маржу для ПОЛУЧЕННОГО qty
-                required_margin = final_notional / effective_leverage
+            # Если после округления получилось 0 лотов, но 1 лот проходит по лимиту - берем 1 лот
+            if qty < order_size_min:
+                qty = order_size_min
 
-                if required_margin > max_margin:
-                    # Пробуем увеличить плечо или уменьшить qty?
-                    # Безопаснее просто выдать ошибку, чтобы не заходить с плечом 100х случайно
-                    raise ValueError(f"Недостаточно маржи на Gate: надо ${required_margin:.2f}, есть ${max_margin:.2f}")
-            except ValueError:
-                raise
-            except Exception as e:
-                print(f"[gate] balance check failed: {e}")
-
-        print(f"[gate] {ticker} Итоговый qty={qty} (notional=${final_notional:.2f})")
+        # Итоговая стоимость
+        final_notional = qty * quanto_multiplier * price
 
         # 4. Формирование запроса
         ts = str(int(time.time()))
@@ -1735,47 +1655,31 @@ class GateExchange(CcxtExchange):
 
         body_d = {
             'contract': ticker,
-            'size': size,
+            'size': int(size),
             'price': '0',
             'tif': 'ioc',
-            'text': 't-arb',
-            'leverage': str(effective_leverage),
+            'text': 't-arb'
         }
         if reduce_only:
             body_d['reduce_only'] = True
-            body_d.pop('leverage', None)
 
-        # Вспомогательная функция подписи (внутри для чистоты)
-        def _do_request(payload_dict):
-            payload_json = _json.dumps(payload_dict)
-            payload_hash = hl.sha512(payload_json.encode()).hexdigest()
-            # Исправлено: используйте self._api_secret, который передается в класс
-            sign_str = '\n'.join([method, path, '', payload_hash, ts])
-            signature = hmac.new(self._api_secret.encode(), sign_str.encode(), hl.sha512).hexdigest()
+        payload_json = _json.dumps(body_d)
+        payload_hash = hl.sha512(payload_json.encode()).hexdigest()
+        sign_str = '\n'.join([method, path, '', payload_hash, ts])
+        signature = hmac.new(self._api_secret.encode(), sign_str.encode(), hl.sha512).hexdigest()
 
-            headers = {
-                'KEY': self._api_key,
-                'SIGN': signature,
-                'Timestamp': ts,
-                'Content-Type': 'application/json',
-            }
-            return requests.post(f'https://api.gateio.ws{path}', headers=headers, data=payload_json, timeout=15)
+        headers = {
+            'KEY': self._api_key,
+            'SIGN': signature,
+            'Timestamp': ts,
+            'Content-Type': 'application/json',
+        }
 
-        r = _do_request(body_d)
+        r = requests.post(f'https://api.gateio.ws{path}', headers=headers, data=payload_json, timeout=15)
 
-        # 5. Обработка ответа
         if not r.ok:
-            err_data = r.json()
-            label = err_data.get('label')
-            msg = err_data.get('message')
-            # Если ошибка в плече (уже установлено другое на бирже вручную)
-            if label == 'INVALID_PARAM_VALUE' and 'leverage' in msg:
-                print("[gate] Ошибка плеча, пробуем отправить без параметра leverage...")
-                body_d.pop('leverage', None)
-                r = _do_request(body_d)
-
-            if not r.ok:
-                raise ValueError(f"Gate API Error: {label} - {msg}")
+            err = r.json()
+            raise ValueError(f"Gate API Error: {err.get('label')} - {err.get('message')}")
 
         res = r.json()
         return {
@@ -1786,129 +1690,75 @@ class GateExchange(CcxtExchange):
         }
 
     async def place_market_order(self, symbol: str, side: str, size_usd: float) -> dict:
-        # 1. Подготовка (базовая инфа о символе)
-        await self._setup_symbol(symbol)
-
-        # 2. ПРЕДУСТАНОВКА: Сначала режим маржи и плечо (ОЖИДАЕМ завершения)
-        # На Gate.io лучше сделать это синхронно или через await
         await self._set_margin_and_leverage(symbol, leverage=LEVERAGE)
-
-        # 3. ИСПОЛНЕНИЕ: Открываем ордер, когда уверены в настройках
-        result = await _run_sync(self._gate_order_sync, symbol, side, size_usd)
-
-        return result
-
-    async def _set_isolated_after_open(self, symbol: str):
-        """Переключает позицию на isolated mode после открытия."""
-        import hashlib as hl, json as _json
-        ticker = _gate_ticker(symbol)
-        await asyncio.sleep(0.5)
-
-        def _sync():
-            ts = str(int(time.time()))
-            path = f'/api/v4/futures/usdt/positions/{ticker}/leverage'
-            body = _json.dumps({'leverage': str(LEVERAGE), 'cross_leverage_limit': '0'})
-            body_hash = hl.sha512(body.encode()).hexdigest()
-            sign_str  = '\n'.join(['POST', path, '', body_hash, ts])
-            sig = hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha512).hexdigest()
-            try:
-                r = requests.post(f'https://api.gateio.ws{path}',
-                    headers={'KEY': self._api_key, 'SIGN': sig, 'Timestamp': ts,
-                             'Content-Type': 'application/json'},
-                    data=body, timeout=10)
-                d = r.json()
-                if isinstance(d, dict) and not d.get('label'):
-                    lev = d.get('leverage', '?')
-                    print(f"[gate] {ticker}: isolated mode set, leverage={lev}× ✅")
-                else:
-                    print(f"[gate] isolated warn: {d.get('label')} {d.get('message')}")
-            except Exception as e:
-                print(f"[gate] isolated set failed: {e}")
-
-        await _run_sync(_sync)
+        return await _run_sync(self._gate_order_sync, symbol, side, size_usd)
 
     async def close_position(self, symbol: str, side: str, qty: float) -> dict:
-        """Закрывает позицию. qty — количество контрактов (как вернулось при открытии)."""
         price = await self.get_price(symbol)
-        # При закрытии передаём qty напрямую как контракты — не пересчитываем через size_usd,
-        # так как _gate_order_sync снова поделил бы на price и quanto_multiplier.
+        # При закрытии шлем qty как есть (это количество контрактов)
         return await _run_sync(self._gate_close_sync, symbol, side, int(qty), price)
 
-    def _gate_close_sync(self, symbol: str, side: str,
-                         qty_contracts: int, price: float) -> dict:
-        """Закрывает позицию Gate: qty_contracts — точное количество контрактов."""
+    def _gate_close_sync(self, symbol: str, side: str, qty_contracts: int, price: float) -> dict:
         import hashlib as hl, json as _json
         ticker = _gate_ticker(symbol)
-        size   = -qty_contracts if side == 'sell' else qty_contracts
-        ts     = str(int(time.time()))
-        path   = '/api/v4/futures/usdt/orders'
+        size = -qty_contracts if side == 'sell' else qty_contracts
+        ts = str(int(time.time()))
+        path = '/api/v4/futures/usdt/orders'
         body_d = {
-            'contract':   ticker,
-            'size':       size,
-            'price':      '0',
-            'tif':        'ioc',
+            'contract': ticker,
+            'size': int(size),
+            'price': '0',
+            'tif': 'ioc',
             'reduce_only': True,
         }
-        body_     = _json.dumps(body_d)
+        body_ = _json.dumps(body_d)
         body_hash = hl.sha512(body_.encode()).hexdigest()
-        sign_str  = '\n'.join(['POST', path, '', body_hash, ts])
-        sig       = hmac.new(self._api_secret.encode(),
-                             sign_str.encode(), hashlib.sha512).hexdigest()
+        sign_str = '\n'.join(['POST', path, '', body_hash, ts])
+        sig = hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha512).hexdigest()
         r = requests.post(f'https://api.gateio.ws{path}',
                           headers={'KEY': self._api_key, 'SIGN': sig, 'Timestamp': ts,
                                    'Content-Type': 'application/json'},
                           data=body_, timeout=15)
-        if not r.ok:
-            err = r.json() if r.content else {}
-            raise ValueError(f"gate close {r.status_code}: "
-                             f"{err.get('label','')} — {err.get('message', r.text[:100])}")
+        r.raise_for_status()
         d = r.json()
-        if isinstance(d, dict) and d.get('label'):
-            raise ValueError(f"gate close error: {d.get('label')} — {d.get('message')}")
-        fill_price = float(d.get('fill_price') or price)
-        return {'order_id': str(d.get('id', '')), 'price': fill_price, 'fee': 0.0}
+        return {'order_id': str(d.get('id', '')), 'price': float(d.get('fill_price') or price), 'fee': 0.0}
 
     async def get_closed_pnl(self, symbol: str) -> Optional[float]:
-        """Получает реализованный PnL закрытой позиции с Gate."""
         import hashlib as hl
         def _sync():
             ticker = _gate_ticker(symbol)
             ts = str(int(time.time()))
-            path = f'/api/v4/futures/usdt/my_trades?contract={ticker}&limit=10'
-            body_hash = hl.sha512(b'').hexdigest()
-            sign_str = '\n'.join(['GET', path, '', body_hash, ts])
-            sig = hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha512).hexdigest()
-            # Убираем query string из пути для подписи, но передаём как params
             path_base = '/api/v4/futures/usdt/my_trades'
-            sign_str2 = '\n'.join(['GET', path_base, f'contract={ticker}&limit=10', body_hash, ts])
-            sig2 = hmac.new(self._api_secret.encode(), sign_str2.encode(), hashlib.sha512).hexdigest()
-            r = requests.get('https://api.gateio.ws' + path_base,
-                             params={'contract': ticker, 'limit': 10},
-                             headers={'KEY': self._api_key, 'SIGN': sig2, 'Timestamp': ts,
-                                      'Content-Type': 'application/json'}, timeout=10)
+            query = f'contract={ticker}&limit=10'
+            body_hash = hl.sha512(b'').hexdigest()
+            sign_str = '\n'.join(['GET', path_base, query, body_hash, ts])
+            sig = hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha512).hexdigest()
+            r = requests.get('https://api.gateio.ws' + path_base, params={'contract': ticker, 'limit': 10},
+                             headers={'KEY': self._api_key, 'SIGN': sig, 'Timestamp': ts}, timeout=10)
             r.raise_for_status()
             trades = r.json()
-            if not trades: return None
-            return sum(float(t.get('profit', 0) or 0) for t in trades[:10])
+            return sum(float(t.get('profit', 0) or 0) for t in trades)
+
         try:
             return await _run_sync(_sync)
-        except Exception:
+        except:
             return None
 
     async def get_funding_rate(self, symbol: str) -> Optional[dict]:
         def _sync():
             ticker = _gate_ticker(symbol)
-            r = requests.get('https://api.gateio.ws/api/v4/futures/usdt/contracts/' + ticker,
-                             timeout=10)
+            r = requests.get('https://api.gateio.ws/api/v4/futures/usdt/contracts/' + ticker, timeout=10)
             r.raise_for_status()
             d = r.json()
-            rate    = float(d.get('funding_rate') or 0)
-            next_ts = int(d.get('funding_next_apply', 0))
-            interval = int(d.get('funding_interval', 28800)) // 3600
-            return {'rate': rate, 'next_time': next_ts, 'interval_hours': interval}
+            return {
+                'rate': float(d.get('funding_rate', 0)),
+                'next_time': int(d.get('funding_next_apply', 0)),
+                'interval_hours': int(d.get('funding_interval', 28800)) // 3600
+            }
+
         try:
             return await _run_sync(_sync)
-        except Exception:
+        except:
             return None
 
     async def get_open_position(self, symbol: str) -> Optional[dict]:
@@ -1921,23 +1771,23 @@ class GateExchange(CcxtExchange):
             sign_str = '\n'.join(['GET', path, '', body_hash, ts])
             sig = hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha512).hexdigest()
             r = requests.get(f'https://api.gateio.ws{path}',
-                             headers={'KEY': self._api_key, 'SIGN': sig, 'Timestamp': ts,
-                                      'Content-Type': 'application/json'}, timeout=10)
+                             headers={'KEY': self._api_key, 'SIGN': sig, 'Timestamp': ts}, timeout=10)
             if r.status_code == 404: return None
             r.raise_for_status()
             d = r.json()
-            size = float(d.get('size', 0) or 0)
+            size = float(d.get('size', 0))
             if size == 0: return None
             return {
                 'size': abs(size),
                 'side': 'long' if size > 0 else 'short',
                 'entry_price': float(d.get('entry_price', 0)),
                 'unrealized_pnl': float(d.get('unrealised_pnl', 0)),
-                'leverage': int(float(d.get('leverage', LEVERAGE))),
+                'leverage': int(float(d.get('leverage', LEVERAGE)))
             }
+
         try:
             return await _run_sync(_sync)
-        except Exception:
+        except:
             return None
 
 
