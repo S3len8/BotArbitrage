@@ -117,6 +117,15 @@ def _funding_ok(signal) -> tuple[bool, str]:
     if both_negative and diff_pct < 1.0:
         return True, f"оба отриц. + diff<1% ✅ {info}"
 
+    # Условие Double Profit: на шорте фанд положительный (нам платят),
+    # на лонге отрицательный (нам тоже платят).
+    double_profit = fs > 0 and fl < 0
+
+    # ⭐ НОВОЕ УСЛОВИЕ: Double Profit (Обе биржи платят нам)
+    # Игнорируем любую разницу (diff), так как фандинг работает на нас с обеих сторон.
+    if double_profit:
+        return True, f"✅ DOUBLE PROFIT (нам платят обе биржи) | {info}"
+
     # Всё остальное — не берём
     return False, f"diff≥0.2% и не оба отриц. ❌ {info}"
 
