@@ -310,7 +310,43 @@ async def api_trades(limit: int = 500):
     if not _db_ok:
         return []
     from db import get_trade_history
-    return [_t(t) for t in get_trade_history(limit)]
+    from exchanges import create_exchange
+    import asyncio
+
+    trades = get_trade_history(limit)
+    if not trades:
+        return []
+
+    sem = asyncio.Semaphore(5)
+
+    async def enrich_trade(t):
+        item = _t(t)
+        if t.status in ('closed', 'partial'):
+            async with sem:
+                try:
+                    s_ex = create_exchange(t.short_exchange)
+                    l_ex = create_exchange(t.long_exchange)
+                    s_pnl, l_pnl = await asyncio.gather(
+                        s_ex.get_closed_pnl(t.symbol),
+                        l_ex.get_closed_pnl(t.symbol),
+                        return_exceptions=True,
+                    )
+                    await asyncio.gather(s_ex.close(), l_ex.close(), return_exceptions=True)
+
+                    if not isinstance(s_pnl, Exception) and s_pnl is not None:
+                        item['short_pnl_usd'] = round(float(s_pnl), 6)
+                    if not isinstance(l_pnl, Exception) and l_pnl is not None:
+                        item['long_pnl_usd'] = round(float(l_pnl), 6)
+
+                    fees = (t.fee_short_usd or 0) + (t.fee_long_usd or 0)
+                    if item['short_pnl_usd'] is not None and item['long_pnl_usd'] is not None:
+                        item['net_pnl_usd'] = round(item['short_pnl_usd'] + item['long_pnl_usd'] - fees, 6)
+                except Exception as e:
+                    print(f"[GUI] get_closed_pnl error for trade #{t.id}: {e}")
+        return item
+
+    tasks = [enrich_trade(t) for t in trades]
+    return await asyncio.gather(*tasks)
 
 
 @app.get("/api/trades/open")

@@ -322,6 +322,31 @@ class BinanceExchange(CcxtExchange):
         await _run_sync(_sync)
         print(f"[binance] {ticker}: ISOLATED, {LEVERAGE}×")
 
+    async def get_contract_info(self, symbol: str):
+        """Отримуємо дані про мінімальний крок лота та множник контракту Binance."""
+        ticker = symbol.replace('/', '').replace(':USDT', '')
+
+        def _sync_info():
+            r = requests.get('https://fapi.binance.com/fapi/v1/exchangeInfo', timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            for s in data.get('symbols', []):
+                if s['symbol'] == ticker:
+                    step = 0.001
+                    min_qty = 0.001
+                    for f in s.get('filters', []):
+                        if f['filterType'] == 'LOT_SIZE':
+                            step = float(f['stepSize'])
+                            min_qty = float(f['minQty'])
+                    return {
+                        'step': step,
+                        'multiplier': 1.0,
+                        'min_qty': min_qty,
+                    }
+            return {'step': 0.001, 'multiplier': 1.0, 'min_qty': 0.001}
+
+        return await _run_sync(_sync_info)
+
     def _binance_order_sync(self, symbol: str, side: str, size_usd: float,
                             reduce_only: bool = False, price: float = None) -> dict:
         """Размещает рыночный ордер Binance Futures через прямой REST."""
@@ -972,6 +997,35 @@ class MexcExchange(CcxtExchange):
             return {'order_id': str(d.get('data', '')), 'price': 0.0, 'fee': 0.0}
         return await _run_sync(_close_sync)
 
+    async def get_closed_pnl(self, symbol: str) -> Optional[float]:
+        """Получает реализованный PnL закрытой позиции с MEXC Futures."""
+        import json as _json
+        ticker = _mexc_ticker(symbol)
+
+        def _sync():
+            ts = str(_ts())
+            path = '/api/v1/private/position/list/history_positions'
+            params = {'symbol': ticker, 'page_num': 1, 'page_size': 10}
+            qs = '&'.join(f'{k}={v}' for k, v in params.items())
+            r = requests.get(f'https://contract.mexc.com{path}?{qs}',
+                             headers=self._mexc_headers(ts), timeout=10)
+            if not r.ok:
+                return None
+            data = r.json()
+            if not data.get('success') or not data.get('data', {}).get('resultList'):
+                return None
+            total_pnl = 0.0
+            for pos in data['data']['resultList']:
+                if pos.get('symbol') == ticker:
+                    pnl = float(pos.get('closeProfitLoss', 0) or 0)
+                    total_pnl += pnl
+            return total_pnl if total_pnl != 0 else None
+
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
+
 
 class BitgetExchange(BaseExchange):
     name = 'bitget'
@@ -1176,6 +1230,36 @@ class BitgetExchange(BaseExchange):
             return None
 
     def _fmt(self, symbol): return f"{symbol.replace('USDT','')}/USDT:USDT"
+
+    async def get_closed_pnl(self, symbol: str) -> Optional[float]:
+        """Получает реализованный PnL закрытой позиции с Bitget Futures."""
+        import base64
+        def _sync():
+            ticker = _bitget_ticker(symbol)
+            ts = str(_ts())
+            path = f'/api/v2/mix/position/history-position?productType=USDT-FUTURES&symbol={ticker}'
+            sign_str = ts + 'GET' + path
+            sig = base64.b64encode(
+                hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha256).digest()
+            ).decode()
+            r = requests.get(f'https://api.bitget.com{path}',
+                             headers={'ACCESS-KEY': self._api_key, 'ACCESS-SIGN': sig,
+                                      'ACCESS-TIMESTAMP': ts, 'ACCESS-PASSPHRASE': self._passphrase,
+                                      'Content-Type': 'application/json'}, timeout=10)
+            if not r.ok:
+                return None
+            data = r.json()
+            if data.get('code') != '00000' or not data.get('data', {}).get('list'):
+                return None
+            total_pnl = 0.0
+            for pos in data['data']['list']:
+                pnl = float(pos.get('netProfit', 0) or 0)
+                total_pnl += pnl
+            return total_pnl if total_pnl != 0 else None
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
 
 
 class KucoinExchange(BaseExchange):
@@ -1416,6 +1500,43 @@ class KucoinExchange(BaseExchange):
             return None
 
 
+    async def get_closed_pnl(self, symbol: str) -> Optional[float]:
+        """Получает реализованный PnL закрытой позиции с KuCoin Futures."""
+        import base64, json as _json
+        ticker = _kucoin_ticker(symbol)
+
+        def _sync():
+            ts = str(_ts())
+            method = 'GET'
+            path = f'/api/v1/fill-data?symbol={ticker}&startAt={int(_ts()) - 86400000}&endAt={_ts()}'
+            sign_str = ts + method + path
+            sig = base64.b64encode(
+                hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha256).digest()
+            ).decode()
+            pp_sig = base64.b64encode(
+                hmac.new(self._api_secret.encode(), self._passphrase.encode(), hashlib.sha256).digest()
+            ).decode()
+            r = requests.get(f'https://api-futures.kucoin.com{path}',
+                             headers={'KC-API-KEY': self._api_key, 'KC-API-SIGN': sig,
+                                      'KC-API-TIMESTAMP': ts, 'KC-API-PASSPHRASE': pp_sig,
+                                      'KC-API-KEY-VERSION': '2'}, timeout=10)
+            if not r.ok:
+                return None
+            data = r.json()
+            if data.get('code') not in ('200000', 200000) or not data.get('data'):
+                return None
+            total_pnl = 0.0
+            for fill in data['data']:
+                pnl = float(fill.get('realisedPnl', 0) or 0)
+                total_pnl += pnl
+            return total_pnl if total_pnl != 0 else None
+
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
+
+
 class GateExchange(CcxtExchange):
     def __init__(self):
         super().__init__('gate', {'options': {'defaultType': 'future'}})
@@ -1436,8 +1557,8 @@ class GateExchange(CcxtExchange):
             method = 'POST'
             # Ендпоінт для зміни плеча та режиму маржі
             path = f'/api/v4/futures/usdt/positions/{ticker}/leverage'
-            # cross_leverage_limit=0 вмикає режим ISOLATED
-            query = f'leverage={LEVERAGE}&cross_leverage_limit=0'
+            # Для ISOLATED margin передаємо тільки leverage
+            query = f'leverage={LEVERAGE}'
 
             # Підпис для Gate V4 POST запиту з Query String
             body_hash = hl.sha512(b'').hexdigest()
@@ -1474,7 +1595,8 @@ class GateExchange(CcxtExchange):
             d = r.json()
             return {
                 'step': float(d.get('order_size_min', 1)),
-                'multiplier': float(d.get('quanto_multiplier') or d.get('multiplier') or 1)
+                'multiplier': float(d.get('quanto_multiplier') or d.get('multiplier') or 1),
+                'min_qty': float(d.get('order_size_min', 1))
             }
 
         return await _run_sync(_sync_info)
@@ -1623,6 +1745,38 @@ class GateExchange(CcxtExchange):
         try:
             return await _run_sync(_sync)
         except:
+            return None
+
+    async def get_closed_pnl(self, symbol: str) -> Optional[float]:
+        """Получает реализованный PnL закрытой позиции с Gate.io Futures."""
+        import hashlib as hl
+        ticker = _gate_ticker(symbol)
+
+        def _sync():
+            ts = str(int(time.time()))
+            method = 'GET'
+            path = f'/api/v4/futures/usdt/my_trades'
+            # Gate API v4: /my_trades возвращает сделки, суммируем realised PnL
+            query = f'contract={ticker}&limit=20'
+            body_hash = hl.sha512(b'').hexdigest()
+            sign_str = '\n'.join([method, path, query, body_hash, ts])
+            sig = hmac.new(self._api_secret.encode(), sign_str.encode(), hl.sha512).hexdigest()
+            r = requests.get(f'https://api.gateio.ws{path}?{query}',
+                             headers={'KEY': self._api_key, 'SIGN': sig, 'Timestamp': ts}, timeout=10)
+            if not r.ok:
+                return None
+            trades = r.json()
+            if not trades:
+                return None
+            total_pnl = 0.0
+            for t in trades:
+                pnl = float(t.get('pnl', 0) or 0)
+                total_pnl += pnl
+            return total_pnl if total_pnl != 0 else None
+
+        try:
+            return await _run_sync(_sync)
+        except Exception:
             return None
 
 
