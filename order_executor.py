@@ -33,175 +33,200 @@ def _now(): return datetime.now(timezone.utc)
 def _ms():  return int(time.time() * 1000)
 
 
-async def open_position(signal: OpenSignal, final_size_usd: float, signal_received_ms: int = None) -> tuple[Optional[Trade], str]:
+async def open_position(signal: OpenSignal, final_size_usd: float, signal_received_ms: int = None) -> tuple[
+    Optional[Trade], str]:
     """
-    signal_received_ms — время получения сигнала в ms (time.time()*1000).
-    Если не передан — замер начинается с момента вызова функции.
+    Покращена функція відкриття:
+    1. Налаштування маржі.
+    2. Фінальна перевірка спреду (мінімум 3%).
+    3. Синхронізація кількості монет/контрактів.
+    4. Послідовне виконання ордерів.
     """
     t0 = signal_received_ms or _ms()
+    from settings import MIN_SPREAD_PCT
 
     short_ex = create_exchange(signal.short_exchange)
-    long_ex  = create_exchange(signal.long_exchange)
+    long_ex = create_exchange(signal.long_exchange)
 
-    trade = Trade(
-        ticker=signal.ticker, symbol=signal.symbol,
-        short_exchange=signal.short_exchange, long_exchange=signal.long_exchange,
-        trade_size_usd=final_size_usd, status='open', leverage=LEVERAGE,
-        opened_at=_now(),
-        funding_short=signal.funding_short, funding_long=signal.funding_long,
-        signal_spread_pct=signal.spread_pct, signal_text=signal.raw_text[:500],
-    )
-
-    print(f"[Executor] OPEN {signal.ticker}: SHORT ${final_size_usd:.2f}@{signal.short_exchange} LONG ${final_size_usd:.2f}@{signal.long_exchange} lev={LEVERAGE}×")
-
-    # Открываем ноги ПОСЛЕДОВАТЕЛЬНО: сначала short, потом long.
-    short_r: dict | Exception = Exception("not started")
-    long_r:  dict | Exception = Exception("not started")
-
-    # ── 1. Short ──
     try:
-        short_r = await asyncio.wait_for(
-            short_ex.place_market_order(signal.symbol, 'sell', final_size_usd),
-            timeout=20
+        # --- КРОК 1: НАЛАШТУВАННЯ БІРЖ (Маржа, Плечо) ---
+        # Це займає 1-2 секунди, за цей час ціна може піти
+        await asyncio.gather(
+            short_ex._setup_symbol(signal.symbol),
+            long_ex._setup_symbol(signal.symbol),
+            return_exceptions=True
         )
-    except asyncio.TimeoutError:
-        short_r = Exception(f"timeout 20с")
-    except Exception as e:
-        short_r = e
 
-    short_ok = not isinstance(short_r, Exception)
-
-    if not short_ok:
-        print(f"[Executor] SHORT ошибка {signal.short_exchange}: {short_r}")
-        trade.status = 'failed'
-        save_trade(trade)
-        msg = (f"❌ <b>{signal.ticker}</b>: Short не открылся ({signal.short_exchange.upper()})\n"
-               f"Long не открывался — откат не нужен\n"
-               f"Причина: {short_r}")
-        await _close(short_ex, long_ex)
-        await notify(msg)
-        return None, msg
-
-    # ── 2. Long ──
-    try:
-        long_r = await asyncio.wait_for(
-            long_ex.place_market_order(signal.symbol, 'buy', final_size_usd),
-            timeout=20
+        # --- КРОК 2: ФІНАЛЬНИЙ ГВАРД СПРЕДУ (ОСТАННЯ МИТЬ) ---
+        # Отримуємо ціни ПІСЛЯ налаштувань, прямо перед входом
+        s_p, l_p = await asyncio.gather(
+            short_ex.get_price(signal.symbol),
+            long_ex.get_price(signal.symbol)
         )
-    except asyncio.TimeoutError:
-        long_r = Exception(f"timeout 20с")
-    except Exception as e:
-        long_r = e
 
-    long_ok = not isinstance(long_r, Exception)
+        current_spread = (s_p / l_p - 1) * 100 if l_p > 0 else 0
+        print(f"[Guard] {signal.ticker}: Спред перед входом {current_spread:.2f}% (Потрібно: {MIN_SPREAD_PCT}%)")
 
-    t_after = _ms()
-    exec_ms = t_after - t0
+        if current_spread < MIN_SPREAD_PCT:
+            await asyncio.gather(short_ex.close(), long_ex.close())
+            msg = f"⛔ {signal.ticker} СКАСОВАНО: спред упав до {current_spread:.2f}% (мін {MIN_SPREAD_PCT}%)"
+            return None, msg
 
-    if not long_ok:
-        print(f"[Executor] LONG ошибка {signal.long_exchange}: {long_r}")
+        # --- КРОК 3: СИНХРОНІЗАЦІЯ ОБСЯГУ (ЛОТІВ) ---
+        # Отримуємо специфікації контрактів обох бірж
+        inf_s, inf_l = await asyncio.gather(
+            short_ex.get_contract_info(signal.symbol),
+            long_ex.get_contract_info(signal.symbol)
+        )
+
+        # Знаходимо спільні обмеження
+        common_step = max(inf_s.get('step', 1.0), inf_l.get('step', 1.0))
+        # Мінімальна кількість монет, яку вимагають біржі
+        min_required = max(inf_s.get('min_qty', 0.0), inf_l.get('min_qty', 0.0))
+
+        # Рахуємо бажану кількість монет для кожної сторони
+        qty_s_raw = final_size_usd / (s_p * inf_s.get('multiplier', 1.0))
+        qty_l_raw = final_size_usd / (l_p * inf_l.get('multiplier', 1.0))
+
+        # Вибираємо однакову кількість для обох бірж (меншу з двох, округлену до кроку)
+        final_qty = (min(qty_s_raw, qty_l_raw) // common_step) * common_step
+
+        # Перевірка на мінімальний лот
+        if final_qty < min_required:
+            # Якщо мінімальний лот коштує не набагато дорожче (до +20%), беремо його
+            if min_required * s_p <= (final_size_usd * 1.2):
+                final_qty = min_required
+                print(f"[Executor] {signal.ticker}: Обсяг збільшено до мін. лота {final_qty}")
+            else:
+                await asyncio.gather(short_ex.close(), long_ex.close())
+                msg = f"❌ {signal.ticker} СКАСОВАНО: мін. лот ${min_required * s_p:.2f} > ліміту ${final_size_usd}"
+                return None, msg
+
+        # Фактична сума в USD для ордерів (трохи зміниться через синхронізацію qty)
+        exec_size_s = final_qty * s_p * inf_s.get('multiplier', 1.0)
+        exec_size_l = final_qty * l_p * inf_l.get('multiplier', 1.0)
+
+        # --- КРОК 4: ВИКОНАННЯ ОРДЕРІВ ---
+        trade = Trade(
+            ticker=signal.ticker, symbol=signal.symbol,
+            short_exchange=signal.short_exchange, long_exchange=signal.long_exchange,
+            trade_size_usd=exec_size_s, status='open', leverage=LEVERAGE,
+            opened_at=_now(),
+            funding_short=signal.funding_short, funding_long=signal.funding_long,
+            signal_spread_pct=signal.spread_pct, signal_text=signal.raw_text[:500],
+        )
+
+        short_r: dict | Exception = Exception("not started")
+        long_r: dict | Exception = Exception("not started")
+
+        # 1. Short
         try:
-            await asyncio.wait_for(
-                short_ex.close_position(signal.symbol, 'buy', short_r['qty']),
-                timeout=15
+            short_r = await asyncio.wait_for(
+                short_ex.place_market_order(signal.symbol, 'sell', exec_size_s),
+                timeout=20
             )
-            rollback_status = "Short откатан ✅"
         except Exception as e:
-            rollback_status = f"Short откат ПРОВАЛИЛСЯ ⚠️: {e}"
-            print(f"[Executor] rollback short failed: {e}")
+            short_r = e
 
-        trade.status = 'failed'
-        save_trade(trade)
-        msg = (f"❌ <b>{signal.ticker}</b>: Long не открылся ({signal.long_exchange.upper()})\n"
-               f"{rollback_status}\n"
-               f"Причина: {long_r}")
-        await _close(short_ex, long_ex)
-        await notify(msg)
-        return None, msg
+        if isinstance(short_r, Exception):
+            trade.status = 'failed'
+            save_trade(trade)
+            msg = f"❌ {signal.ticker}: Short помилка ({signal.short_exchange}): {short_r}"
+            await asyncio.gather(short_ex.close(), long_ex.close())
+            await notify(msg)
+            return None, msg
 
-    if short_ok and long_ok:
-        trade.short_order_id    = short_r['order_id'];  trade.short_entry_price = short_r['price']
-        trade.short_qty         = short_r['qty'];        trade.fee_short_usd     = short_r.get('fee', 0)
-        trade.long_order_id     = long_r['order_id'];   trade.long_entry_price  = long_r['price']
-        trade.long_qty          = long_r['qty'];         trade.fee_long_usd      = long_r.get('fee', 0)
-        trade.exec_time_short_ms = exec_ms
-        trade.exec_time_long_ms  = exec_ms
-        save_trade(trade)
-
-        asyncio.create_task(notify_order(
-            signal.short_exchange, 'short', signal.symbol,
-            short_r['price'], short_r['qty'], final_size_usd,
-            short_r['order_id'], f"↔️ Pair: <b>{signal.ticker}</b> | Trade #{trade.id}"
-        ))
-        asyncio.create_task(notify_order(
-            signal.long_exchange, 'long', signal.symbol,
-            long_r['price'], long_r['qty'], final_size_usd,
-            long_r['order_id'], f"↔️ Pair: <b>{signal.ticker}</b> | Trade #{trade.id}"
-        ))
-
-        actual_spread = 0.0
-        if trade.long_entry_price and trade.long_entry_price > 0:
-            actual_spread = (trade.short_entry_price / trade.long_entry_price - 1) * 100
-
-        tv_url    = tradingview_url(signal.short_exchange, signal.long_exchange, signal.ticker)
-        short_url = exchange_url(signal.short_exchange, signal.ticker)
-        long_url  = exchange_url(signal.long_exchange, signal.ticker)
-        ex_buttons = []
-        if short_url:
-            ex_buttons.append({"text": f"📉 {signal.short_exchange.upper()}", "url": short_url})
-        if long_url:
-            ex_buttons.append({"text": f"📈 {signal.long_exchange.upper()}", "url": long_url})
-
-        def _build_msg(current_spread: float = None) -> str:
-            spread_line = f"📊 Спред сигнала: {signal.spread_pct:.2f}% | Фактический: {actual_spread:.2f}%"
-            if current_spread is not None:
-                spread_line += f"\n📡 Текущий спред: {current_spread:.2f}%"
-            return (
-                f"✅ <b>Открыто: {signal.ticker}</b>\n"
-                f"📉 SHORT {signal.short_exchange.upper()}: {trade.short_qty} @ ${trade.short_entry_price:.6f}\n"
-                f"📈 LONG  {signal.long_exchange.upper()}: {trade.long_qty} @ ${trade.long_entry_price:.6f}\n"
-                f"💵 Размер: ${final_size_usd:.2f} | Плечо: {LEVERAGE}×\n"
-                f"{spread_line}\n"
-                f"⚡ Исполнение: {exec_ms}мс от сигнала"
+        # 2. Long
+        try:
+            long_r = await asyncio.wait_for(
+                long_ex.place_market_order(signal.symbol, 'buy', exec_size_l),
+                timeout=20
             )
+        except Exception as e:
+            long_r = e
 
-        await _close(short_ex, long_ex)
-        msg = _build_msg()
-        msg_id = await notify(msg, tv_url=tv_url, buttons=ex_buttons)
+        t_after = _ms()
+        exec_ms = t_after - t0
 
+        # Якщо Long не відкрився - відкат Short
+        if isinstance(long_r, Exception):
+            try:
+                await short_ex.close_position(signal.symbol, 'buy', short_r['qty'])
+                rollback = "Short откатан ✅"
+            except Exception as re:
+                rollback = f"Short відкат ПРОВАЛИВСЯ ⚠️: {re}"
+
+            trade.status = 'failed'
+            save_trade(trade)
+            msg = f"❌ {signal.ticker}: Long помилка ({signal.long_exchange}): {long_r}\n{rollback}"
+            await asyncio.gather(short_ex.close(), long_ex.close())
+            await notify(msg)
+            return None, msg
+
+        # --- КРОК 5: ЗБЕРЕЖЕННЯ ТА ПОВІДОМЛЕННЯ ---
+        trade.short_order_id = short_r['order_id'];
+        trade.short_entry_price = short_r['price']
+        trade.short_qty = short_r['qty'];
+        trade.fee_short_usd = short_r.get('fee', 0)
+        trade.long_order_id = long_r['order_id'];
+        trade.long_entry_price = long_r['price']
+        trade.long_qty = long_r['qty'];
+        trade.fee_long_usd = long_r.get('fee', 0)
+        trade.exec_time_short_ms = exec_ms
+        trade.exec_time_long_ms = exec_ms
+        save_trade(trade)
+
+        # Логування в канал ордерів
+        for side, res, ex_name in [('short', short_r, signal.short_exchange), ('long', long_r, signal.long_exchange)]:
+            asyncio.create_task(notify_order(
+                ex_name, side, signal.symbol, res['price'], res['qty'],
+                (res['qty'] * res['price']), res['order_id'], f"↔️ Pair: {signal.ticker} | Trade #{trade.id}"
+            ))
+
+        actual_spread = (trade.short_entry_price / trade.long_entry_price - 1) * 100
+
+        tv_url = tradingview_url(signal.short_exchange, signal.long_exchange, signal.ticker)
+        short_url = exchange_url(signal.short_exchange, signal.ticker)
+        long_url = exchange_url(signal.long_exchange, signal.ticker)
+        ex_buttons = [{"text": f"📉 {signal.short_exchange.upper()}", "url": short_url},
+                      {"text": f"📈 {signal.long_exchange.upper()}", "url": long_url}]
+
+        def _build_msg(live_sp: float = None) -> str:
+            msg = (f"✅ <b>Відкрито: {signal.ticker}</b>\n"
+                   f"📉 SHORT {signal.short_exchange.upper()}: {trade.short_qty} @ ${trade.short_entry_price:.6f}\n"
+                   f"📈 LONG  {signal.long_exchange.upper()}: {trade.long_qty} @ ${trade.long_entry_price:.6f}\n"
+                   f"📊 Спред: {signal.spread_pct:.2f}% | Факт: {actual_spread:.2f}%")
+            if live_sp: msg += f"\n📡 Поточний: {live_sp:.2f}%"
+            msg += f"\n⚡ Виконання: {exec_ms}мс"
+            return msg
+
+        await asyncio.gather(short_ex.close(), long_ex.close())
+        msg_id = await notify(_build_msg(), tv_url=tv_url, buttons=ex_buttons)
+
+        # Live оновлення спреду
         async def _live_spread_updater():
-            if not msg_id:
-                return
-            from exchanges import create_exchange
-            for _ in range(20):
+            if not msg_id: return
+            for _ in range(10):
                 await asyncio.sleep(30)
                 try:
-                    from db import get_open_trade
-                    open_t = get_open_trade(trade.id)
-                    if not open_t or open_t.status != 'open':
-                        break
+                    from db import get_trade_by_id
+                    t_check = get_trade_by_id(trade.id)
+                    if not t_check or t_check.status != 'open': break
                     s_ex = create_exchange(signal.short_exchange)
                     l_ex = create_exchange(signal.long_exchange)
-                    try:
-                        sp, lp = await asyncio.gather(
-                            s_ex.get_price(signal.symbol),
-                            l_ex.get_price(signal.symbol),
-                        )
-                        cur_spread = (sp / lp - 1) * 100 if lp > 0 else 0
-                        updated_msg = _build_msg(cur_spread)
-                        await edit_notify(msg_id, updated_msg, tv_url=tv_url, buttons=ex_buttons)
-                    finally:
-                        await s_ex.close()
-                        await l_ex.close()
-                except Exception as e:
-                    print(f"[Executor] live spread error: {e}")
+                    sp, lp = await asyncio.gather(s_ex.get_price(signal.symbol), l_ex.get_price(signal.symbol))
+                    await asyncio.gather(s_ex.close(), l_ex.close())
+                    await edit_notify(msg_id, _build_msg((sp / lp - 1) * 100), tv_url=tv_url, buttons=ex_buttons)
+                except:
                     break
 
         asyncio.create_task(_live_spread_updater())
-        return trade, msg
+        return trade, _build_msg()
 
-    await _close(short_ex, long_ex)
-    return trade, msg
+    except Exception as e:
+        print(f"[Executor] Критична помилка: {e}")
+        await asyncio.gather(short_ex.close(), long_ex.close(), return_exceptions=True)
+        return None, str(e)
 
 
 async def close_position(close_signal: CloseSignal) -> tuple[Optional[Trade], str]:
