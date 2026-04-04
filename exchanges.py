@@ -855,6 +855,29 @@ class BybitExchange(BaseExchange):
         result['price'] = price
         return result
 
+    async def get_contract_info(self, symbol: str):
+        """Отримуємо дані про мінімальний крок лота та множник контракту Bybit."""
+        ticker = _bybit_ticker(symbol)
+
+        def _sync_info():
+            r = requests.get('https://api.bybit.com/v5/market/instruments-info',
+                             params={'category': 'linear', 'symbol': ticker}, timeout=10)
+            r.raise_for_status()
+            items = r.json().get('result', {}).get('list', [])
+            if not items:
+                return {'step': 0.001, 'multiplier': 1.0, 'min_qty': 0.001}
+            d = items[0]
+            lot_filter = d.get('lotSizeFilter', {})
+            step = float(lot_filter.get('qtyStep', 0.001))
+            min_qty = float(lot_filter.get('minOrderQty', 0.001))
+            return {
+                'step': step,
+                'multiplier': 1.0,
+                'min_qty': min_qty,
+            }
+
+        return await _run_sync(_sync_info)
+
 
 class MexcExchange(CcxtExchange):
     def __init__(self):
@@ -997,6 +1020,25 @@ class MexcExchange(CcxtExchange):
             return {'order_id': str(d.get('data', '')), 'price': 0.0, 'fee': 0.0}
         return await _run_sync(_close_sync)
 
+    async def get_contract_info(self, symbol: str):
+        """Отримуємо дані про мінімальний крок лота та множник контракту MEXC."""
+        ticker = _mexc_ticker(symbol)
+
+        def _sync_info():
+            r = requests.get('https://contract.mexc.com/api/v1/contract/detail',
+                             params={'symbol': ticker}, timeout=10)
+            r.raise_for_status()
+            data = r.json().get('data', {})
+            if not data:
+                return {'step': 1.0, 'multiplier': 1.0, 'min_qty': 1.0}
+            return {
+                'step': 1.0,
+                'multiplier': float(data.get('multiplier', 1) or 1),
+                'min_qty': 1.0,
+            }
+
+        return await _run_sync(_sync_info)
+
     async def get_closed_pnl(self, symbol: str) -> Optional[float]:
         """Получает реализованный PnL закрытой позиции с MEXC Futures."""
         import json as _json
@@ -1079,30 +1121,69 @@ class BitgetExchange(BaseExchange):
                 hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha256).digest()).decode()
             headers = {'ACCESS-KEY': self._api_key, 'ACCESS-SIGN': sig, 'ACCESS-TIMESTAMP': ts,
                        'ACCESS-PASSPHRASE': self._passphrase, 'Content-Type': 'application/json'}
-            return requests.post(f'https://api.bitget.com{path}', headers=headers, data=body_str, timeout=10)
+            r = requests.post(f'https://api.bitget.com{path}', headers=headers, data=body_str, timeout=10)
+            if not r.ok:
+                raise ValueError(f"bitget POST {path}: {r.status_code} {r.text}")
+            res = r.json()
+            if res.get('code') != '00000':
+                raise ValueError(f"bitget POST {path}: {res.get('msg')} ({res.get('code')})")
+            return res
+
+        def _do_bitget_get(path, params=None):
+            ts = str(_ts())
+            qs = '&'.join(f'{k}={v}' for k, v in (params or {}).items())
+            full_path = f'{path}?{qs}' if qs else path
+            sign_str = ts + 'GET' + full_path
+            sig = base64.b64encode(
+                hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha256).digest()).decode()
+            headers = {'ACCESS-KEY': self._api_key, 'ACCESS-SIGN': sig, 'ACCESS-TIMESTAMP': ts,
+                       'ACCESS-PASSPHRASE': self._passphrase, 'Content-Type': 'application/json'}
+            r = requests.get(f'https://api.bitget.com{full_path}', headers=headers, timeout=10)
+            if not r.ok:
+                raise ValueError(f"bitget GET {path}: {r.status_code} {r.text}")
+            return r.json()
 
         def _sync():
-            # 1. Переключаем на Режим Хеджирования (Hedge Mode) - исправляет ошибку 40774
+            # 1. Переключаем на Режим Хеджирования (Hedge Mode)
             try:
                 _do_bitget_post('/api/v2/mix/account/set-position-mode',
                                 {'productType': 'USDT-FUTURES', 'posMode': 'hedge_mode'})
-            except:
-                pass
+            except Exception as e:
+                print(f"[bitget] set-position-mode: {e}")
 
             # 2. Устанавливаем изолированную маржу
             try:
                 _do_bitget_post('/api/v2/mix/account/set-margin-mode',
                                 {'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginMode': 'isolated'})
-            except:
-                pass
+            except Exception as e:
+                print(f"[bitget] set-margin-mode: {e}")
 
-            # 3. Устанавливаем плечо
+            # 3. Устанавливаем плечо — ОБЯЗАТЕЛЬНО с проверкой
+            _do_bitget_post('/api/v2/mix/account/set-leverage',
+                            {'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginCoin': 'USDT',
+                             'leverage': str(LEVERAGE)})
+
+            # 4. Верификация: читаем текущее плечо из позиции
+            import time as _time
+            _time.sleep(0.3)
             try:
-                _do_bitget_post('/api/v2/mix/account/set-leverage',
-                                {'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginCoin': 'USDT',
-                                 'leverage': str(LEVERAGE)})
-            except:
-                pass
+                pos_data = _do_bitget_get('/api/v2/mix/position/single-position',
+                                          {'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginCoin': 'USDT'})
+                positions = pos_data.get('data', [])
+                if positions:
+                    actual_leverage = int(float(positions[0].get('leverage', 0)))
+                    if actual_leverage != LEVERAGE:
+                        raise ValueError(
+                            f"bitget leverage mismatch: wanted {LEVERAGE}x, got {actual_leverage}x for {ticker}. "
+                            f"Trade BLOCKED — check exchange settings manually."
+                        )
+                    print(f"[bitget] {ticker}: leverage verified ✅ {LEVERAGE}×")
+                else:
+                    print(f"[bitget] {ticker}: no open position yet, leverage set to {LEVERAGE}×")
+            except ValueError:
+                raise
+            except Exception as e:
+                print(f"[bitget] leverage verification skipped: {e}")
 
         await _run_sync(_sync)
 
@@ -1230,6 +1311,39 @@ class BitgetExchange(BaseExchange):
             return None
 
     def _fmt(self, symbol): return f"{symbol.replace('USDT','')}/USDT:USDT"
+
+    async def get_contract_info(self, symbol: str):
+        """Отримуємо дані про мінімальний крок лота та множник контракту Bitget."""
+        import base64
+        def _sync_info():
+            ticker = _bitget_ticker(symbol)
+            ts = str(_ts())
+            path = f'/api/v2/mix/market/contracts?productType=USDT-FUTURES&symbol={ticker}'
+            sign_str = ts + 'GET' + path
+            sig = base64.b64encode(
+                hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha256).digest()
+            ).decode()
+            r = requests.get(f'https://api.bitget.com{path}',
+                             headers={'ACCESS-KEY': self._api_key, 'ACCESS-SIGN': sig,
+                                      'ACCESS-TIMESTAMP': ts, 'ACCESS-PASSPHRASE': self._passphrase,
+                                      'Content-Type': 'application/json'}, timeout=10)
+            if not r.ok:
+                return {'step': 0.1, 'multiplier': 1.0, 'min_qty': 0.1}
+            data = r.json().get('data', [])
+            if not data:
+                return {'step': 0.1, 'multiplier': 1.0, 'min_qty': 0.1}
+            d = data[0] if isinstance(data, list) else data
+            step = float(d.get('volumePlace', 0.1) or 0.1)
+            min_qty = float(d.get('minTradeNum', 0.1) or 0.1)
+            return {
+                'step': step,
+                'multiplier': 1.0,
+                'min_qty': min_qty,
+            }
+        try:
+            return await _run_sync(_sync_info)
+        except Exception:
+            return {'step': 0.1, 'multiplier': 1.0, 'min_qty': 0.1}
 
     async def get_closed_pnl(self, symbol: str) -> Optional[float]:
         """Получает реализованный PnL закрытой позиции с Bitget Futures."""
@@ -1465,6 +1579,27 @@ class KucoinExchange(BaseExchange):
             return await _run_sync(_sync)
         except Exception:
             return None
+
+    async def get_contract_info(self, symbol: str):
+        """Отримуємо дані про мінімальний крок лота та множник контракту KuCoin."""
+        def _sync_info():
+            ticker = _kucoin_ticker(symbol)
+            r = requests.get('https://api-futures.kucoin.com/api/v1/contracts/active', timeout=10)
+            r.raise_for_status()
+            for item in (r.json().get('data') or []):
+                if item.get('symbol') == ticker:
+                    step = float(item.get('lotSize', 1) or 1)
+                    min_qty = step
+                    return {
+                        'step': step,
+                        'multiplier': float(item.get('multiplier', 1) or 1),
+                        'min_qty': min_qty,
+                    }
+            return {'step': 1.0, 'multiplier': 1.0, 'min_qty': 1.0}
+        try:
+            return await _run_sync(_sync_info)
+        except Exception:
+            return {'step': 1.0, 'multiplier': 1.0, 'min_qty': 1.0}
 
     async def get_open_position(self, symbol: str) -> Optional[dict]:
         import base64

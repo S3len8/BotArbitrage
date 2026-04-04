@@ -20,12 +20,13 @@ import time
 from telethon import TelegramClient, events
 from telethon.tl.functions.channels import GetFullChannelRequest
 
-from settings import TG_API_ID, TG_API_HASH, TG_SESSION, SIGNAL_CHANNEL
+from settings import TG_API_ID, TG_API_HASH, TG_SESSION, SIGNAL_CHANNEL, MIN_SPREAD_PCT
 from signal_parser import parse_message, parse_pinned, OpenSignal, CloseSignal
 from risk_manager import check_signal
 from order_executor import open_position, close_position, REENTRY_MIN_SPREAD_PCT
 from exchanges import create_exchange
 from notifier import notify, notify_mexc
+from signal_cache import add_signal, remove_signal, is_cached, start_signal_monitor, stop_signal_monitor, start_spread_monitor, stop_spread_monitor
 
 DEDUP_WINDOW_S = 120
 _seen: dict[str, float] = {}
@@ -334,6 +335,10 @@ class SignalListener:
 
         await self._load_pinned()
 
+        # Запускаем мониторы кэшированных сигналов и спреда позиций
+        await start_signal_monitor()
+        await start_spread_monitor()
+
         RECENT_MSG_SECONDS = 5 * 60
 
         @self.client.on(events.NewMessage(chats=SIGNAL_CHANNEL))
@@ -375,6 +380,9 @@ class SignalListener:
                 pending.task.cancel()
                 print(f"[Listener] Отменено ожидание фандинга для {ticker}")
         _pending_signals.clear()
+        # Останавливаем мониторы
+        await stop_signal_monitor()
+        await stop_spread_monitor()
         await notify("🔴 <b>Бот остановлен</b>")
         await self.client.disconnect()
 
@@ -441,6 +449,11 @@ class SignalListener:
             await self._open(signal, received_ms)
 
         elif isinstance(signal, CloseSignal):
+            # Если тикер в кэше — удаляем (спред сошёлся)
+            if is_cached(signal.ticker):
+                remove_signal(signal.ticker)
+                await notify(f"🗑 <b>{signal.ticker}</b>: сигнал удалён из кэша (спред сошёлся)")
+                print(f"[Listener] {signal.ticker} удалён из кэша по CLOSE сигналу")
             print(f"[Listener] CLOSE {signal.ticker}")
             await self._close(signal)
 
@@ -529,6 +542,52 @@ class SignalListener:
 
         if not risk:
             print(f"[Listener] Пропущен {signal.ticker}: {risk.reason}")
+
+            # Если причина — низкий спред, кэшируем сигнал для мониторинга
+            if 'спред' in risk.reason.lower() or 'spread' in risk.reason.lower():
+                if not is_cached(signal.ticker):
+                    # Получаем актуальные цены для кэширования
+                    try:
+                        s_price, l_price = await asyncio.gather(
+                            short_ex.get_price(signal.symbol),
+                            long_ex.get_price(signal.symbol),
+                            return_exceptions=True,
+                        )
+                        if not isinstance(s_price, Exception) and not isinstance(l_price, Exception):
+                            sp = float(s_price)
+                            lp = float(l_price)
+                            current_spread = (sp / lp - 1) * 100 if lp > 0 else 0
+
+                            # Обновляем цены в сигнале
+                            from signal_parser import OpenSignal as _OS
+                            cached_sig = _OS(
+                                ticker=signal.ticker,
+                                symbol=signal.symbol,
+                                short_exchange=signal.short_exchange,
+                                long_exchange=signal.long_exchange,
+                                short_price=sp,
+                                long_price=lp,
+                                spread_pct=current_spread,
+                                funding_short=signal.funding_short,
+                                funding_long=signal.funding_long,
+                                max_size_short=signal.max_size_short,
+                                max_size_long=signal.max_size_long,
+                                interval_short=signal.interval_short,
+                                interval_long=signal.interval_long,
+                                raw_text=signal.raw_text,
+                            )
+                            add_signal(cached_sig, current_spread)
+                            await notify(
+                                f"💤 <b>{signal.ticker}: спред недостаточен — ожидаю</b>\n"
+                                f"📊 Текущий спред: {current_spread:.2f}% (мин {MIN_SPREAD_PCT}%)\n"
+                                f"📉 SHORT {signal.short_exchange.upper()} | 📈 LONG {signal.long_exchange.upper()}\n"
+                                f"⏳ Мониторю каждые {5}с, макс {15} мин"
+                            )
+                    except Exception as e:
+                        print(f"[Listener] Ошибка кэширования {signal.ticker}: {e}")
+                else:
+                    print(f"[Listener] {signal.ticker} уже в кэше — пропускаю")
+
             await notify(f"⏭ Пропущен {signal.ticker}\n{risk.reason}")
             return
 
@@ -561,6 +620,11 @@ class SignalListener:
             await notify(f"🚫 <b>{signal.ticker}</b>: отменено ожидание фандинга (получен CLOSE)")
             _seen.pop(signal.ticker, None)
             return
+
+        # Если тикер в кэше сигналов — удаляем
+        if is_cached(signal.ticker):
+            remove_signal(signal.ticker)
+            print(f"[Listener] {signal.ticker} удалён из кэша по CLOSE сигналу")
 
         try:
             _, msg = await close_position(signal)

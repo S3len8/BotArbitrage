@@ -138,32 +138,39 @@ def _conn():
 
 
 def save_trade(trade: Trade) -> int:
-    with _conn() as c, c.cursor() as cur:
-        cur.execute("""
-            INSERT INTO trades (
-                ticker, symbol, short_exchange, long_exchange, trade_size_usd,
-                short_order_id, long_order_id,
-                short_entry_price, long_entry_price, short_qty, long_qty,
-                status, leverage, opened_at,
-                funding_short, funding_long, signal_spread_pct, signal_text,
-                exec_time_short_ms, exec_time_long_ms
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            RETURNING id
-        """, (
-            trade.ticker, trade.symbol,
-            trade.short_exchange, trade.long_exchange, trade.trade_size_usd,
-            trade.short_order_id, trade.long_order_id,
-            trade.short_entry_price, trade.long_entry_price,
-            trade.short_qty, trade.long_qty,
-            trade.status, trade.leverage,
-            trade.opened_at or datetime.now(timezone.utc),
-            trade.funding_short, trade.funding_long,
-            trade.signal_spread_pct, trade.signal_text,
-            trade.exec_time_short_ms, trade.exec_time_long_ms,
-        ))
-        trade.id = cur.fetchone()['id']
-        c.commit()
-    return trade.id
+    try:
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("""
+                INSERT INTO trades (
+                    ticker, symbol, short_exchange, long_exchange, trade_size_usd,
+                    short_order_id, long_order_id,
+                    short_entry_price, long_entry_price, short_qty, long_qty,
+                    status, leverage, opened_at,
+                    funding_short, funding_long, signal_spread_pct, signal_text,
+                    exec_time_short_ms, exec_time_long_ms
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING id
+            """, (
+                trade.ticker, trade.symbol,
+                trade.short_exchange, trade.long_exchange, trade.trade_size_usd,
+                trade.short_order_id, trade.long_order_id,
+                trade.short_entry_price, trade.long_entry_price,
+                trade.short_qty, trade.long_qty,
+                trade.status, trade.leverage,
+                trade.opened_at or datetime.now(timezone.utc),
+                trade.funding_short, trade.funding_long,
+                trade.signal_spread_pct, trade.signal_text,
+                trade.exec_time_short_ms, trade.exec_time_long_ms,
+            ))
+            trade.id = cur.fetchone()['id']
+            c.commit()
+        print(f"[DB] Trade saved: id={trade.id} ticker={trade.ticker} status={trade.status}")
+        return trade.id
+    except Exception as e:
+        print(f"[DB] ERROR save_trade: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 # Найти функцию update_trade в db.py и заменить на эту:
@@ -194,6 +201,7 @@ def update_trade(trade: Trade):
             trade.id,
         ))
         c.commit()
+    print(f"[DB] Trade updated: id={trade.id} ticker={trade.ticker} status={trade.status}")
 
 
 def get_open_trade(ticker: str) -> Optional[Trade]:
