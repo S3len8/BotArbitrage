@@ -804,26 +804,51 @@ async def _check_funding_for_trade(t):
 
     should_close  = False
     close_reason  = ""
-    is_pre_fund   = False  # флаг: закрытие именно перед фандингом (для перезахода)
+    is_pre_fund   = False
 
-    # ── Случай 1: скоро фандинг → закрываем всегда ──
-    if 0 < minutes_until <= MINUTES_BEFORE_FUNDING:
-        should_close = True
-        is_pre_fund  = True
-        close_reason = (
-            f"До фандинга {minutes_until:.0f} мин — закрываем позицию\n"
-            f"Entry спред: {entry_spread_pct:.2f}% | Текущий: {current_spread_pct:.2f}%\n"
-            f"Накоплено: {accumulated_fund:+.3f}% | После фандинга было бы: {after_next_profit:.3f}%\n"
-            f"Фандинг: short={sf_rate*100:+.3f}%/период, long={lf_rate*100:+.3f}%/период"
-        )
+    # Определяем: платит ли фандинг на обеих позициях
+    # Short получает когда rate > 0, Long получает когда rate < 0
+    both_pay_us = (sf_rate > 0) and (lf_rate < 0)
 
-    # ── Случай 2: накопленный фандинг съел >80% спреда ──
-    elif net_fund_per_period < 0 and accumulated_fund < -(entry_spread_pct * 0.8):
-        should_close = True
-        close_reason = (
-            f"Фандинг съел {abs(accumulated_fund):.3f}% из {entry_spread_pct:.2f}% спреда\n"
-            f"Осталось: {remaining_profit:.3f}%"
-        )
+    if both_pay_us:
+        # Фандинг платит на обеих позициях — НЕ закрываем перед фандингом
+        # Закрываем только если фандинг на одной стороне стал минус и перевешивает плюс другой
+        print(f"[FundingMonitor] {t.ticker}: фандинг платит на обеих позициях — пропускаю закрытие перед фандингом")
+
+        # Проверяем: не стал ли фандинг на одной стороне отрицательным настолько,
+        # что перевешивает плюс на другой
+        net_fund_per_period_raw = (sf_rate * 100) + (lf_rate * 100)
+        # Для short: положительный rate = получаем деньги, отрицательный = платим
+        # Для long: отрицательный rate = получаем деньги, положительный = платим
+        # net_fund_per_period уже считается как -(sf) - (lf)
+        # Если net_fund_per_period < 0 — мы получаем чистый плюс
+        # Если net_fund_per_period > 0 — мы платим чистый минус
+        if net_fund_per_period > 0 and accumulated_fund < -(entry_spread_pct * 0.8):
+            should_close = True
+            close_reason = (
+                f"Фандинг перестал платить на обеих позициях: "
+                f"накопленный убыток {abs(accumulated_fund):.3f}% из {entry_spread_pct:.2f}% спреда"
+            )
+    else:
+        # Обычная логика — закрываем перед фандингом
+        # ── Случай 1: скоро фандинг → закрываем всегда ──
+        if 0 < minutes_until <= MINUTES_BEFORE_FUNDING:
+            should_close = True
+            is_pre_fund  = True
+            close_reason = (
+                f"До фандинга {minutes_until:.0f} мин — закрываем позицию\n"
+                f"Entry спред: {entry_spread_pct:.2f}% | Текущий: {current_spread_pct:.2f}%\n"
+                f"Накоплено: {accumulated_fund:+.3f}% | После фандинга было бы: {after_next_profit:.3f}%\n"
+                f"Фандинг: short={sf_rate*100:+.3f}%/период, long={lf_rate*100:+.3f}%/период"
+            )
+
+        # ── Случай 2: накопленный фандинг съел >80% спреда ──
+        elif net_fund_per_period < 0 and accumulated_fund < -(entry_spread_pct * 0.8):
+            should_close = True
+            close_reason = (
+                f"Фандинг съел {abs(accumulated_fund):.3f}% из {entry_spread_pct:.2f}% спреда\n"
+                f"Осталось: {remaining_profit:.3f}%"
+            )
 
     if not should_close:
         return

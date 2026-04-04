@@ -135,22 +135,27 @@ async def check_signal(signal: OpenSignal, short_ex: BaseExchange, long_ex: Base
         # -----------------------------------------------------------------------
 
     # 5b. Фандинг-фильтр — Стратегия #4
-    # ✅ Условие A: diff < 0.2%
-    # ✅ Условие B: оба фандинга отрицательные И diff < 1.0%
     fs = signal.funding_short
     fl = signal.funding_long
     if fs is not None and fl is not None:
         diff_pct      = abs(fs - fl) * 100
         both_negative = fs < 0 and fl < 0
+        # Нам платят на обеих позициях:
+        #   Short получает фандинг когда rate > 0 (short продаёт → получает)
+        #   Long  получает фандинг когда rate < 0 (long покупает → получает)
+        both_pay_us   = (fs > 0) and (fl < 0)
 
-        passes = diff_pct < 0.2 or (both_negative and diff_pct < 1.0)
+        passes = diff_pct < 0.2 or (both_negative and diff_pct < 1.0) or both_pay_us
 
         if not passes:
             return RiskResult(ok=False, reason=(
                 f"Фандинг не прошёл: short={fs*100:+.3f}% long={fl*100:+.3f}% "
-                f"diff={diff_pct:.3f}% — нужно diff<0.2% ИЛИ (оба отриц. + diff<1%). "
+                f"diff={diff_pct:.3f}% — нужно diff<0.2% ИЛИ (оба отриц. + diff<1%) ИЛИ (оба платят нам). "
                 f"{signal.ticker} пропущен."
             ))
+        if both_pay_us:
+            print(f"[Risk] {signal.ticker}: ФАНДИГ ПЛАТИТ НАМ с обеих сторон! "
+                  f"short={fs*100:+.3f}% long={fl*100:+.3f}% — вход разрешён при любом diff")
 
     # 6. Проверка объёма (если MIN_VOLUME_USD > 0)
     if MIN_VOLUME_USD > 0:
