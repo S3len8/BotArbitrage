@@ -359,7 +359,7 @@ async def api_open_trades():
 
 @app.get("/api/positions/live")
 async def api_positions_live():
-    """Открытые позиции с реальными данными с бирж без мерцания."""
+    """Открытые позиции с реальными данными с бирж. Сохраняет данные в БД."""
     if not _db_ok: return []
     from db import get_all_open_trades, update_trade
     from exchanges import create_exchange
@@ -368,17 +368,15 @@ async def api_positions_live():
     trades = get_all_open_trades()
     if not trades: return []
 
-    # Ограничиваем количество одновременных запросов к биржам (защита от бана)
     sem = asyncio.Semaphore(5)
 
     async def fetch_trade_data(t):
         async with sem:
-            item = _t(t)  # Превращаем объект БД в словарь
+            item = _t(t)
             try:
                 s_ex = create_exchange(t.short_exchange)
                 l_ex = create_exchange(t.long_exchange)
 
-                # Запрашиваем всё параллельно
                 s_price, l_price, s_pos, l_pos, s_fund, l_fund = await asyncio.gather(
                     s_ex.get_price(t.symbol),
                     l_ex.get_price(t.symbol),
@@ -390,16 +388,13 @@ async def api_positions_live():
                 )
                 await asyncio.gather(s_ex.close(), l_ex.close(), return_exceptions=True)
 
-                # Обработка цен и PnL
                 sp = float(s_price) if isinstance(s_price, (int, float, str)) else t.short_entry_price
                 lp = float(l_price) if isinstance(l_price, (int, float, str)) else t.long_entry_price
 
-                # Берем PnL напрямую из ответа биржи (unrealized_pnl)
                 s_pnl = s_pos.get('unrealized_pnl', 0) if (not isinstance(s_pos, Exception) and s_pos) else 0
                 l_pnl = l_pos.get('unrealized_pnl', 0) if (not isinstance(l_pos, Exception) and l_pos) else 0
 
-                # Расчет накопленного фандинга (упрощенно)
-                fund_earned = item.get('fund_earned', 0)  # Можно добавить логику накопления из истории
+                fund_earned = item.get('fund_earned', 0)
 
                 item.update({
                     'cur_short_price': sp,
@@ -410,6 +405,38 @@ async def api_positions_live():
                     'short_on_exchange': not isinstance(s_pos, Exception) and s_pos is not None,
                     'long_on_exchange': not isinstance(l_pos, Exception) and l_pos is not None,
                 })
+
+                # Сохраняем живые данные обратно в БД
+                s_on_ex = not isinstance(s_pos, Exception) and s_pos is not None
+                l_on_ex = not isinstance(l_pos, Exception) and l_pos is not None
+
+                # Если позиция закрылась на бирже (нет открытой позиции), но в БД ещё open
+                if not s_on_ex or not l_on_ex:
+                    if s_pos is None or l_pos is None:
+                        # Одна из позиций закрылась — помечаем как partial/closed
+                        if t.status != 'closed':
+                            t.status = 'partial' if (s_on_ex or l_on_ex) else 'closed'
+                            t.closed_at = datetime.now(timezone.utc).isoformat()
+                            t.short_close_price = sp
+                            t.long_close_price = lp
+                            if t.short_entry_price and t.short_qty:
+                                t.short_pnl_usd = round((t.short_entry_price - sp) * t.short_qty, 6)
+                            if t.long_entry_price and t.long_qty:
+                                t.long_pnl_usd = round((lp - t.long_entry_price) * t.long_qty, 6)
+                            fees = (t.fee_short_usd or 0) + (t.fee_long_usd or 0)
+                            if t.short_pnl_usd is not None and t.long_pnl_usd is not None:
+                                t.net_pnl_usd = round(t.short_pnl_usd + t.long_pnl_usd - fees, 6)
+                            update_trade(t)
+                            print(f"[GUI] Позиция #{t.id} ({t.ticker}) закрылась на бирже → статус={t.status}")
+
+                # Обновляем PnL в БД для открытых позиций
+                if t.status in ('open', 'partial'):
+                    t.short_pnl_usd = round(s_pnl, 6) if s_pnl != 0 else t.short_pnl_usd
+                    t.long_pnl_usd = round(l_pnl, 6) if l_pnl != 0 else t.long_pnl_usd
+                    if t.short_pnl_usd is not None and t.long_pnl_usd is not None:
+                        t.net_pnl_usd = round(t.short_pnl_usd + t.long_pnl_usd - (t.fee_short_usd or 0) - (t.fee_long_usd or 0), 6)
+                    update_trade(t)
+
             except Exception as e:
                 item['live_error'] = str(e)
             return item
