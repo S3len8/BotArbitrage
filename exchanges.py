@@ -1729,9 +1729,9 @@ class GateExchange(CcxtExchange):
             r.raise_for_status()
             d = r.json()
             return {
-                'step': float(d.get('order_size_min', 1)),
+                'step': max(float(d.get('order_size_min', 1) or 1), 1.0),
                 'multiplier': float(d.get('quanto_multiplier') or d.get('multiplier') or 1),
-                'min_qty': float(d.get('order_size_min', 1))
+                'min_qty': max(float(d.get('order_size_min', 1) or 1), 1.0)
             }
 
         return await _run_sync(_sync_info)

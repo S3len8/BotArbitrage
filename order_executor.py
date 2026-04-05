@@ -72,39 +72,69 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
             msg = f"⛔ {signal.ticker} СКАСОВАНО: спред упав до {current_spread:.2f}% (мін {MIN_SPREAD_PCT}%)"
             return None, msg
 
-        # --- КРОК 3: СИНХРОНІЗАЦІЯ ОБСЯГУ (ЛОТІВ) ---
-        # Отримуємо специфікації контрактів обох бірж
+        # --- КРОК 2.5: ПЕРЕВІРКА ЩО SHORT > LONG (НЕГАТИВНИЙ СПРЕД) ---
+        if s_p <= l_p:
+            await asyncio.gather(short_ex.close(), long_ex.close())
+            msg = f"⛔ {signal.ticker} СКАСОВАНО: short_price ({s_p}) <= long_price ({l_p}) — негативний спред"
+            return None, msg
+
+        # --- КРОК 3: РОЗРАХУНОК ОБСЯГУ ДЛЯ КОЖНОЇ БІРЖІ ОКРЕМО ---
+        # Кожна біржа має свої одиниці: Gate — контракти, Binance — монети
+        # Рахуємо qty окремо, потім обмежуємо по USD
+
         inf_s, inf_l = await asyncio.gather(
             short_ex.get_contract_info(signal.symbol),
             long_ex.get_contract_info(signal.symbol)
         )
 
-        # Знаходимо спільні обмеження
-        common_step = max(inf_s.get('step', 1.0), inf_l.get('step', 1.0))
-        # Мінімальна кількість монет, яку вимагають біржі
-        min_required = max(inf_s.get('min_qty', 0.0), inf_l.get('min_qty', 0.0))
+        mult_s = inf_s.get('multiplier', 1.0) or 1.0
+        mult_l = inf_l.get('multiplier', 1.0) or 1.0
+        step_s = max(inf_s.get('step', 1.0) or 1.0, 1.0)
+        step_l = max(inf_l.get('step', 1.0) or 1.0, 1.0)
+        min_s  = max(inf_s.get('min_qty', 1.0) or 1.0, 1.0)
+        min_l  = max(inf_l.get('min_qty', 1.0) or 1.0, 1.0)
 
-        # Рахуємо бажану кількість монет для кожної сторони
-        qty_s_raw = final_size_usd / (s_p * inf_s.get('multiplier', 1.0))
-        qty_l_raw = final_size_usd / (l_p * inf_l.get('multiplier', 1.0))
+        # Розраховуємо бажану qty для кожної біржі
+        qty_s_raw = final_size_usd / (s_p * mult_s) if (s_p * mult_s) > 0 else 0
+        qty_l_raw = final_size_usd / (l_p * mult_l) if (l_p * mult_l) > 0 else 0
 
-        # Вибираємо однакову кількість для обох бірж (меншу з двох, округлену до кроку)
-        final_qty = (min(qty_s_raw, qty_l_raw) // common_step) * common_step
+        # Округлюємо до кроку кожної біржі
+        qty_s = (qty_s_raw // step_s) * step_s
+        qty_l = (qty_l_raw // step_l) * step_l
 
-        # Перевірка на мінімальний лот
-        if final_qty < min_required:
-            # Якщо мінімальний лот коштує не набагато дорожче (до +20%), беремо його
-            if min_required * s_p <= (final_size_usd * 1.2):
-                final_qty = min_required
-                print(f"[Executor] {signal.ticker}: Обсяг збільшено до мін. лота {final_qty}")
+        # Перевірка мінімального лота
+        if qty_s < min_s:
+            cost_s = min_s * s_p * mult_s
+            if cost_s <= final_size_usd * 1.2:
+                qty_s = min_s
+                print(f"[Executor] {signal.ticker}: Short qty збільшено до мін. лота {min_s}")
             else:
                 await asyncio.gather(short_ex.close(), long_ex.close())
-                msg = f"❌ {signal.ticker} СКАСОВАНО: мін. лот ${min_required * s_p:.2f} > ліміту ${final_size_usd}"
+                msg = f"❌ {signal.ticker}: мін. лот Short ${cost_s:.2f} > ліміту ${final_size_usd}"
                 return None, msg
 
-        # Фактична сума в USD для ордерів (трохи зміниться через синхронізацію qty)
-        exec_size_s = final_qty * s_p * inf_s.get('multiplier', 1.0)
-        exec_size_l = final_qty * l_p * inf_l.get('multiplier', 1.0)
+        if qty_l < min_l:
+            cost_l = min_l * l_p * mult_l
+            if cost_l <= final_size_usd * 1.2:
+                qty_l = min_l
+                print(f"[Executor] {signal.ticker}: Long qty збільшено до мін. лота {min_l}")
+            else:
+                await asyncio.gather(short_ex.close(), long_ex.close())
+                msg = f"❌ {signal.ticker}: мін. лот Long ${cost_l:.2f} > ліміту ${final_size_usd}"
+                return None, msg
+
+        # Фактичний розмір в USD — кожна сторона окремо
+        exec_size_s = qty_s * s_p * mult_s
+        exec_size_l = qty_l * l_p * mult_l
+
+        # ЗАХИСТ: фактичний розмір не повинен перевищувати ліміт більше ніж на 20%
+        max_allowed = final_size_usd * 1.2
+        if exec_size_s > max_allowed or exec_size_l > max_allowed:
+            print(f"[Executor] {signal.ticker}: ПЕРЕВИЩЕННЯ ОБСЯГУ! "
+                  f"short=${exec_size_s:.2f} long=${exec_size_l:.2f} ліміт=${final_size_usd:.2f}")
+            await asyncio.gather(short_ex.close(), long_ex.close())
+            msg = f"❌ {signal.ticker}: обсяг перевищено — short=${exec_size_s:.2f}, long=${exec_size_l:.2f} (ліміт ${final_size_usd:.2f})"
+            return None, msg
 
         # --- КРОК 4: ВИКОНАННЯ ОРДЕРІВ ---
         trade = Trade(
@@ -316,9 +346,11 @@ async def close_position(close_signal: CloseSignal) -> tuple[Optional[Trade], st
         actual_close_spread = f"\n📊 Спред закрытия: {cs:.2f}%"
 
     pnl_emoji = "💰" if trade.net_pnl_usd and trade.net_pnl_usd > 0 else "💸"
+    short_close_str = f"${trade.short_close_price:.6f}" if trade.short_close_price else "—"
+    long_close_str  = f"${trade.long_close_price:.6f}" if trade.long_close_price else "—"
     msg = (f"{'✅' if trade.status=='closed' else '⚠️'} <b>Закрыто: {trade.ticker}</b>\n"
-           f"📉 SHORT {trade.short_exchange.upper()} @ ${trade.short_close_price:.6f if trade.short_close_price else '—'}\n"
-           f"📈 LONG  {trade.long_exchange.upper()} @ ${trade.long_close_price:.6f  if trade.long_close_price  else '—'}\n"
+           f"📉 SHORT {trade.short_exchange.upper()} @ {short_close_str}\n"
+           f"📈 LONG  {trade.long_exchange.upper()} @ {long_close_str}\n"
            f"📊 Спред входа: {trade.signal_spread_pct:.2f}%{actual_close_spread}\n"
            f"PnL short: {_upnl(trade.short_pnl_usd)} | long: {_upnl(trade.long_pnl_usd)}\n"
            f"Комиссии: ${fees:.4f}\n"
@@ -843,12 +875,15 @@ async def _check_funding_for_trade(t):
             )
 
         # ── Случай 2: накопленный фандинг съел >80% спреда ──
-        elif net_fund_per_period < 0 and accumulated_fund < -(entry_spread_pct * 0.8):
+        # НО: если entry_spread отрицательный — НЕ закрываем по фандингу
+        elif entry_spread_pct > 0 and net_fund_per_period < 0 and accumulated_fund < -(entry_spread_pct * 0.8):
             should_close = True
             close_reason = (
                 f"Фандинг съел {abs(accumulated_fund):.3f}% из {entry_spread_pct:.2f}% спреда\n"
                 f"Осталось: {remaining_profit:.3f}%"
             )
+        elif entry_spread_pct <= 0:
+            print(f"[FundingMonitor] {t.ticker}: entry_spread={entry_spread_pct:.2f}% ≤ 0 — пропускаю закрытие по фандингу")
 
     if not should_close:
         return
