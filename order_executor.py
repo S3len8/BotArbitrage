@@ -204,6 +204,30 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
         trade.fee_long_usd = long_r.get('fee', 0)
         trade.exec_time_short_ms = exec_ms
         trade.exec_time_long_ms = exec_ms
+
+        # ПЕРЕВІРКА: фактичний спред після філів ордерів
+        actual_spread = (trade.short_entry_price / trade.long_entry_price - 1) * 100
+        if actual_spread < MIN_SPREAD_PCT:
+            print(f"[Executor] {signal.ticker}: фактичний спред {actual_spread:.2f}% < {MIN_SPREAD_PCT}% — негайне закриття!")
+            await notify(
+                f"⛔ <b>{signal.ticker}: скасовано — фактичний спред {actual_spread:.2f}%</b>\n"
+                f"📊 Спред сигналу: {signal.spread_pct:.2f}% | Факт: {actual_spread:.2f}%\n"
+                f"⚡ Slippage занадто великий — закриваю"
+            )
+            # Закриваємо обидві позиції
+            try:
+                await short_ex.close_position(signal.symbol, 'buy', trade.short_qty)
+            except Exception as e:
+                print(f"[Executor] Помилка відкату Short: {e}")
+            try:
+                await long_ex.close_position(signal.symbol, 'sell', trade.long_qty)
+            except Exception as e:
+                print(f"[Executor] Помилка відкату Long: {e}")
+            await asyncio.gather(short_ex.close(), long_ex.close())
+            trade.status = 'failed'
+            save_trade(trade)
+            return None, f"Фактичний спред {actual_spread:.2f}% < {MIN_SPREAD_PCT}%"
+
         save_trade(trade)
 
         # Логування в канал ордерів
@@ -320,11 +344,15 @@ async def close_position(close_signal: CloseSignal) -> tuple[Optional[Trade], st
 
     fees = (trade.fee_short_usd or 0) + (trade.fee_long_usd or 0)
     if real_short_pnl is not None and real_long_pnl is not None:
+        # Exchange PnL уже включает комиссии — не вычитаем их повторно
         trade.short_pnl_usd = round(real_short_pnl, 6)
         trade.long_pnl_usd  = round(real_long_pnl, 6)
-        trade.net_pnl_usd   = round(real_short_pnl + real_long_pnl - fees, 6)
+        trade.net_pnl_usd   = round(real_short_pnl + real_long_pnl, 6)
     else:
         _calc_pnl(trade)
+        # Если считаем сами — вычитаем комиссии
+        if trade.short_pnl_usd is not None and trade.long_pnl_usd is not None:
+            trade.net_pnl_usd = round(trade.short_pnl_usd + trade.long_pnl_usd - fees, 6)
 
     update_trade(trade)
 
@@ -610,6 +638,36 @@ async def _check_margin_risk(t) -> bool:
         update_trade(t)
         return True
 
+    # Логика orphan leg: одна позиция закрылась, другую нужно закрыть
+    s_on_ex = not isinstance(s_pos, Exception) and s_pos is not None
+    l_on_ex = not isinstance(l_pos, Exception) and l_pos is not None
+
+    if s_on_ex and not l_on_ex:
+        print(f"[MarginCheck] 🚨 {t.ticker}: LONG позиция закрылась на бирже, закрываю SHORT!")
+        await notify(f"🚨 <b>Orphan leg: {t.ticker}</b>\nLONG закрылся на бирже, закрываю SHORT...")
+        s_ex2 = create_exchange(t.short_exchange)
+        try:
+            await s_ex2.close_position(t.symbol, 'buy', t.short_qty or 0)
+        finally:
+            await s_ex2.close()
+        t.status = 'closed'
+        t.closed_at = datetime.now(timezone.utc).isoformat()
+        update_trade(t)
+        return True
+
+    if l_on_ex and not s_on_ex:
+        print(f"[MarginCheck] 🚨 {t.ticker}: SHORT позиция закрылась на бирже, закрываю LONG!")
+        await notify(f"🚨 <b>Orphan leg: {t.ticker}</b>\nSHORT закрылся на бирже, закрываю LONG...")
+        l_ex2 = create_exchange(t.long_exchange)
+        try:
+            await l_ex2.close_position(t.symbol, 'sell', t.long_qty or 0)
+        finally:
+            await l_ex2.close()
+        t.status = 'closed'
+        t.closed_at = datetime.now(timezone.utc).isoformat()
+        update_trade(t)
+        return True
+
     s_price = float(s_price_r) if not isinstance(s_price_r, Exception) else None
     l_price = float(l_price_r) if not isinstance(l_price_r, Exception) else None
 
@@ -659,7 +717,7 @@ async def _check_margin_risk(t) -> bool:
               f"short_dist={s_dist_pct:.1f}% long_dist={l_dist_pct:.1f}% (lev={lev:.0f}×)")
 
         # Ступень 2: аварийное закрытие
-        if min_dist <= 10:
+        if min_dist <= 5:
             print(f"[MarginCheck] 🚨 {t.ticker}: {min_side} в {min_dist:.1f}% от ликвидации! АВАРИЙНОЕ ЗАКРЫТИЕ.")
             await notify(
                 f"🚨 <b>АВАРИЙНОЕ ЗАКРЫТИЕ: {t.ticker}</b>\n"
@@ -675,7 +733,7 @@ async def _check_margin_risk(t) -> bool:
             return True
 
         # Ступень 1: предупреждение
-        if min_dist <= 15:
+        if min_dist <= 10:
             cooldown_key = t.id
             if now - _margin_warn_cooldown.get(cooldown_key, 0) > MARGIN_WARN_COOLDOWN_S:
                 _margin_warn_cooldown[cooldown_key] = now

@@ -255,6 +255,33 @@ async def _wait_and_open(pending: PendingSignal):
         raw_text=f"[post-funding entry] {signal.ticker}",
     )
 
+    # Проверяем время до фандинга — если <= 15 мин, НЕ заходим
+    try:
+        next_short_ts, next_long_ts = await asyncio.wait_for(
+            _get_funding_times(updated_signal), timeout=10
+        )
+    except asyncio.TimeoutError:
+        print(f"[Listener] {ticker}: таймаут получения времени фандинга после начисления")
+        next_short_ts, next_long_ts = None, None
+
+    min_until = min(
+        _minutes_until(next_short_ts),
+        _minutes_until(next_long_ts),
+    )
+
+    if min_until <= WAIT_BEFORE_FUNDING_MIN:
+        await notify(
+            f"⛔ <b>{ticker}: до фандинга {min_until:.0f} мин — не перезаходим</b>\n"
+            f"📊 Спред: {current_spread:.2f}%\n"
+            f"⏱ Ждём ещё {WAIT_BEFORE_FUNDING_MIN - min_until:.0f} мин"
+        )
+        # Ставим в очередь ожидания
+        nearest = min(next_short_ts or 0, next_long_ts or 0) or None
+        pending = PendingSignal(updated_signal, nearest, pending.received_ms)
+        _pending_signals[signal.ticker] = pending
+        pending.task = asyncio.create_task(_wait_and_open(pending))
+        return
+
     # Проверяем фандинг-фильтр с новыми ставками
     fund_ok, fund_reason = _funding_ok(updated_signal)
     if not fund_ok:
@@ -446,7 +473,8 @@ class SignalListener:
                 return
 
             print(f"[Listener] [{source}] OPEN {signal.ticker} {signal.short_exchange}↕{signal.long_exchange} {signal.spread_pct:.2f}% | {reason}")
-            await self._open(signal, received_ms)
+            # ВСЕ сигналы идут в кэш — вход только когда живой спред >= 3%
+            await self._cache_signal(signal, received_ms)
 
         elif isinstance(signal, CloseSignal):
             # Если тикер в кэше — удаляем (спред сошёлся)
@@ -456,6 +484,63 @@ class SignalListener:
                 print(f"[Listener] {signal.ticker} удалён из кэша по CLOSE сигналу")
             print(f"[Listener] CLOSE {signal.ticker}")
             await self._close(signal)
+
+    async def _cache_signal(self, signal: OpenSignal, received_ms: int):
+        """Кэширует сигнал и запускает мониторинг — вход только когда живой спред >= 3%."""
+        if is_cached(signal.ticker):
+            print(f"[Listener] {signal.ticker} уже в кэше — обновляю")
+            remove_signal(signal.ticker)
+
+        # Получаем живые цены
+        try:
+            s_ex = create_exchange(signal.short_exchange)
+            l_ex = create_exchange(signal.long_exchange)
+            s_price, l_price = await asyncio.gather(
+                s_ex.get_price(signal.symbol),
+                l_ex.get_price(signal.symbol),
+                return_exceptions=True,
+            )
+            await asyncio.gather(s_ex.close(), l_ex.close(), return_exceptions=True)
+        except Exception as e:
+            print(f"[Listener] Ошибка получения цен для кэша {signal.ticker}: {e}")
+            return
+
+        if isinstance(s_price, Exception) or isinstance(l_price, Exception):
+            print(f"[Listener] Не удалось получить цены для кэша {signal.ticker}")
+            return
+
+        sp = float(s_price)
+        lp = float(l_price)
+        if lp <= 0:
+            return
+
+        current_spread = (sp / lp - 1) * 100
+
+        from signal_parser import OpenSignal as _OS
+        cached_sig = _OS(
+            ticker=signal.ticker,
+            symbol=signal.symbol,
+            short_exchange=signal.short_exchange,
+            long_exchange=signal.long_exchange,
+            short_price=sp,
+            long_price=lp,
+            spread_pct=current_spread,
+            funding_short=signal.funding_short,
+            funding_long=signal.funding_long,
+            max_size_short=signal.max_size_short,
+            max_size_long=signal.max_size_long,
+            interval_short=signal.interval_short,
+            interval_long=signal.interval_long,
+            raw_text=signal.raw_text,
+        )
+
+        add_signal(cached_sig, current_spread)
+        await notify(
+            f"💤 <b>{signal.ticker}: сигнал в кэше</b>\n"
+            f"📊 Спред: {current_spread:.2f}% (мин {MIN_SPREAD_PCT}%)\n"
+            f"📉 SHORT {signal.short_exchange.upper()} | 📈 LONG {signal.long_exchange.upper()}\n"
+            f"⏳ Мониторю каждые 5с, макс 15 мин"
+        )
 
     async def _open(self, signal: OpenSignal, received_ms: int):
         if _is_duplicate(signal.ticker):
@@ -483,8 +568,12 @@ class SignalListener:
                 _get_funding_times(signal), timeout=15
             )
         except asyncio.TimeoutError:
-            print(f"[Listener] {signal.ticker}: таймаут получения времени фандинга, открываем сразу")
-            next_short_ts, next_long_ts = None, None
+            print(f"[Listener] {signal.ticker}: таймаут получения времени фандинга — НЕ открываем")
+            await notify(f"⛔ <b>{signal.ticker}</b>: не удалось получить время фандинга — позиция не открыта")
+            await short_ex.close()
+            await long_ex.close()
+            _seen.pop(signal.ticker, None)
+            return
 
         min_until = min(
             _minutes_until(next_short_ts),
@@ -499,7 +588,7 @@ class SignalListener:
             nearest_fund_ts = next_long_ts
 
         if min_until <= WAIT_BEFORE_FUNDING_MIN and nearest_fund_ts:
-            # До фандинга <= 15 минут — ставим в очередь ожидания
+            # До фандинга <= 15 минут — НЕ открываем, ждём начисления
             print(f"[Listener] {signal.ticker}: до фандинга {min_until:.0f} мин "
                   f"(<= {WAIT_BEFORE_FUNDING_MIN}) — ждём начисления")
 

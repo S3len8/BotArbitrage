@@ -24,6 +24,7 @@ async def run_gui():
         host="127.0.0.1",   # localhost вместо 0.0.0.0 — работает на Windows
         port=8080,
         log_level="info",
+        reload=True,
     )
     await uvicorn.Server(config).serve()
 

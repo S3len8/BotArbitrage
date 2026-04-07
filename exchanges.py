@@ -1109,7 +1109,7 @@ class BitgetExchange(BaseExchange):
         return 0.0
 
     async def _setup_symbol(self, symbol: str):
-        """Bitget: Принудительная установка Изолированной маржи, Плеча и Режима Хеджирования."""
+        """Bitget: One-Way Mode + Isolated Margin + Leverage."""
         import base64, json as _json
         ticker = _bitget_ticker(symbol)
 
@@ -1144,46 +1144,50 @@ class BitgetExchange(BaseExchange):
             return r.json()
 
         def _sync():
-            # 1. Переключаем на Режим Хеджирования (Hedge Mode)
+            # 1. One-Way Mode (односторонний режим)
             try:
                 _do_bitget_post('/api/v2/mix/account/set-position-mode',
-                                {'productType': 'USDT-FUTURES', 'posMode': 'hedge_mode'})
+                                {'productType': 'USDT-FUTURES', 'posMode': 'one_way_mode'})
+                print(f"[bitget] {ticker}: one-way mode set")
             except Exception as e:
                 print(f"[bitget] set-position-mode: {e}")
 
-            # 2. Устанавливаем изолированную маржу
+            # 2. Isolated Margin
             try:
                 _do_bitget_post('/api/v2/mix/account/set-margin-mode',
                                 {'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginMode': 'isolated'})
+                print(f"[bitget] {ticker}: isolated margin set")
             except Exception as e:
                 print(f"[bitget] set-margin-mode: {e}")
 
-            # 3. Устанавливаем плечо — ОБЯЗАТЕЛЬНО с проверкой
+            # 3. Leverage (в One-Way без holdSide)
             _do_bitget_post('/api/v2/mix/account/set-leverage',
                             {'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginCoin': 'USDT',
                              'leverage': str(LEVERAGE)})
+            print(f"[bitget] {ticker}: leverage set to {LEVERAGE}x")
 
-            # 4. Верификация: читаем текущее плечо из позиции
+            # 4. Верификация
             import time as _time
-            _time.sleep(0.3)
+            _time.sleep(0.5)
             try:
-                pos_data = _do_bitget_get('/api/v2/mix/position/single-position',
-                                          {'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginCoin': 'USDT'})
-                positions = pos_data.get('data', [])
-                if positions:
-                    actual_leverage = int(float(positions[0].get('leverage', 0)))
-                    if actual_leverage != LEVERAGE:
-                        raise ValueError(
-                            f"bitget leverage mismatch: wanted {LEVERAGE}x, got {actual_leverage}x for {ticker}. "
-                            f"Trade BLOCKED — check exchange settings manually."
-                        )
+                acct_data = _do_bitget_get('/api/v2/mix/account/account',
+                                           {'symbol': ticker, 'productType': 'USDT-FUTURES'})
+                accounts = acct_data.get('data', [])
+                if accounts:
+                    for acct in accounts:
+                        margin_mode = acct.get('marginMode', '')
+                        leverage = acct.get('leverage', '')
+                        print(f"[bitget] {ticker}: marginMode={margin_mode}, leverage={leverage}")
+                        if leverage and int(float(leverage)) != LEVERAGE:
+                            raise ValueError(
+                                f"bitget leverage mismatch: wanted {LEVERAGE}x, got {leverage}x for {ticker}. "
+                                f"Trade BLOCKED."
+                            )
                     print(f"[bitget] {ticker}: leverage verified ✅ {LEVERAGE}×")
-                else:
-                    print(f"[bitget] {ticker}: no open position yet, leverage set to {LEVERAGE}×")
             except ValueError:
                 raise
             except Exception as e:
-                print(f"[bitget] leverage verification skipped: {e}")
+                print(f"[bitget] leverage verification warning: {e}")
 
         await _run_sync(_sync)
 
@@ -1194,23 +1198,18 @@ class BitgetExchange(BaseExchange):
         if price is None: price = self._price_sync(symbol)
 
         # Расчет qty
-        qty = round(size_usd / price, 1)  # Упрощенное округление
+        qty = round(size_usd / price, 1)
 
         ts = str(_ts())
         path = '/api/v2/mix/order/place-order'
 
-        # Логика для Hedge Mode
-        if reduce_only:
-            trade_side = 'close'
-            pos_side = 'long' if side.lower() == 'sell' else 'short'
-        else:
-            trade_side = 'open'
-            pos_side = 'long' if side.lower() == 'buy' else 'short'
+        # One-Way Mode: нет posSide, только tradeSide
+        trade_side = 'close' if reduce_only else 'open'
 
         body = {
             'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginCoin': 'USDT',
             'marginMode': 'isolated', 'side': side.lower(), 'orderType': 'market',
-            'size': str(qty), 'tradeSide': trade_side, 'posSide': pos_side
+            'size': str(qty), 'tradeSide': trade_side
         }
 
         body_str = _json.dumps(body, separators=(',', ':'))
@@ -1233,6 +1232,7 @@ class BitgetExchange(BaseExchange):
         return await _run_sync(self._bitget_order_sync, symbol, side, size_usd)
 
     async def close_position(self, symbol: str, side: str, qty: float) -> dict:
+        """Закрытие позиции на Bitget через market order с tradeSide=close (One-Way Mode)."""
         price = await self.get_price(symbol)
         return await _run_sync(self._bitget_order_sync, symbol, side, qty * price, reduce_only=True, price=price)
 
@@ -1736,7 +1736,7 @@ class GateExchange(CcxtExchange):
 
         return await _run_sync(_sync_info)
 
-    def _gate_order_sync(self, ticker: str, side: str, qty: float, price: float) -> dict:
+    def _gate_order_sync(self, ticker: str, side: str, qty: float, price: float, reduce_only: bool = False) -> dict:
         """КРОК 2: Відправка ринкового ордера (Size на Gate — це кількість контрактів)."""
         import hashlib as hl
         import json as _json
@@ -1753,8 +1753,18 @@ class GateExchange(CcxtExchange):
             'size': order_size,
             'price': '0',  # '0' означає ринковий ордер (Market)
             'tif': 'ioc',
-            'text': 't-arb'
+            'text': 't-arb',
         }
+
+        # В Hedge Mode reduce_only не працює — використовуємо auto_size
+        if reduce_only:
+            # side='buy' закриває short, side='sell' закриває long
+            if side.lower() in ('buy', 'long'):
+                body_d['auto_size'] = 'close_short'
+            else:
+                body_d['auto_size'] = 'close_long'
+            # auto_size ігнорує знак size, тому ставимо позитивне
+            body_d['size'] = abs(order_size)
 
         body_json = _json.dumps(body_d)
         body_hash = hl.sha512(body_json.encode()).hexdigest()
@@ -1807,8 +1817,8 @@ class GateExchange(CcxtExchange):
         """Закриття позиції (використовує існуючий qty контрактів)."""
         price = await self.get_price(symbol)
         ticker = _gate_ticker(symbol)
-        # При закритті шлемо qty як ціле число контрактів
-        return await _run_sync(self._gate_order_sync, ticker, side, int(qty), price)
+        # При закритті шлемо qty як ціле число контрактів + reduce_only
+        return await _run_sync(self._gate_order_sync, ticker, side, int(qty), price, True)
 
     def _price_sync(self, symbol: str) -> float:
         ticker = _gate_ticker(symbol)
