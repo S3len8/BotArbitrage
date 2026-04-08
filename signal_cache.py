@@ -97,9 +97,10 @@ async def stop_signal_monitor():
 
 
 async def _monitor_loop():
-    """Периодически проверяет кэшированные сигналы."""
+    """Периодически проверяет кэшированные сигналы + фандинг."""
     from risk_manager import check_signal
     from order_executor import open_position
+    from listener import _minutes_until, _get_funding_times, WAIT_BEFORE_FUNDING_MIN
 
     while True:
         await asyncio.sleep(MONITOR_INTERVAL)
@@ -123,15 +124,17 @@ async def _monitor_loop():
                 print(f"[SignalCache] {ticker} исчерпал попытки ({cached.max_attempts}) — удаляю")
                 continue
 
-            # Получаем живые цены
+            # Получаем живые цены + фандинг
             try:
                 sig = cached.signal
                 s_ex = create_exchange(sig.short_exchange)
                 l_ex = create_exchange(sig.long_exchange)
                 try:
-                    s_price, l_price = await asyncio.gather(
+                    s_price, l_price, s_fund, l_fund = await asyncio.gather(
                         s_ex.get_price(sig.symbol),
                         l_ex.get_price(sig.symbol),
+                        s_ex.get_funding_rate(sig.symbol),
+                        l_ex.get_funding_rate(sig.symbol),
                         return_exceptions=True,
                     )
                 finally:
@@ -151,68 +154,102 @@ async def _monitor_loop():
 
                 print(f"[SignalCache] {ticker}: спред {current_spread:.2f}% (попытка {cached.attempts})")
 
-                # Спред достиг минимума — пробуем войти
-                if current_spread >= MIN_SPREAD_PCT:
-                    print(f"[SignalCache] {ticker}: спред {current_spread:.2f}% >= {MIN_SPREAD_PCT}% — вхожу!")
+                # Спред должен быть >= 3%
+                if current_spread < MIN_SPREAD_PCT:
+                    continue
 
-                    # Удаляем из кэша чтобы не дублировать
-                    _cached_signals.pop(ticker, None)
-
-                    # Создаём обновлённый сигнал с актуальными ценами
+                # Проверяем время до фандинга
+                try:
                     from signal_parser import OpenSignal as _OS
-                    updated = _OS(
-                        ticker=sig.ticker,
-                        symbol=sig.symbol,
-                        short_exchange=sig.short_exchange,
-                        long_exchange=sig.long_exchange,
-                        short_price=sp,
-                        long_price=lp,
-                        spread_pct=current_spread,
-                        funding_short=sig.funding_short,
-                        funding_long=sig.funding_long,
-                        max_size_short=sig.max_size_short,
-                        max_size_long=sig.max_size_long,
-                        interval_short=sig.interval_short,
-                        interval_long=sig.interval_long,
-                        raw_text=f"[cached-signal entry] {sig.ticker}",
+                    temp_sig = _OS(
+                        ticker=sig.ticker, symbol=sig.symbol,
+                        short_exchange=sig.short_exchange, long_exchange=sig.long_exchange,
+                        short_price=sp, long_price=lp, spread_pct=current_spread,
+                        funding_short=sig.funding_short, funding_long=sig.funding_long,
+                        max_size_short=sig.max_size_short, max_size_long=sig.max_size_long,
+                        interval_short=sig.interval_short, interval_long=sig.interval_long,
+                        raw_text=sig.raw_text,
                     )
-
-                    await notify(
-                        f"📡 <b>{ticker}: кэшированный сигнал активирован</b>\n"
-                        f"📊 Спред вырос до {current_spread:.2f}% (мин {MIN_SPREAD_PCT}%)\n"
-                        f"⏱ Ожидание: {int(now - cached.cached_at)}с\n"
-                        f"⚡ Открываю позицию..."
+                    next_short_ts, next_long_ts = await asyncio.wait_for(
+                        _get_funding_times(temp_sig), timeout=10
                     )
+                    min_until = min(
+                        _minutes_until(next_short_ts),
+                        _minutes_until(next_long_ts),
+                    )
+                except Exception:
+                    min_until = 9999  # если не удалось получить — считаем что далеко
 
-                    # Проверяем риск
-                    s_ex2 = create_exchange(sig.short_exchange)
-                    l_ex2 = create_exchange(sig.long_exchange)
-                    try:
-                        risk = await asyncio.wait_for(
-                            check_signal(updated, s_ex2, l_ex2),
-                            timeout=30
-                        )
-                    finally:
-                        await asyncio.gather(s_ex2.close(), l_ex2.close(), return_exceptions=True)
+                if min_until <= WAIT_BEFORE_FUNDING_MIN:
+                    print(f"[SignalCache] {ticker}: до фандинга {min_until:.0f} мин — жду начисления")
+                    continue
 
-                    if not risk:
-                        print(f"[SignalCache] {ticker}: риск-менеджер отклонил — {risk.reason}")
-                        await notify(f"⛔ <b>{ticker}: кэшированный сигнал отклонён</b>\n{risk.reason}")
-                        continue
+                print(f"[SignalCache] {ticker}: спред {current_spread:.2f}% >= {MIN_SPREAD_PCT}%, фандинг через {min_until:.0f}м — вхожу!")
 
-                    # Открываем позицию
-                    try:
-                        trade, msg = await asyncio.wait_for(
-                            open_position(updated, risk.final_size_usd, signal_received_ms=int(cached.cached_at * 1000)),
-                            timeout=60
-                        )
-                        if trade:
-                            print(f"[SignalCache] {ticker}: успешно открыта позиция trade_id={trade.id}")
-                        else:
-                            print(f"[SignalCache] {ticker}: открытие не удалось")
-                    except Exception as e:
-                        print(f"[SignalCache] {ticker}: ошибка открытия — {e}")
-                        await notify(f"❌ <b>{ticker}: ошибка открытия кэшированного сигнала</b>\n{e}")
+                # Удаляем из кэша чтобы не дублировать
+                _cached_signals.pop(ticker, None)
+
+                # Обновляем фандинг из бирж
+                sf = s_fund.get('rate') if (not isinstance(s_fund, Exception) and s_fund) else sig.funding_short
+                lf = l_fund.get('rate') if (not isinstance(l_fund, Exception) and l_fund) else sig.funding_long
+                i_s = s_fund.get('interval_hours') if (not isinstance(s_fund, Exception) and s_fund) else sig.interval_short
+                i_l = l_fund.get('interval_hours') if (not isinstance(l_fund, Exception) and l_fund) else sig.interval_long
+
+                # Создаём обновлённый сигнал с актуальными ценами
+                from signal_parser import OpenSignal as _OS
+                updated = _OS(
+                    ticker=sig.ticker,
+                    symbol=sig.symbol,
+                    short_exchange=sig.short_exchange,
+                    long_exchange=sig.long_exchange,
+                    short_price=sp,
+                    long_price=lp,
+                    spread_pct=current_spread,
+                    funding_short=sf,
+                    funding_long=lf,
+                    max_size_short=sig.max_size_short,
+                    max_size_long=sig.max_size_long,
+                    interval_short=i_s,
+                    interval_long=i_l,
+                    raw_text=f"[cached-signal entry] {sig.ticker}",
+                )
+
+                await notify(
+                    f"📡 <b>{ticker}: кэшированный сигнал активирован</b>\n"
+                    f"📊 Спред: {current_spread:.2f}% (мин {MIN_SPREAD_PCT}%)\n"
+                    f"⏱ До фандинга: {min_until:.0f}м\n"
+                    f"⚡ Открываю позицию..."
+                )
+
+                # Проверяем риск
+                s_ex2 = create_exchange(sig.short_exchange)
+                l_ex2 = create_exchange(sig.long_exchange)
+                try:
+                    risk = await asyncio.wait_for(
+                        check_signal(updated, s_ex2, l_ex2),
+                        timeout=30
+                    )
+                finally:
+                    await asyncio.gather(s_ex2.close(), l_ex2.close(), return_exceptions=True)
+
+                if not risk:
+                    print(f"[SignalCache] {ticker}: риск-менеджер отклонил — {risk.reason}")
+                    await notify(f"⛔ <b>{ticker}: кэшированный сигнал отклонён</b>\n{risk.reason}")
+                    continue
+
+                # Открываем позицию
+                try:
+                    trade, msg = await asyncio.wait_for(
+                        open_position(updated, risk.final_size_usd, signal_received_ms=int(cached.cached_at * 1000)),
+                        timeout=60
+                    )
+                    if trade:
+                        print(f"[SignalCache] {ticker}: успешно открыта позиция trade_id={trade.id}")
+                    else:
+                        print(f"[SignalCache] {ticker}: открытие не удалось")
+                except Exception as e:
+                    print(f"[SignalCache] {ticker}: ошибка открытия — {e}")
+                    await notify(f"❌ <b>{ticker}: ошибка открытия кэшированного сигнала</b>\n{e}")
 
             except Exception as e:
                 print(f"[SignalCache] {ticker}: ошибка проверки — {e}")

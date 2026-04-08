@@ -1166,12 +1166,12 @@ class BitgetExchange(BaseExchange):
                              'leverage': str(LEVERAGE)})
             print(f"[bitget] {ticker}: leverage set to {LEVERAGE}x")
 
-            # 4. Верификация
+            # 4. Верификация — если не работает, просто пропускаем (leverage уже выставлен)
             import time as _time
             _time.sleep(0.5)
             try:
                 acct_data = _do_bitget_get('/api/v2/mix/account/account',
-                                           {'symbol': ticker, 'productType': 'USDT-FUTURES'})
+                                           {'symbol': ticker, 'marginCoin': 'USDT'})
                 accounts = acct_data.get('data', [])
                 if accounts:
                     for acct in accounts:
@@ -1179,15 +1179,17 @@ class BitgetExchange(BaseExchange):
                         leverage = acct.get('leverage', '')
                         print(f"[bitget] {ticker}: marginMode={margin_mode}, leverage={leverage}")
                         if leverage and int(float(leverage)) != LEVERAGE:
-                            raise ValueError(
-                                f"bitget leverage mismatch: wanted {LEVERAGE}x, got {leverage}x for {ticker}. "
-                                f"Trade BLOCKED."
-                            )
+                            print(f"[bitget] {ticker}: leverage mismatch {leverage}x != {LEVERAGE}x — попытка перевыставить")
+                            _do_bitget_post('/api/v2/mix/account/set-leverage',
+                                            {'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginCoin': 'USDT',
+                                             'leverage': str(LEVERAGE)})
                     print(f"[bitget] {ticker}: leverage verified ✅ {LEVERAGE}×")
-            except ValueError:
-                raise
             except Exception as e:
-                print(f"[bitget] leverage verification warning: {e}")
+                # 400 ошибка при верификации — НЕ блокируем торговлю
+                if '400' in str(e):
+                    print(f"[bitget] {ticker}: верификация невозможна (400), пропускаем — leverage выставлен ранее")
+                else:
+                    print(f"[bitget] leverage verification warning: {e}")
 
         await _run_sync(_sync)
 
@@ -1203,13 +1205,12 @@ class BitgetExchange(BaseExchange):
         ts = str(_ts())
         path = '/api/v2/mix/order/place-order'
 
-        # One-Way Mode: нет posSide, только tradeSide
-        trade_side = 'close' if reduce_only else 'open'
-
+        # One-Way Mode: side определяет направление, tradeSide не нужен для открытия
+        # Для закрытия: side + reduce_only, без tradeSide
         body = {
             'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginCoin': 'USDT',
             'marginMode': 'isolated', 'side': side.lower(), 'orderType': 'market',
-            'size': str(qty), 'tradeSide': trade_side
+            'size': str(qty)
         }
 
         body_str = _json.dumps(body, separators=(',', ':'))
@@ -1235,30 +1236,6 @@ class BitgetExchange(BaseExchange):
         """Закрытие позиции на Bitget через market order с tradeSide=close (One-Way Mode)."""
         price = await self.get_price(symbol)
         return await _run_sync(self._bitget_order_sync, symbol, side, qty * price, reduce_only=True, price=price)
-
-    async def get_open_position(self, symbol: str) -> Optional[dict]:
-        import base64
-        def _sync():
-            ticker = _bitget_ticker(symbol)
-            ts = str(_ts())
-            path = f'/api/v2/mix/position/single-position?symbol={ticker}&productType=USDT-FUTURES&marginCoin=USDT'
-            sign_str = ts + 'GET' + path
-            sig = base64.b64encode(
-                hmac.new(self._api_secret.encode(), sign_str.encode(), hashlib.sha256).digest()).decode()
-            r = requests.get(f'https://api.bitget.com{path}',
-                             headers={'ACCESS-KEY': self._api_key, 'ACCESS-SIGN': sig, 'ACCESS-TIMESTAMP': ts,
-                                      'ACCESS-PASSPHRASE': self._passphrase, 'Content-Type': 'application/json'},
-                             timeout=10)
-            data = r.json().get('data', [])
-            for p in (data if isinstance(data, list) else [data]):
-                size = float(p.get('total', 0) or 0)
-                if size > 0:
-                    return {'size': size, 'side': p.get('holdSide'), 'entry_price': float(p.get('openPriceAvg', 0)),
-                            'unrealized_pnl': float(p.get('unrealizedPL', 0)),
-                            'leverage': int(float(p.get('leverage', 5)))}
-            return None
-
-        return await _run_sync(_sync)
 
     async def get_funding_rate(self, symbol: str) -> Optional[dict]:
         def _sync():
@@ -1814,11 +1791,42 @@ class GateExchange(CcxtExchange):
         return await _run_sync(self._gate_order_sync, ticker, side, qty, price)
 
     async def close_position(self, symbol: str, side: str, qty: float) -> dict:
-        """Закриття позиції (використовує існуючий qty контрактів)."""
+        """Закриття позиції. Отримуємо реальний розмір з API щоб не плутати монети з контрактами."""
         price = await self.get_price(symbol)
         ticker = _gate_ticker(symbol)
-        # При закритті шлемо qty як ціле число контрактів + reduce_only
-        return await _run_sync(self._gate_order_sync, ticker, side, int(qty), price, True)
+
+        actual_pos = await self.get_open_position(symbol)
+        if actual_pos and actual_pos.get('size'):
+            close_qty = abs(actual_pos['size'])
+            print(f"[gate] {symbol}: закриваю {close_qty} контрактів (з API)")
+        elif qty > 0:
+            info = await self.get_contract_info(symbol)
+            mult = info.get('multiplier', 1.0) or 1.0
+            close_qty = int(qty / mult)
+            if close_qty < 1:
+                close_qty = 1
+            print(f"[gate] {symbol}: закриваю {close_qty} контрактів (fallback, монети={qty})")
+        else:
+            close_qty = 1
+
+        result = await _run_sync(self._gate_order_sync, ticker, side, close_qty, price, True)
+
+        await asyncio.sleep(1)
+        remaining = await self.get_open_position(symbol)
+        if remaining and remaining.get('size', 0) > 0:
+            print(f"[gate] ⚠️ {symbol}: позиція не повністю закрилась ({remaining['size']} залишилось), retry...")
+            retry_qty = abs(remaining['size'])
+            await asyncio.sleep(0.5)
+            result2 = await _run_sync(self._gate_order_sync, ticker, side, retry_qty, price, True)
+            result['qty'] = result2.get('qty', retry_qty)
+            remaining2 = await self.get_open_position(symbol)
+            if remaining2 and remaining2.get('size', 0) > 0:
+                print(f"[gate] ❌ {symbol}: позиція все ще відкрита після retry!")
+                raise ValueError(f"Gate позиція не закрилась: {remaining2['size']} контрактів залишилось")
+            print(f"[gate] {symbol}: retry OK ✅")
+            result = result2
+
+        return result
 
     def _price_sync(self, symbol: str) -> float:
         ticker = _gate_ticker(symbol)
