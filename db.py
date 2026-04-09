@@ -54,6 +54,13 @@ class Trade:
     exec_time_short_ms: Optional[int] = None   # мс от сигнала до short fill
     exec_time_long_ms:  Optional[int] = None   # мс от сигнала до long fill
 
+    # Спред на момент закрытия
+    exit_spread_pct: Optional[float] = None
+
+    # Время закрытия с биржи
+    short_close_time: Optional[str] = None
+    long_close_time:  Optional[str] = None
+
     id: Optional[int] = None
 
 
@@ -91,7 +98,10 @@ def db_init():
                 signal_spread_pct     NUMERIC(10,4)  DEFAULT 0,
                 signal_text           TEXT           DEFAULT '',
                 exec_time_short_ms    INTEGER,
-                exec_time_long_ms     INTEGER
+                exec_time_long_ms     INTEGER,
+                exit_spread_pct      NUMERIC(10,4),
+                short_close_time     TIMESTAMPTZ,
+                long_close_time      TIMESTAMPTZ
             )
         """)
         cur.execute("""
@@ -104,6 +114,9 @@ def db_init():
         for col, definition in [
             ('exec_time_short_ms', 'INTEGER'),
             ('exec_time_long_ms',  'INTEGER'),
+            ('exit_spread_pct',   'NUMERIC(10,4)'),
+            ('short_close_time',  'TIMESTAMPTZ'),
+            ('long_close_time',   'TIMESTAMPTZ'),
         ]:
             try:
                 cur.execute(f"ALTER TABLE trades ADD COLUMN IF NOT EXISTS {col} {definition}")
@@ -186,7 +199,9 @@ def update_trade(trade: Trade):
                 fee_short_usd=%s,        fee_long_usd=%s,
                 closed_at=%s,
                 short_qty=%s,            long_qty=%s,
-                short_entry_price=%s,    long_entry_price=%s
+                short_entry_price=%s,    long_entry_price=%s,
+                exit_spread_pct=%s,
+                short_close_time=%s,     long_close_time=%s
             WHERE id=%s
         """, (
             trade.status,
@@ -198,6 +213,8 @@ def update_trade(trade: Trade):
             trade.closed_at,
             trade.short_qty,            trade.long_qty,
             trade.short_entry_price,    trade.long_entry_price,
+            trade.exit_spread_pct,
+            trade.short_close_time,     trade.long_close_time,
             trade.id,
         ))
         c.commit()

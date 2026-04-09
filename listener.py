@@ -151,9 +151,9 @@ async def _get_funding_times(signal: OpenSignal) -> tuple[int | None, int | None
 
 
 def _minutes_until(ts: int | None) -> float:
-    """Минут до unix timestamp. 9999 если ts=None."""
-    if not ts:
-        return 9999.0
+    """Минут до unix timestamp. Бросает ValueError если ts=None или <= 0."""
+    if not ts or ts <= 0:
+        raise ValueError("Funding time not available")
     return max(0.0, (ts - time.time()) / 60)
 
 
@@ -260,14 +260,44 @@ async def _wait_and_open(pending: PendingSignal):
         next_short_ts, next_long_ts = await asyncio.wait_for(
             _get_funding_times(updated_signal), timeout=10
         )
-    except asyncio.TimeoutError:
-        print(f"[Listener] {ticker}: таймаут получения времени фандинга после начисления")
-        next_short_ts, next_long_ts = None, None
-
-    min_until = min(
-        _minutes_until(next_short_ts),
-        _minutes_until(next_long_ts),
-    )
+        min_until = min(
+            _minutes_until(next_short_ts),
+            _minutes_until(next_long_ts),
+        )
+    except ValueError:
+        # Не удалось получить время фандинга — повторяем запрос через 10 сек
+        print(f"[Listener] {ticker}: не удалось получить время фандинга — повторяю через 10с...")
+        await asyncio.sleep(10)
+        try:
+            next_short_ts, next_long_ts = await asyncio.wait_for(
+                _get_funding_times(updated_signal), timeout=10
+            )
+            min_until = min(
+                _minutes_until(next_short_ts),
+                _minutes_until(next_long_ts),
+            )
+        except ValueError:
+            print(f"[Listener] {ticker}: снова не удалось получить время фандинга — сигнал остаётся в кэше")
+            # Кэшируем обратно для мониторинга
+            _seen.pop(ticker, None)
+            from signal_parser import OpenSignal as _OS
+            from signal_cache import add_signal
+            cached_sig = _OS(
+                ticker=signal.ticker, symbol=signal.symbol,
+                short_exchange=signal.short_exchange, long_exchange=signal.long_exchange,
+                short_price=sp, long_price=lp, spread_pct=current_spread,
+                funding_short=sf, funding_long=lf,
+                max_size_short=signal.max_size_short, max_size_long=signal.max_size_long,
+                interval_short=i_s, interval_long=i_l,
+                raw_text=f"[funding-timeout requeue] {signal.ticker}",
+            )
+            add_signal(cached_sig, current_spread)
+            return
+    except (asyncio.TimeoutError, Exception) as e:
+        print(f"[Listener] {ticker}: ошибка времени фандинга после начисления — блокируем вход: {e}")
+        await notify(f"⛔ <b>{ticker}: не удалось получить время фандинга — позицию не открываем</b>")
+        _seen.pop(ticker, None)
+        return
 
     if min_until <= WAIT_BEFORE_FUNDING_MIN:
         await notify(
@@ -575,10 +605,20 @@ class SignalListener:
             _seen.pop(signal.ticker, None)
             return
 
-        min_until = min(
-            _minutes_until(next_short_ts),
-            _minutes_until(next_long_ts),
-        )
+        try:
+            min_until = min(
+                _minutes_until(next_short_ts),
+                _minutes_until(next_long_ts),
+            )
+        except ValueError:
+            # Не удалось получить время фандинга — кэшируем сигнал, повторяем через монитор
+            print(f"[Listener] {signal.ticker}: не удалось получить время фандинга — кэширую")
+            await short_ex.close()
+            await long_ex.close()
+            await self._cache_signal(signal, received_ms)
+            _seen.pop(signal.ticker, None)
+            return
+
         nearest_fund_ts = None
         if next_short_ts and next_long_ts:
             nearest_fund_ts = min(next_short_ts, next_long_ts)

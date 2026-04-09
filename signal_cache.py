@@ -2,11 +2,13 @@
 signal_cache.py — кэш сигналов для ожидания подходящего спреда.
 
 Логика:
-1. Если спред сигнала < MIN_SPREAD_PCT → сохраняем сигнал в кэш
+1. Если спред сигнала < CACHE_MIN_SPREAD → сохраняем сигнал в кэш
 2. Фоновый монитор каждые 5 сек проверяет живые цены кэшированных сигналов
-3. Если спред вырос >= MIN_SPREAD_PCT → запускаем риск-проверку и входим
+3. Если спред вырос >= CACHE_MIN_SPREAD → запускаем риск-проверку и входим
 4. Если пришёл CLOSE сигнал → удаляем из кэша
 5. Если сигнал устарел (CACHE_TTL) → удаляем
+6. Если пришёл сигнал для тикера который уже в кэше → выбираем наибольший спред
+7. Если достигнут лимит позиций и несколько сигналов → выбираем наибольший спред
 """
 
 import asyncio
@@ -14,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from settings import MIN_SPREAD_PCT, LEVERAGE
+from settings import CACHE_MIN_SPREAD, LEVERAGE, MAX_OPEN_POSITIONS
 from signal_parser import OpenSignal
 from exchanges import create_exchange
 from notifier import notify
@@ -23,6 +25,8 @@ from notifier import notify
 CACHE_TTL_SECONDS = 15 * 60  # 15 минут — время жизни кэшированного сигнала
 MONITOR_INTERVAL  = 5        # проверка каждые 5 секунд
 SPREAD_ENTRY_DROP = 1.2      # если спред упал на 1.2% от входа → закрываем
+# CACHE_MIN_SPREAD импортируется из settings (4.0 по умолчанию)
+MAX_CACHED_SIGNALS = MAX_OPEN_POSITIONS * 2  # макс. кэшированных сигналов
 
 # ── Кэш сигналов ──────────────────────────────────────────────
 _cached_signals: dict[str, "CachedSignal"] = {}
@@ -41,13 +45,40 @@ class CachedSignal:
 
 
 def add_signal(signal: OpenSignal, current_spread: float):
-    """Сохраняет сигнал в кэш для мониторинга."""
+    """Сохраняет сигнал в кэш. При конфликте выбирает наибольший спред."""
+    ticker = signal.ticker
+
+    # Если тикер уже в кэше — сравниваем спреды, оставляем наибольший
+    if ticker in _cached_signals:
+        existing = _cached_signals[ticker]
+        if current_spread > existing.last_spread:
+            cached = CachedSignal(
+                signal=signal,
+                last_spread=current_spread,
+                cached_at=existing.cached_at,
+            )
+            _cached_signals[ticker] = cached
+            print(f"[SignalCache] {ticker} обновлён в кэше: спред {current_spread:.2f}% > {existing.last_spread:.2f}% (предыдущий)")
+        else:
+            print(f"[SignalCache] {ticker} уже в кэше со спредом {existing.last_spread:.2f}% — новый {current_spread:.2f}% ниже, пропускаем")
+        return
+
+    # Если достигнут лимит кэша — удаляем сигналы с наименьшим спредом
+    if len(_cached_signals) >= MAX_CACHED_SIGNALS:
+        print(f"[SignalCache] Кэш полон ({MAX_CACHED_SIGNALS}), удаляю наименьшие спреды...")
+        # Сортируем по спреду, удаляем худшие
+        sorted_signals = sorted(_cached_signals.items(), key=lambda x: x[1].last_spread)
+        to_remove = len(_cached_signals) - MAX_CACHED_SIGNALS + 1
+        for tick, cached_item in sorted_signals[:to_remove]:
+            print(f"[SignalCache] Удалён {tick} со спредом {cached_item.last_spread:.2f}% (место для нового)")
+            _cached_signals.pop(tick)
+
     cached = CachedSignal(
         signal=signal,
         last_spread=current_spread,
     )
-    _cached_signals[signal.ticker] = cached
-    print(f"[SignalCache] {signal.ticker} добавлен в кэш: спред {current_spread:.2f}% < {MIN_SPREAD_PCT}%")
+    _cached_signals[ticker] = cached
+    print(f"[SignalCache] {ticker} добавлен в кэш: спред {current_spread:.2f}%")
 
 
 def remove_signal(ticker: str):
@@ -154,8 +185,8 @@ async def _monitor_loop():
 
                 print(f"[SignalCache] {ticker}: спред {current_spread:.2f}% (попытка {cached.attempts})")
 
-                # Спред должен быть >= 3%
-                if current_spread < MIN_SPREAD_PCT:
+                # Спред должен быть >= CACHE_MIN_SPREAD (3.0%)
+                if current_spread < CACHE_MIN_SPREAD:
                     continue
 
                 # Проверяем время до фандинга
@@ -173,18 +204,35 @@ async def _monitor_loop():
                     next_short_ts, next_long_ts = await asyncio.wait_for(
                         _get_funding_times(temp_sig), timeout=10
                     )
-                    min_until = min(
-                        _minutes_until(next_short_ts),
-                        _minutes_until(next_long_ts),
-                    )
-                except Exception:
-                    min_until = 9999  # если не удалось получить — считаем что далеко
+                    try:
+                        min_until = min(
+                            _minutes_until(next_short_ts),
+                            _minutes_until(next_long_ts),
+                        )
+                    except ValueError:
+                        # Не удалось получить время фандинга — повторяем через 10 сек
+                        print(f"[SignalCache] {ticker}: не удалось получить время фандинга — повторяю через 10с...")
+                        await asyncio.sleep(10)
+                        try:
+                            next_short_ts2, next_long_ts2 = await asyncio.wait_for(
+                                _get_funding_times(temp_sig), timeout=10
+                            )
+                            min_until = min(
+                                _minutes_until(next_short_ts2),
+                                _minutes_until(next_long_ts2),
+                            )
+                        except ValueError:
+                            print(f"[SignalCache] {ticker}: снова не удалось получить время фандинга — пропускаю проверку, вход заблокирован")
+                            continue  # сигнал остаётся в кэше, следующая попытка через 5 сек
+                except Exception as e:
+                    print(f"[SignalCache] {ticker}: ошибка получения времени фандинга — блокируем вход: {e}")
+                    continue  # если не удалось получить фандинг — НЕ входим, сигнал в кэше
 
                 if min_until <= WAIT_BEFORE_FUNDING_MIN:
                     print(f"[SignalCache] {ticker}: до фандинга {min_until:.0f} мин — жду начисления")
                     continue
 
-                print(f"[SignalCache] {ticker}: спред {current_spread:.2f}% >= {MIN_SPREAD_PCT}%, фандинг через {min_until:.0f}м — вхожу!")
+                print(f"[SignalCache] {ticker}: спред {current_spread:.2f}% >= {CACHE_MIN_SPREAD}%, фандинг через {min_until:.0f}м — вхожу!")
 
                 # Удаляем из кэша чтобы не дублировать
                 _cached_signals.pop(ticker, None)
@@ -216,7 +264,7 @@ async def _monitor_loop():
 
                 await notify(
                     f"📡 <b>{ticker}: кэшированный сигнал активирован</b>\n"
-                    f"📊 Спред: {current_spread:.2f}% (мин {MIN_SPREAD_PCT}%)\n"
+                    f"📊 Спред: {current_spread:.2f}% (мин {CACHE_MIN_SPREAD}%)\n"
                     f"⏱ До фандинга: {min_until:.0f}м\n"
                     f"⚡ Открываю позицию..."
                 )
@@ -233,8 +281,25 @@ async def _monitor_loop():
                     await asyncio.gather(s_ex2.close(), l_ex2.close(), return_exceptions=True)
 
                 if not risk:
-                    print(f"[SignalCache] {ticker}: риск-менеджер отклонил — {risk.reason}")
-                    await notify(f"⛔ <b>{ticker}: кэшированный сигнал отклонён</b>\n{risk.reason}")
+                    reason = risk.reason or ""
+                    print(f"[SignalCache] {ticker}: риск-менеджер отклонил — {reason}")
+                    await notify(f"⛔ <b>{ticker}: кэшированный сигнал отклонён</b>\n{reason}")
+
+                    # Конфликт: max positions / insufficient funds / same ticker → выбираем наибольший спред
+                    conflict_reasons = (
+                        "Лимит позиций", "Не удалось определить размер", "уже открыта",
+                        "выключена в GUI", "недостаточно", "не хватает"
+                    )
+                    if any(cr.lower() in reason.lower() for cr in conflict_reasons):
+                        print(f"[SignalCache] {ticker}: конфликт — удаляю низкоспредовые сигналы")
+                        # Удаляем все кэшированные сигналы кроме текущего (наибольший спред)
+                        remaining = {
+                            t: c for t, c in _cached_signals.items()
+                            if t != ticker and c.last_spread < cached.last_spread
+                        }
+                        for rem_t, rem_c in remaining.items():
+                            print(f"[SignalCache] Удалён {rem_t} со спредом {rem_c.last_spread:.2f}%")
+                            _cached_signals.pop(rem_t, None)
                     continue
 
                 # Открываем позицию

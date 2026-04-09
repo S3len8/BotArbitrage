@@ -307,47 +307,12 @@ async def api_balance_history(exchange: str, limit: int = 100):
 
 @app.get("/api/trades")
 async def api_trades(limit: int = 500):
-    """Все сделки — PnL закрытых позиций берётся с бирж (Realized PNL)."""
+    """Все сделки из БД."""
     if not _db_ok:
         return []
     from db import get_trade_history
-    from exchanges import create_exchange
-    import asyncio
-
     trades = get_trade_history(limit)
-    if not trades:
-        return []
-
-    sem = asyncio.Semaphore(5)
-
-    async def enrich_trade(t):
-        item = _t(t)
-        if t.status in ('closed', 'partial'):
-            async with sem:
-                try:
-                    s_ex = create_exchange(t.short_exchange)
-                    l_ex = create_exchange(t.long_exchange)
-                    s_pnl, l_pnl = await asyncio.gather(
-                        s_ex.get_closed_pnl(t.symbol),
-                        l_ex.get_closed_pnl(t.symbol),
-                        return_exceptions=True,
-                    )
-                    await asyncio.gather(s_ex.close(), l_ex.close(), return_exceptions=True)
-
-                    if not isinstance(s_pnl, Exception) and s_pnl is not None:
-                        item['short_pnl_usd'] = round(float(s_pnl), 6)
-                    if not isinstance(l_pnl, Exception) and l_pnl is not None:
-                        item['long_pnl_usd'] = round(float(l_pnl), 6)
-
-                    # Net PnL = short + long (биржевой PnL уже включает комиссии)
-                    if item['short_pnl_usd'] is not None and item['long_pnl_usd'] is not None:
-                        item['net_pnl_usd'] = round(item['short_pnl_usd'] + item['long_pnl_usd'], 6)
-                except Exception as e:
-                    print(f"[GUI] get_closed_pnl error for trade #{t.id}: {e}")
-        return item
-
-    tasks = [enrich_trade(t) for t in trades]
-    return await asyncio.gather(*tasks)
+    return [_t(t) for t in trades]
 
 
 @app.get("/api/trades/open")
@@ -420,19 +385,48 @@ async def api_positions_live():
                     print(f"[GUI] Позиция #{t.id} ({t.ticker}) закрыта на бирже — обновляю БД")
                     t.status = 'closed' if (not s_on_ex and not l_on_ex) else 'partial'
                     t.closed_at = datetime.now(timezone.utc).isoformat()
-                    t.short_close_price = sp
-                    t.long_close_price = lp
-                    if t.short_entry_price and t.short_qty:
-                        t.short_pnl_usd = round((t.short_entry_price - sp) * t.short_qty, 6)
-                    if t.long_entry_price and t.long_qty:
-                        t.long_pnl_usd = round((lp - t.long_entry_price) * t.long_qty, 6)
+
+                    # Получаем полные данные закрытия с бирж
+                    try:
+                        s_cd, l_cd = await asyncio.gather(
+                            s_ex.get_close_data(t.symbol),
+                            l_ex.get_close_data(t.symbol),
+                            return_exceptions=True,
+                        )
+                        if not isinstance(s_cd, Exception) and s_cd:
+                            t.short_close_price = s_cd.get('close_price') or sp
+                            t.short_pnl_usd = round(s_cd.get('realized_pnl', 0) or 0, 6)
+                            t.short_close_time = s_cd.get('close_time')
+                            t.fee_short_usd = round(s_cd.get('fee', 0) or 0, 6)
+                        else:
+                            t.short_close_price = sp
+                            if t.short_entry_price and t.short_qty:
+                                t.short_pnl_usd = round((t.short_entry_price - sp) * t.short_qty, 6)
+                        if not isinstance(l_cd, Exception) and l_cd:
+                            t.long_close_price = l_cd.get('close_price') or lp
+                            t.long_pnl_usd = round(l_cd.get('realized_pnl', 0) or 0, 6)
+                            t.long_close_time = l_cd.get('close_time')
+                            t.fee_long_usd = round(l_cd.get('fee', 0) or 0, 6)
+                        else:
+                            t.long_close_price = lp
+                            if t.long_entry_price and t.long_qty:
+                                t.long_pnl_usd = round((lp - t.long_entry_price) * t.long_qty, 6)
+                    except Exception as cd_err:
+                        print(f"[GUI] get_close_data error: {cd_err}")
+                        t.short_close_price = sp
+                        t.long_close_price = lp
+                        if t.short_entry_price and t.short_qty:
+                            t.short_pnl_usd = round((t.short_entry_price - sp) * t.short_qty, 6)
+                        if t.long_entry_price and t.long_qty:
+                            t.long_pnl_usd = round((lp - t.long_entry_price) * t.long_qty, 6)
+
                     fees = (t.fee_short_usd or 0) + (t.fee_long_usd or 0)
                     if t.short_pnl_usd is not None and t.long_pnl_usd is not None:
-                        t.net_pnl_usd = round(t.short_pnl_usd + t.long_pnl_usd - fees, 6)
+                        t.net_pnl_usd = round(t.short_pnl_usd + t.long_pnl_usd, 6)
                     update_trade(t)
                     item['status'] = t.status
-                    item['short_close_price'] = sp
-                    item['long_close_price'] = lp
+                    item['short_close_price'] = t.short_close_price
+                    item['long_close_price'] = t.long_close_price
                     item['short_pnl_usd'] = t.short_pnl_usd
                     item['long_pnl_usd'] = t.long_pnl_usd
                     item['net_pnl_usd'] = t.net_pnl_usd
@@ -630,7 +624,7 @@ def _t(t) -> dict:
         "short_exchange": t.short_exchange, "long_exchange": t.long_exchange,
         "trade_size_usd": t.trade_size_usd,
         "short_entry_price": t.short_entry_price, "long_entry_price": t.long_entry_price,
-        "short_qty": t.short_qty, "long_qty": t.long_qty, # ДОДАНО
+        "short_qty": t.short_qty, "long_qty": t.long_qty,
         "short_close_price": t.short_close_price, "long_close_price": t.long_close_price,
         "short_pnl_usd": t.short_pnl_usd, "long_pnl_usd": t.long_pnl_usd,
         "net_pnl_usd": t.net_pnl_usd,
@@ -640,8 +634,11 @@ def _t(t) -> dict:
         "closed_at": str(t.closed_at) if t.closed_at else None,
         "status": t.status, "leverage": t.leverage,
         "signal_spread_pct": t.signal_spread_pct,
+        "exit_spread_pct": t.exit_spread_pct,
         "exec_time_short_ms": t.exec_time_short_ms,
         "exec_time_long_ms":  t.exec_time_long_ms,
+        "short_close_time": str(t.short_close_time) if t.short_close_time else None,
+        "long_close_time":  str(t.long_close_time) if t.long_close_time else None,
     }
 
 

@@ -729,7 +729,7 @@
             <th>Close Short</th><th>Close Long</th>
             <th>PnL Short</th><th>PnL Long</th><th>Fees</th><th>Net PnL</th>
             <th>Fund Short</th><th>Fund Long</th>
-            <th>Spread%</th><th>Exec ms</th>
+            <th>Spread%</th><th>Exit Spread%</th><th>Exec ms</th>
             <th>Opened</th><th>Closed</th><th>Duration</th><th>Status</th>
           </tr>
         </thead>
@@ -1390,7 +1390,7 @@ function renderTable() {
   });
   const tbody = document.getElementById('trades-tbody');
   if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="22" style="text-align:center;padding:30px;
+    tbody.innerHTML = `<tr><td colspan="23" style="text-align:center;padding:30px;
       color:var(--text3);font-family:var(--mono)">No trades found</td></tr>`;
     return;
   }
@@ -1427,6 +1427,7 @@ function renderTable() {
       <td style="color:var(--text3)">${fund_s}</td>
       <td style="color:var(--text3)">${fund_l}</td>
       <td>${Number(t.signal_spread_pct||0).toFixed(2)}%</td>
+      <td>${t.exit_spread_pct != null ? Number(t.exit_spread_pct).toFixed(2)+'%' : '—'}</td>
       <td>${execStr}</td>
       <td style="color:var(--text3)">${fmtTime(t.opened_at)}</td>
       <td style="color:var(--text3)">${fmtTime(t.closed_at)}</td>

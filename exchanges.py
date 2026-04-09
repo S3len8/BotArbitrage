@@ -13,6 +13,8 @@ import math
 import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 import ccxt.async_support as ccxt
@@ -69,6 +71,12 @@ class BaseExchange(ABC):
     async def get_closed_pnl(self, symbol: str) -> Optional[float]:
         """Возвращает реализованный PnL последней закрытой позиции с биржи.
         Это точные данные с биржи — использовать для итогового расчёта прибыли.
+        """
+        return None
+
+    async def get_close_data(self, symbol: str) -> Optional[dict]:
+        """Возвращает полные данные закрытия позиции с биржи:
+        {'close_price': float, 'realized_pnl': float, 'close_time': str, 'fee': float}
         """
         return None
 
@@ -482,7 +490,12 @@ class BinanceExchange(CcxtExchange):
     def _open_params(self, side): return {'type': 'MARKET'}
 
     async def get_closed_pnl(self, symbol: str) -> Optional[float]:
-        """Получает реализованный PnL закрытой позиции с Binance Futures."""
+        """Получает реализованный PnЛ закрытой позиции с Binance Futures."""
+        data = await self.get_close_data(symbol)
+        return data.get('realized_pnl') if data else None
+
+    async def get_close_data(self, symbol: str) -> Optional[dict]:
+        """Полные данные закрытия с Binance: цена, PnL, время, комиссии."""
         def _sync():
             ticker = symbol.replace('/', '').replace(':USDT', '')
             ts = _ts()
@@ -495,10 +508,25 @@ class BinanceExchange(CcxtExchange):
             r.raise_for_status()
             trades = r.json()
             if not trades: return None
-            return sum(float(t.get('realizedPnl', 0)) for t in trades)
+
+            realized_pnl = sum(float(t.get('realizedPnl', 0)) for t in trades)
+            fee = sum(float(t.get('commission', 0)) for t in trades)
+            # Берем последний (самый свежий) ордер
+            last = trades[-1]
+            close_price = float(last.get('price', 0))
+            close_ts_ms = int(last.get('time', 0))
+            close_time = datetime.fromtimestamp(close_ts_ms / 1000, tz=timezone.utc).isoformat()
+
+            return {
+                'close_price': close_price,
+                'realized_pnl': realized_pnl,
+                'close_time': close_time,
+                'fee': fee,
+            }
         try:
             return await _run_sync(_sync)
-        except Exception:
+        except Exception as e:
+            print(f"[binance] get_close_data error: {e}")
             return None
 
     async def get_funding_rate(self, symbol: str) -> Optional[dict]:
@@ -770,6 +798,11 @@ class BybitExchange(BaseExchange):
 
     async def get_closed_pnl(self, symbol: str) -> Optional[float]:
         """Получает реализованный PnL закрытой позиции с Bybit."""
+        data = await self.get_close_data(symbol)
+        return data.get('realized_pnl') if data else None
+
+    async def get_close_data(self, symbol: str) -> Optional[dict]:
+        """Полные данные закрытия с Bybit: цена, PnL, время, комиссии."""
         def _sync():
             ticker = _bybit_ticker(symbol)
             ts = str(_ts())
@@ -786,12 +819,27 @@ class BybitExchange(BaseExchange):
                              timeout=10)
             r.raise_for_status()
             items = r.json().get('result', {}).get('list', [])
-            if not items: return None
-            # Берём самую последнюю закрытую позицию
-            return float(items[0].get('closedPnl', 0))
+            if not items:
+                return None
+
+            pos = items[0]
+            realized_pnl = float(pos.get('closedPnl', 0))
+            fee = abs(float(pos.get('fee', 0) or 0))
+            # avgEntryPrice, avgClosePrice — Bybit возвращает среднюю цену входа/выхода
+            close_price = float(pos.get('avgClosePrice', 0))
+            close_ts_ms = int(pos.get('updatedAt', 0) or 0)
+            close_time = datetime.fromtimestamp(close_ts_ms / 1000, tz=timezone.utc).isoformat() if close_ts_ms else None
+
+            return {
+                'close_price': close_price,
+                'realized_pnl': realized_pnl,
+                'close_time': close_time,
+                'fee': fee,
+            }
         try:
             return await _run_sync(_sync)
-        except Exception:
+        except Exception as e:
+            print(f"[bybit] get_close_data error: {e}")
             return None
 
     async def get_funding_rate(self, symbol: str) -> Optional[dict]:
@@ -1041,6 +1089,11 @@ class MexcExchange(CcxtExchange):
 
     async def get_closed_pnl(self, symbol: str) -> Optional[float]:
         """Получает реализованный PnL закрытой позиции с MEXC Futures."""
+        data = await self.get_close_data(symbol)
+        return data.get('realized_pnl') if data else None
+
+    async def get_close_data(self, symbol: str) -> Optional[dict]:
+        """Полные данные закрытия с MEXC: цена, PnL, время, комиссии."""
         import json as _json
         ticker = _mexc_ticker(symbol)
 
@@ -1056,16 +1109,28 @@ class MexcExchange(CcxtExchange):
             data = r.json()
             if not data.get('success') or not data.get('data', {}).get('resultList'):
                 return None
-            total_pnl = 0.0
-            for pos in data['data']['resultList']:
-                if pos.get('symbol') == ticker:
-                    pnl = float(pos.get('closeProfitLoss', 0) or 0)
-                    total_pnl += pnl
-            return total_pnl if total_pnl != 0 else None
 
+            positions = [p for p in data['data']['resultList'] if p.get('symbol') == ticker]
+            if not positions:
+                return None
+
+            total_pnl = sum(float(p.get('closeProfitLoss', 0) or 0) for p in positions)
+            last = positions[0]
+            close_price = float(last.get('closeAvgPrice', 0) or 0)
+            close_ts = int(last.get('updateTime', 0) or 0)
+            close_time = datetime.fromtimestamp(close_ts / 1000, tz=timezone.utc).isoformat() if close_ts else None
+            fee = abs(float(last.get('fee', 0) or 0))
+
+            return {
+                'close_price': close_price,
+                'realized_pnl': total_pnl,
+                'close_time': close_time,
+                'fee': fee,
+            }
         try:
             return await _run_sync(_sync)
-        except Exception:
+        except Exception as e:
+            print(f"[mexc] get_close_data error: {e}")
             return None
 
 
@@ -1160,15 +1225,22 @@ class BitgetExchange(BaseExchange):
             except Exception as e:
                 print(f"[bitget] set-margin-mode: {e}")
 
-            # 3. Leverage (в One-Way без holdSide)
-            _do_bitget_post('/api/v2/mix/account/set-leverage',
-                            {'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginCoin': 'USDT',
-                             'leverage': str(LEVERAGE)})
-            print(f"[bitget] {ticker}: leverage set to {LEVERAGE}x")
+            # 3. Leverage — всегда 5x, без вариантов
+            for _retry in range(3):
+                try:
+                    _do_bitget_post('/api/v2/mix/account/set-leverage',
+                                    {'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginCoin': 'USDT',
+                                     'leverage': '5'})
+                    print(f"[bitget] {ticker}: leverage set to 5x")
+                    break
+                except Exception as lev_err:
+                    print(f"[bitget] {ticker}: set-leverage error (attempt {_retry+1}): {lev_err}")
+                    if _retry == 2:
+                        raise ValueError(f"Bitget leverage не выставлен: {lev_err}")
 
-            # 4. Верификация — если не работает, просто пропускаем (leverage уже выставлен)
+            # 4. Верификация — убеждаемся что 5x
             import time as _time
-            _time.sleep(0.5)
+            _time.sleep(0.3)
             try:
                 acct_data = _do_bitget_get('/api/v2/mix/account/account',
                                            {'symbol': ticker, 'marginCoin': 'USDT'})
@@ -1178,16 +1250,19 @@ class BitgetExchange(BaseExchange):
                         margin_mode = acct.get('marginMode', '')
                         leverage = acct.get('leverage', '')
                         print(f"[bitget] {ticker}: marginMode={margin_mode}, leverage={leverage}")
-                        if leverage and int(float(leverage)) != LEVERAGE:
-                            print(f"[bitget] {ticker}: leverage mismatch {leverage}x != {LEVERAGE}x — попытка перевыставить")
-                            _do_bitget_post('/api/v2/mix/account/set-leverage',
-                                            {'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginCoin': 'USDT',
-                                             'leverage': str(LEVERAGE)})
-                    print(f"[bitget] {ticker}: leverage verified ✅ {LEVERAGE}×")
+                        if leverage:
+                            lev_int = int(float(leverage))
+                            if lev_int != 5:
+                                print(f"[bitget] {ticker}: ❌ leverage {lev_int}x != 5x — ПЕРЕВЫСТАВЛЯЕМ")
+                                _do_bitget_post('/api/v2/mix/account/set-leverage',
+                                                {'symbol': ticker, 'productType': 'USDT-FUTURES', 'marginCoin': 'USDT',
+                                                 'leverage': '5'})
+                                _time.sleep(0.3)
+                                print(f"[bitget] {ticker}: leverage forced to 5x ✅")
+                    print(f"[bitget] {ticker}: leverage verified ✅ 5×")
             except Exception as e:
-                # 400 ошибка при верификации — НЕ блокируем торговлю
                 if '400' in str(e):
-                    print(f"[bitget] {ticker}: верификация невозможна (400), пропускаем — leverage выставлен ранее")
+                    print(f"[bitget] {ticker}: верификация невозможна (400), пропускаем")
                 else:
                     print(f"[bitget] leverage verification warning: {e}")
 
@@ -1324,6 +1399,11 @@ class BitgetExchange(BaseExchange):
 
     async def get_closed_pnl(self, symbol: str) -> Optional[float]:
         """Получает реализованный PnL закрытой позиции с Bitget Futures."""
+        data = await self.get_close_data(symbol)
+        return data.get('realized_pnl') if data else None
+
+    async def get_close_data(self, symbol: str) -> Optional[dict]:
+        """Полные данные закрытия с Bitget: цена, PnL, время, комиссии."""
         import base64
         def _sync():
             ticker = _bitget_ticker(symbol)
@@ -1342,14 +1422,25 @@ class BitgetExchange(BaseExchange):
             data = r.json()
             if data.get('code') != '00000' or not data.get('data', {}).get('list'):
                 return None
-            total_pnl = 0.0
-            for pos in data['data']['list']:
-                pnl = float(pos.get('netProfit', 0) or 0)
-                total_pnl += pnl
-            return total_pnl if total_pnl != 0 else None
+
+            positions = data['data']['list']
+            total_pnl = sum(float(p.get('netProfit', 0) or 0) for p in positions)
+            last = positions[0]  # самый свежий
+            close_price = float(last.get('avgClosePrice', 0))
+            close_ts_ms = int(last.get('updateTime', 0) or 0)
+            close_time = datetime.fromtimestamp(close_ts_ms / 1000, tz=timezone.utc).isoformat() if close_ts_ms else None
+            fee = abs(float(last.get('totalFee', 0) or 0))
+
+            return {
+                'close_price': close_price,
+                'realized_pnl': total_pnl,
+                'close_time': close_time,
+                'fee': fee,
+            }
         try:
             return await _run_sync(_sync)
-        except Exception:
+        except Exception as e:
+            print(f"[bitget] get_close_data error: {e}")
             return None
 
 
@@ -1614,7 +1705,12 @@ class KucoinExchange(BaseExchange):
 
     async def get_closed_pnl(self, symbol: str) -> Optional[float]:
         """Получает реализованный PnL закрытой позиции с KuCoin Futures."""
-        import base64, json as _json
+        data = await self.get_close_data(symbol)
+        return data.get('realized_pnl') if data else None
+
+    async def get_close_data(self, symbol: str) -> Optional[dict]:
+        """Полные данные закрытия с KuCoin: цена, PnL, время, комиссии."""
+        import base64
         ticker = _kucoin_ticker(symbol)
 
         def _sync():
@@ -1637,15 +1733,25 @@ class KucoinExchange(BaseExchange):
             data = r.json()
             if data.get('code') not in ('200000', 200000) or not data.get('data'):
                 return None
-            total_pnl = 0.0
-            for fill in data['data']:
-                pnl = float(fill.get('realisedPnl', 0) or 0)
-                total_pnl += pnl
-            return total_pnl if total_pnl != 0 else None
 
+            fills = data['data']
+            total_pnl = sum(float(f.get('realisedPnl', 0) or 0) for f in fills)
+            fee = sum(abs(float(f.get('fee', 0) or 0)) for f in fills)
+            last = fills[-1]
+            close_price = float(last.get('price', 0))
+            close_ts_s = int(last.get('createdAt', 0) or 0) // 1000
+            close_time = datetime.fromtimestamp(close_ts_s, tz=timezone.utc).isoformat() if close_ts_s else None
+
+            return {
+                'close_price': close_price,
+                'realized_pnl': total_pnl,
+                'close_time': close_time,
+                'fee': fee,
+            }
         try:
             return await _run_sync(_sync)
-        except Exception:
+        except Exception as e:
+            print(f"[kucoin] get_close_data error: {e}")
             return None
 
 
@@ -1902,14 +2008,18 @@ class GateExchange(CcxtExchange):
 
     async def get_closed_pnl(self, symbol: str) -> Optional[float]:
         """Получает реализованный PnL закрытой позиции с Gate.io Futures."""
+        data = await self.get_close_data(symbol)
+        return data.get('realized_pnl') if data else None
+
+    async def get_close_data(self, symbol: str) -> Optional[dict]:
+        """Полные данные закрытия с Gate.io: цена, PnL, время, комиссии."""
         import hashlib as hl
         ticker = _gate_ticker(symbol)
 
         def _sync():
             ts = str(int(time.time()))
             method = 'GET'
-            path = f'/api/v4/futures/usdt/my_trades'
-            # Gate API v4: /my_trades возвращает сделки, суммируем realised PnL
+            path = '/api/v4/futures/usdt/my_trades'
             query = f'contract={ticker}&limit=20'
             body_hash = hl.sha512(b'').hexdigest()
             sign_str = '\n'.join([method, path, query, body_hash, ts])
@@ -1921,15 +2031,24 @@ class GateExchange(CcxtExchange):
             trades = r.json()
             if not trades:
                 return None
-            total_pnl = 0.0
-            for t in trades:
-                pnl = float(t.get('pnl', 0) or 0)
-                total_pnl += pnl
-            return total_pnl if total_pnl != 0 else None
 
+            realized_pnl = sum(float(t.get('pnl', 0) or 0) for t in trades)
+            fee = sum(abs(float(t.get('fee', 0) or 0)) for t in trades)
+            last = trades[-1]
+            close_price = float(last.get('price', 0))
+            close_ts = int(last.get('create_time', 0))
+            close_time = datetime.fromtimestamp(close_ts, tz=timezone.utc).isoformat()
+
+            return {
+                'close_price': close_price,
+                'realized_pnl': realized_pnl,
+                'close_time': close_time,
+                'fee': fee,
+            }
         try:
             return await _run_sync(_sync)
-        except Exception:
+        except Exception as e:
+            print(f"[gate] get_close_data error: {e}")
             return None
 
 

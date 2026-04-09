@@ -7,7 +7,7 @@ LEVERAGE:            int   = int(os.getenv("LEVERAGE", "5"))
 PROXY:               str   = os.getenv("PROXY", "")
 # Минимальный спред: стратегия #4 работает от 3%
 # (медиана закрытия 2 минуты при обоих отрицательных фандингах)
-MIN_SPREAD_PCT:      float = float(os.getenv("MIN_SPREAD_PCT", "3.0"))
+MIN_SPREAD_PCT:      float = float(os.getenv("MIN_SPREAD_PCT", "4.0"))
 # Минимальный объём 24ч. Для малых монет (ZBCN, NTRN) объём может быть $20k-100k
 # Ставим 0 чтобы не блокировать — объём проверяется визуально
 MIN_VOLUME_USD:      float = float(os.getenv("MIN_VOLUME_USD", "0"))
@@ -15,6 +15,8 @@ MIN_VOLUME_USD:      float = float(os.getenv("MIN_VOLUME_USD", "0"))
 # Малые монеты (ZBCN, NTRN, LYN) имеют объём $10k-100k и будут заблокированы при 500k
 MAX_OPEN_POSITIONS:  int   = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 BALANCE_ALERT_PCT:   float = float(os.getenv("BALANCE_ALERT_PCT", "50"))
+
+CACHE_MIN_SPREAD:    float = float(os.getenv("CACHE_MIN_SPREAD", "4.0"))
 
 # ── Фандинг-фильтр ────────────────────────────────────────────
 # Данные: diff<0.1% → медиана закрытия 69м (отлично)
