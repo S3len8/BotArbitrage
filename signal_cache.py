@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from settings import CACHE_MIN_SPREAD, LEVERAGE, MAX_OPEN_POSITIONS
+from settings import LEVERAGE, MAX_OPEN_POSITIONS
 from signal_parser import OpenSignal
 from exchanges import create_exchange
 from notifier import notify
@@ -24,8 +24,8 @@ from notifier import notify
 # ── Настройки ─────────────────────────────────────────────────
 CACHE_TTL_SECONDS = 15 * 60  # 15 минут — время жизни кэшированного сигнала
 MONITOR_INTERVAL  = 5        # проверка каждые 5 секунд
-SPREAD_ENTRY_DROP = 1.2      # если спред упал на 1.2% от входа → закрываем
-# CACHE_MIN_SPREAD импортируется из settings (4.0 по умолчанию)
+SPREAD_ENTRY_DROP = 1.5      # если спред упал на 1.5% от входа → закрываем
+CACHE_MIN_SPREAD  = 3.5      # HARDCODED минимум для входа из кэша
 MAX_CACHED_SIGNALS = MAX_OPEN_POSITIONS * 2  # макс. кэшированных сигналов
 
 # ── Кэш сигналов ──────────────────────────────────────────────
@@ -81,11 +81,12 @@ def add_signal(signal: OpenSignal, current_spread: float):
     print(f"[SignalCache] {ticker} добавлен в кэш: спред {current_spread:.2f}%")
 
 
-def remove_signal(ticker: str):
+async def remove_signal(ticker: str):
     """Удаляет сигнал из кэша."""
     removed = _cached_signals.pop(ticker, None)
     if removed:
         print(f"[SignalCache] {ticker} удалён из кэша")
+        await notify(f"🗑 <b>{ticker}</b> удалён из кэша (CLOSE сигнал)")
     return removed is not None
 
 
@@ -140,19 +141,19 @@ async def _monitor_loop():
             continue
 
         now = time.time()
-        stale = []
+        stale = {}  # {ticker: reason}
 
         for ticker, cached in list(_cached_signals.items()):
             # Проверяем время жизни
             if now - cached.cached_at > CACHE_TTL_SECONDS:
-                stale.append(ticker)
-                print(f"[SignalCache] {ticker} устарел ({CACHE_TTL_SECONDS // 60} мин) — удаляю")
+                stale[ticker] = f"устарел ({CACHE_TTL_SECONDS // 60} мин)"
+                print(f"[SignalCache] {ticker} {stale[ticker]} — удаляю")
                 continue
 
             cached.attempts += 1
             if cached.attempts > cached.max_attempts:
-                stale.append(ticker)
-                print(f"[SignalCache] {ticker} исчерпал попытки ({cached.max_attempts}) — удаляю")
+                stale[ticker] = f"исчерпал попытки ({cached.max_attempts})"
+                print(f"[SignalCache] {ticker} {stale[ticker]} — удаляю")
                 continue
 
             # Получаем живые цены + фандинг
@@ -185,7 +186,7 @@ async def _monitor_loop():
 
                 print(f"[SignalCache] {ticker}: спред {current_spread:.2f}% (попытка {cached.attempts})")
 
-                # Спред должен быть >= CACHE_MIN_SPREAD (3.0%)
+                # Спред должен быть >= CACHE_MIN_SPREAD (4.0%)
                 if current_spread < CACHE_MIN_SPREAD:
                     continue
 
@@ -300,6 +301,7 @@ async def _monitor_loop():
                         for rem_t, rem_c in remaining.items():
                             print(f"[SignalCache] Удалён {rem_t} со спредом {rem_c.last_spread:.2f}%")
                             _cached_signals.pop(rem_t, None)
+                            await notify(f"🗑 <b>{rem_t}</b> удалён из кэша: конфликт, выбран {ticker} с лучшим спредом")
                     continue
 
                 # Открываем позицию
@@ -311,7 +313,7 @@ async def _monitor_loop():
                     if trade:
                         print(f"[SignalCache] {ticker}: успешно открыта позиция trade_id={trade.id}")
                     else:
-                        print(f"[SignalCache] {ticker}: открытие не удалось")
+                        print(f"[SignalCache] {ticker}: открытие не удалось — {msg}")
                 except Exception as e:
                     print(f"[SignalCache] {ticker}: ошибка открытия — {e}")
                     await notify(f"❌ <b>{ticker}: ошибка открытия кэшированного сигнала</b>\n{e}")
@@ -319,9 +321,13 @@ async def _monitor_loop():
             except Exception as e:
                 print(f"[SignalCache] {ticker}: ошибка проверки — {e}")
 
-        # Удаляем устаревшие
-        for ticker in stale:
+        # Удаляем устаревшие и уведомляем
+        for ticker, reason in stale.items():
             _cached_signals.pop(ticker, None)
+            try:
+                await notify(f"🗑 <b>{ticker}</b> удалён из кэша: {reason}")
+            except Exception:
+                pass
 
 
 # ── Мониторинг спреда открытых позиций (авто-закрытие) ─────────
@@ -412,28 +418,32 @@ async def _spread_monitor_loop():
                         )
 
                         cs = CloseSignal(ticker=t.ticker, raw_text=f"spread_drop_{spread_drop:.2f}%")
-                        _, msg = await close_position(cs)
+                        closed_trade, msg = await close_position(cs)
                         await notify(msg)
 
-                        # После закрытия — кэшируем сигнал для возможного перезахода
-                        cached_sig = OpenSignal(
-                            ticker=t.ticker,
-                            symbol=t.symbol,
-                            short_exchange=t.short_exchange,
-                            long_exchange=t.long_exchange,
-                            short_price=sp,
-                            long_price=lp,
-                            spread_pct=current_spread,
-                            funding_short=t.funding_short,
-                            funding_long=t.funding_long,
-                            max_size_short=None,
-                            max_size_long=None,
-                            interval_short=None,
-                            interval_long=None,
-                            raw_text=f"[spread-drop reentry] {t.ticker}",
-                        )
-                        add_signal(cached_sig, current_spread)
-                        print(f"[SpreadMonitor] {t.ticker}: сигнал кэширован для перезахода")
+                        # Кэшируем ТОЛЬКО если обе ноги закрыты полностью
+                        if closed_trade and closed_trade.status == 'closed':
+                            cached_sig = OpenSignal(
+                                ticker=t.ticker,
+                                symbol=t.symbol,
+                                short_exchange=t.short_exchange,
+                                long_exchange=t.long_exchange,
+                                short_price=sp,
+                                long_price=lp,
+                                spread_pct=current_spread,
+                                funding_short=t.funding_short,
+                                funding_long=t.funding_long,
+                                max_size_short=None,
+                                max_size_long=None,
+                                interval_short=None,
+                                interval_long=None,
+                                raw_text=f"[spread-drop reentry] {t.ticker}",
+                            )
+                            add_signal(cached_sig, current_spread)
+                            print(f"[SpreadMonitor] {t.ticker}: обе ноги закрыты — сигнал кэширован для перезахода")
+                        else:
+                            print(f"[SpreadMonitor] ⚠️ {t.ticker}: закрытие неполное (status={closed_trade.status if closed_trade else 'None'}), НЕ кэширую!")
+                            await notify(f"⚠️ <b>{t.ticker}: закрытие НЕПОЛНОЕ — ручная проверка обязательна!</b>")
 
                 except Exception as e:
                     print(f"[SpreadMonitor] ошибка {t.ticker}: {e}")

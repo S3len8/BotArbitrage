@@ -15,7 +15,8 @@ import asyncio
 from dataclasses import dataclass
 from typing import Optional
 
-from settings import MAX_OPEN_POSITIONS, MIN_SPREAD_PCT, LEVERAGE, MIN_VOLUME_USD, MAX_FUNDING_DIFF_PCT, MAX_FUNDING_ABS_PCT
+from settings import MAX_OPEN_POSITIONS, LEVERAGE, MIN_VOLUME_USD, MAX_FUNDING_DIFF_PCT, MAX_FUNDING_ABS_PCT
+MIN_SPREAD_PCT = 3.5  # HARDCODED минимум спреда
 from exchanges import BaseExchange
 from db import get_open_trade, get_all_open_trades
 from signal_parser import OpenSignal
@@ -144,18 +145,22 @@ async def check_signal(signal: OpenSignal, short_ex: BaseExchange, long_ex: Base
         #   Short получает фандинг когда rate > 0 (short продаёт → получает)
         #   Long  получает фандинг когда rate < 0 (long покупает → получает)
         both_pay_us   = (fs > 0) and (fl < 0)
+        # Одна из бирж платит 0% — нет комиссии на этой ноге, пропускаем
+        one_zero      = (fs == 0) or (fl == 0)
 
-        passes = diff_pct < 0.2 or (both_negative and diff_pct < 1.0) or both_pay_us
+        passes = diff_pct < 0.2 or (both_negative and diff_pct < 1.0) or both_pay_us or one_zero
 
         if not passes:
             return RiskResult(ok=False, reason=(
                 f"Фандинг не прошёл: short={fs*100:+.3f}% long={fl*100:+.3f}% "
-                f"diff={diff_pct:.3f}% — нужно diff<0.2% ИЛИ (оба отриц. + diff<1%) ИЛИ (оба платят нам). "
+                f"diff={diff_pct:.3f}% — нужно diff<0.2% ИЛИ (оба отриц. + diff<1%) ИЛИ (оба платят нам) ИЛИ одна сторона 0%. "
                 f"{signal.ticker} пропущен."
             ))
         if both_pay_us:
             print(f"[Risk] {signal.ticker}: ФАНДИГ ПЛАТИТ НАМ с обеих сторон! "
                   f"short={fs*100:+.3f}% long={fl*100:+.3f}% — вход разрешён при любом diff")
+        if one_zero:
+            print(f"[Risk] {signal.ticker}: Одна сторона 0% — вход разрешён без ограничений diff")
 
     # 6. Проверка объёма (если MIN_VOLUME_USD > 0)
     if MIN_VOLUME_USD > 0:

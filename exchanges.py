@@ -511,8 +511,8 @@ class BinanceExchange(CcxtExchange):
 
             realized_pnl = sum(float(t.get('realizedPnl', 0)) for t in trades)
             fee = sum(float(t.get('commission', 0)) for t in trades)
-            # Берем последний (самый свежий) ордер
-            last = trades[-1]
+            # userTrades сортирует по убыванию trade_id — trades[0] самый новый (close)
+            last = trades[0]
             close_price = float(last.get('price', 0))
             close_ts_ms = int(last.get('time', 0))
             close_time = datetime.fromtimestamp(close_ts_ms / 1000, tz=timezone.utc).isoformat()
@@ -1114,16 +1114,17 @@ class MexcExchange(CcxtExchange):
             if not positions:
                 return None
 
-            total_pnl = sum(float(p.get('closeProfitLoss', 0) or 0) for p in positions)
+            # history_positions сортирует newest first — positions[0] самая свежая
             last = positions[0]
             close_price = float(last.get('closeAvgPrice', 0) or 0)
             close_ts = int(last.get('updateTime', 0) or 0)
             close_time = datetime.fromtimestamp(close_ts / 1000, tz=timezone.utc).isoformat() if close_ts else None
+            realized_pnl = float(last.get('closeProfitLoss', 0) or 0)
             fee = abs(float(last.get('fee', 0) or 0))
 
             return {
                 'close_price': close_price,
-                'realized_pnl': total_pnl,
+                'realized_pnl': realized_pnl,
                 'close_time': close_time,
                 'fee': fee,
             }
@@ -1424,16 +1425,17 @@ class BitgetExchange(BaseExchange):
                 return None
 
             positions = data['data']['list']
-            total_pnl = sum(float(p.get('netProfit', 0) or 0) for p in positions)
-            last = positions[0]  # самый свежий
+            # history-position сортирует newest first — positions[0] самая свежая (последнее закрытие)
+            last = positions[0]
             close_price = float(last.get('avgClosePrice', 0))
             close_ts_ms = int(last.get('updateTime', 0) or 0)
             close_time = datetime.fromtimestamp(close_ts_ms / 1000, tz=timezone.utc).isoformat() if close_ts_ms else None
+            realized_pnl = float(last.get('netProfit', 0) or 0)
             fee = abs(float(last.get('totalFee', 0) or 0))
 
             return {
                 'close_price': close_price,
-                'realized_pnl': total_pnl,
+                'realized_pnl': realized_pnl,
                 'close_time': close_time,
                 'fee': fee,
             }
@@ -1737,7 +1739,8 @@ class KucoinExchange(BaseExchange):
             fills = data['data']
             total_pnl = sum(float(f.get('realisedPnl', 0) or 0) for f in fills)
             fee = sum(abs(float(f.get('fee', 0) or 0)) for f in fills)
-            last = fills[-1]
+            # fill-data сортирует newest first — fills[0] самая свежая (close)
+            last = fills[0]
             close_price = float(last.get('price', 0))
             close_ts_s = int(last.get('createdAt', 0) or 0) // 1000
             close_time = datetime.fromtimestamp(close_ts_s, tz=timezone.utc).isoformat() if close_ts_s else None
@@ -1820,7 +1823,7 @@ class GateExchange(CcxtExchange):
         return await _run_sync(_sync_info)
 
     def _gate_order_sync(self, ticker: str, side: str, qty: float, price: float, reduce_only: bool = False) -> dict:
-        """КРОК 2: Відправка ринкового ордера (Size на Gate — це кількість контрактів)."""
+        """Відправка ринкового ордера на Gate."""
         import hashlib as hl
         import json as _json
 
@@ -1828,26 +1831,23 @@ class GateExchange(CcxtExchange):
         method = 'POST'
         path = '/api/v4/futures/usdt/orders'
 
-        # На Gate 'size' — це ціле число контрактів. Позитивне — Buy, негативне — Sell.
-        order_size = int(qty) if side.lower() in ('buy', 'long') else -int(qty)
-
         body_d = {
             'contract': ticker,
-            'size': order_size,
-            'price': '0',  # '0' означає ринковий ордер (Market)
+            'price': '0',
             'tif': 'ioc',
             'text': 't-arb',
         }
 
-        # В Hedge Mode reduce_only не працює — використовуємо auto_size
         if reduce_only:
-            # side='buy' закриває short, side='sell' закриває long
             if side.lower() in ('buy', 'long'):
                 body_d['auto_size'] = 'close_short'
+                body_d['size'] = int(qty)
             else:
                 body_d['auto_size'] = 'close_long'
-            # auto_size ігнорує знак size, тому ставимо позитивне
-            body_d['size'] = abs(order_size)
+                body_d['size'] = int(qty)
+        else:
+            order_size = int(qty) if side.lower() in ('buy', 'long') else -int(qty)
+            body_d['size'] = order_size
 
         body_json = _json.dumps(body_d)
         body_hash = hl.sha512(body_json.encode()).hexdigest()
@@ -1863,13 +1863,21 @@ class GateExchange(CcxtExchange):
 
         r = requests.post(f'https://api.gateio.ws{path}', headers=headers, data=body_json, timeout=15)
         if not r.ok:
-            raise ValueError(f"Gate Order Error: {r.text}")
+            raise ValueError(f"Gate Order Error: {r.text} (body={body_d})")
 
         res = r.json()
+        order_id = str(res.get('id', ''))
+        filled_contracts = res.get('filled_size', res.get('size', 0))
+
+        info_r = requests.get(f'https://api.gateio.ws/api/v4/futures/usdt/contracts/{ticker}', timeout=10)
+        info_r.raise_for_status()
+        mult = float(info_r.json().get('quanto_multiplier') or info_r.json().get('multiplier') or 1)
+        filled_coins = abs(float(filled_contracts)) * mult if filled_contracts else abs(float(qty)) * mult
+
         return {
-            'order_id': str(res.get('id', '')),
-            'price': float(res.get('fill_price') or price),
-            'qty': abs(int(res.get('size', 0))),
+            'order_id': order_id,
+            'price': price,
+            'qty': filled_coins,
             'fee': 0.0
         }
 
@@ -1897,7 +1905,7 @@ class GateExchange(CcxtExchange):
         return await _run_sync(self._gate_order_sync, ticker, side, qty, price)
 
     async def close_position(self, symbol: str, side: str, qty: float) -> dict:
-        """Закриття позиції. Отримуємо реальний розмір з API щоб не плутати монети з контрактами."""
+        """Закриття позиції на Gate.io."""
         price = await self.get_price(symbol)
         ticker = _gate_ticker(symbol)
 
@@ -1915,24 +1923,63 @@ class GateExchange(CcxtExchange):
         else:
             close_qty = 1
 
-        result = await _run_sync(self._gate_order_sync, ticker, side, close_qty, price, True)
+        # Отправляем close ордер
+        try:
+            result = await _run_sync(self._gate_order_sync, ticker, side, close_qty, price, True)
+        except Exception as order_err:
+            raise ValueError(f"Gate close order failed: {order_err}")
 
-        await asyncio.sleep(1)
-        remaining = await self.get_open_position(symbol)
-        if remaining and remaining.get('size', 0) > 0:
-            print(f"[gate] ⚠️ {symbol}: позиція не повністю закрилась ({remaining['size']} залишилось), retry...")
-            retry_qty = abs(remaining['size'])
-            await asyncio.sleep(0.5)
-            result2 = await _run_sync(self._gate_order_sync, ticker, side, retry_qty, price, True)
-            result['qty'] = result2.get('qty', retry_qty)
-            remaining2 = await self.get_open_position(symbol)
-            if remaining2 and remaining2.get('size', 0) > 0:
-                print(f"[gate] ❌ {symbol}: позиція все ще відкрита після retry!")
-                raise ValueError(f"Gate позиція не закрилась: {remaining2['size']} контрактів залишилось")
-            print(f"[gate] {symbol}: retry OK ✅")
-            result = result2
+        # Ждём заполнения
+        await asyncio.sleep(2)
 
-        return result
+        # Верификация: проверяем my_trades на наличие закрывающей сделки
+        import hashlib as hl
+        for attempt in range(3):
+            await asyncio.sleep(1)
+            try:
+                ts = str(int(time.time()))
+                path = '/api/v4/futures/usdt/my_trades'
+                query = f'contract={ticker}&limit=10'
+                body_hash = hl.sha512(b'').hexdigest()
+                sign_str = '\n'.join(['GET', path, query, body_hash, ts])
+                sig = hmac.new(self._api_secret.encode(), sign_str.encode(), hl.sha512).hexdigest()
+                r = requests.get(f'https://api.gateio.ws{path}?{query}',
+                                headers={'KEY': self._api_key, 'SIGN': sig, 'Timestamp': ts}, timeout=10)
+                if not r.ok:
+                    continue
+
+                trades = r.json()
+                if not trades:
+                    continue
+
+                # Ищем свежую сделку с ненулевым PnL (закрытие)
+                for trade in trades[:3]:
+                    realized_pnl = float(trade.get('pnl', 0) or 0)
+                    if realized_pnl != 0:
+                        print(f"[gate] {symbol}: позиція закрита ✅ (попытка {attempt+1}, pnl={realized_pnl:.4f})")
+                        result['price'] = float(trade.get('price', price))
+                        return result
+
+                # Если PnL = 0, проверяем через position API
+                remaining_pos = await self.get_open_position(symbol)
+                if not remaining_pos or remaining_pos.get('size', 0) == 0:
+                    print(f"[gate] {symbol}: позиція закрита ✅ (попытка {attempt+1})")
+                    return result
+
+                print(f"[gate] ⚠️ {symbol}: ще відкрита ({remaining_pos.get('size')}), retry {attempt+2}/3...")
+                retry_qty = abs(remaining_pos.get('size', close_qty))
+                await _run_sync(self._gate_order_sync, ticker, side, retry_qty, price, True)
+            except Exception as verify_err:
+                print(f"[gate] {symbol}: верифікація помилка (попытка {attempt+1}): {verify_err}")
+
+        # После 3 попыток — финальная проверка
+        final_pos = await self.get_open_position(symbol)
+        if final_pos and final_pos.get('size', 0) > 0:
+            print(f"[gate] ❌ {symbol}: позиція все ще відкрита після 3 спроб!")
+            raise ValueError(f"Gate позиція не закрилась: {final_pos.get('size')} контрактів залишилось")
+        else:
+            print(f"[gate] {symbol}: позиція закрита ✅")
+            return result
 
     def _price_sync(self, symbol: str) -> float:
         ticker = _gate_ticker(symbol)
@@ -2034,7 +2081,7 @@ class GateExchange(CcxtExchange):
 
             realized_pnl = sum(float(t.get('pnl', 0) or 0) for t in trades)
             fee = sum(abs(float(t.get('fee', 0) or 0)) for t in trades)
-            last = trades[-1]
+            last = trades[0]  # trades[0] — самая свежая (последняя) сделка
             close_price = float(last.get('price', 0))
             close_ts = int(last.get('create_time', 0))
             close_time = datetime.fromtimestamp(close_ts, tz=timezone.utc).isoformat()

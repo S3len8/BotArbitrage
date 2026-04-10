@@ -20,7 +20,7 @@ import time
 from telethon import TelegramClient, events
 from telethon.tl.functions.channels import GetFullChannelRequest
 
-from settings import TG_API_ID, TG_API_HASH, TG_SESSION, SIGNAL_CHANNEL, MIN_SPREAD_PCT
+from settings import TG_API_ID, TG_API_HASH, TG_SESSION, SIGNAL_CHANNEL
 from signal_parser import parse_message, parse_pinned, OpenSignal, CloseSignal
 from risk_manager import check_signal
 from order_executor import open_position, close_position, REENTRY_MIN_SPREAD_PCT
@@ -38,6 +38,9 @@ _pinned_msg_id: int | None = None
 # Дедупликация MEXC уведомлений
 _mexc_notified: dict[str, float] = {}
 MEXC_NOTIFY_WINDOW_S = 300
+
+# HARDCODED минимум спреда для всех проверок
+MIN_SPREAD_PCT = 4.0
 
 # ── Ожидание фандинга ─────────────────────────────────────────
 # Минимальное время до фандинга при котором НЕ открываем позицию сразу
@@ -113,6 +116,8 @@ def _funding_ok(signal) -> tuple[bool, str]:
 
     diff_pct      = abs(fs - fl) * 100
     both_negative = fs < 0 and fl < 0
+    both_pay_us  = (fs > 0) and (fl < 0)
+    one_zero     = (fs == 0) or (fl == 0)
     i_s = signal.interval_short
     i_l = signal.interval_long
     info = f"short={fs*100:+.3f}% long={fl*100:+.3f}% diff={diff_pct:.3f}% int={i_s}ч/{i_l}ч"
@@ -121,8 +126,12 @@ def _funding_ok(signal) -> tuple[bool, str]:
         return True, f"diff<0.2% ✅ {info}"
     if both_negative and diff_pct < 1.0:
         return True, f"оба отриц. + diff<1% ✅ {info}"
+    if both_pay_us:
+        return True, f"оба платят нам ✅ {info}"
+    if one_zero:
+        return True, f"одна сторона 0% ✅ {info}"
 
-    return False, f"diff≥0.2% и не оба отриц. ❌ {info}"
+    return False, f"фандинг не прошёл ❌ {info}"
 
 
 async def _get_funding_times(signal: OpenSignal) -> tuple[int | None, int | None]:
@@ -509,9 +518,7 @@ class SignalListener:
         elif isinstance(signal, CloseSignal):
             # Если тикер в кэше — удаляем (спред сошёлся)
             if is_cached(signal.ticker):
-                remove_signal(signal.ticker)
-                await notify(f"🗑 <b>{signal.ticker}</b>: сигнал удалён из кэша (спред сошёлся)")
-                print(f"[Listener] {signal.ticker} удалён из кэша по CLOSE сигналу")
+                await remove_signal(signal.ticker)
             print(f"[Listener] CLOSE {signal.ticker}")
             await self._close(signal)
 
@@ -519,7 +526,7 @@ class SignalListener:
         """Кэширует сигнал и запускает мониторинг — вход только когда живой спред >= 3%."""
         if is_cached(signal.ticker):
             print(f"[Listener] {signal.ticker} уже в кэше — обновляю")
-            remove_signal(signal.ticker)
+            await remove_signal(signal.ticker)
 
         # Получаем живые цены
         try:
@@ -752,8 +759,7 @@ class SignalListener:
 
         # Если тикер в кэше сигналов — удаляем
         if is_cached(signal.ticker):
-            remove_signal(signal.ticker)
-            print(f"[Listener] {signal.ticker} удалён из кэша по CLOSE сигналу")
+            await remove_signal(signal.ticker)
 
         try:
             _, msg = await close_position(signal)

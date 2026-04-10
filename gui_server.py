@@ -357,8 +357,10 @@ async def api_positions_live():
                 sp = float(s_price) if isinstance(s_price, (int, float, str)) else t.short_entry_price
                 lp = float(l_price) if isinstance(l_price, (int, float, str)) else t.long_entry_price
 
-                s_pnl = s_pos.get('unrealized_pnl', 0) if (not isinstance(s_pos, Exception) and s_pos) else 0
-                l_pnl = l_pos.get('unrealized_pnl', 0) if (not isinstance(l_pos, Exception) and l_pos) else 0
+                s_pos_ok = not isinstance(s_pos, Exception) and s_pos and s_pos.get('size', 0) > 0
+                l_pos_ok = not isinstance(l_pos, Exception) and l_pos and l_pos.get('size', 0) > 0
+                s_pnl = s_pos.get('unrealized_pnl', 0) if s_pos_ok else 0
+                l_pnl = l_pos.get('unrealized_pnl', 0) if l_pos_ok else 0
 
                 fund_earned = item.get('fund_earned', 0)
 
@@ -373,54 +375,51 @@ async def api_positions_live():
                     'short_unrealized': round(s_pnl, 4),
                     'long_unrealized': round(l_pnl, 4),
                     'unrealized_pnl': round(s_pnl + l_pnl + fund_earned, 4),
-                    'short_on_exchange': not isinstance(s_pos, Exception) and s_pos is not None,
-                    'long_on_exchange': not isinstance(l_pos, Exception) and l_pos is not None,
+                    'short_on_exchange': s_pos_ok,
+                    'long_on_exchange': l_pos_ok,
                 })
 
-                # Если позиция закрылась на бирже (ручное закрытие) — обновляем БД
-                s_on_ex = not isinstance(s_pos, Exception) and s_pos is not None
-                l_on_ex = not isinstance(l_pos, Exception) and l_pos is not None
-
-                if t.status == 'open' and (not s_on_ex or not l_on_ex):
+                # Если позиция закрылась на бирже — обновляем БД
+                if t.status == 'open' and (not s_pos_ok or not l_pos_ok):
                     print(f"[GUI] Позиция #{t.id} ({t.ticker}) закрыта на бирже — обновляю БД")
-                    t.status = 'closed' if (not s_on_ex and not l_on_ex) else 'partial'
+                    t.status = 'closed' if (not s_pos_ok and not l_pos_ok) else 'partial'
                     t.closed_at = datetime.now(timezone.utc).isoformat()
 
                     # Получаем полные данные закрытия с бирж
+                    s_cd, l_cd = None, None
                     try:
-                        s_cd, l_cd = await asyncio.gather(
+                        s_cd2, l_cd2 = await asyncio.gather(
                             s_ex.get_close_data(t.symbol),
                             l_ex.get_close_data(t.symbol),
                             return_exceptions=True,
                         )
-                        if not isinstance(s_cd, Exception) and s_cd:
-                            t.short_close_price = s_cd.get('close_price') or sp
-                            t.short_pnl_usd = round(s_cd.get('realized_pnl', 0) or 0, 6)
-                            t.short_close_time = s_cd.get('close_time')
-                            t.fee_short_usd = round(s_cd.get('fee', 0) or 0, 6)
-                        else:
-                            t.short_close_price = sp
-                            if t.short_entry_price and t.short_qty:
-                                t.short_pnl_usd = round((t.short_entry_price - sp) * t.short_qty, 6)
-                        if not isinstance(l_cd, Exception) and l_cd:
-                            t.long_close_price = l_cd.get('close_price') or lp
-                            t.long_pnl_usd = round(l_cd.get('realized_pnl', 0) or 0, 6)
-                            t.long_close_time = l_cd.get('close_time')
-                            t.fee_long_usd = round(l_cd.get('fee', 0) or 0, 6)
-                        else:
-                            t.long_close_price = lp
-                            if t.long_entry_price and t.long_qty:
-                                t.long_pnl_usd = round((lp - t.long_entry_price) * t.long_qty, 6)
-                    except Exception as cd_err:
-                        print(f"[GUI] get_close_data error: {cd_err}")
+                        if not isinstance(s_cd2, Exception) and s_cd2:
+                            s_cd = s_cd2
+                        if not isinstance(l_cd2, Exception) and l_cd2:
+                            l_cd = l_cd2
+                    except Exception:
+                        pass
+
+                    if s_cd and (s_cd.get('realized_pnl', 0) or 0) != 0:
+                        t.short_close_price = s_cd.get('close_price') or sp
+                        t.short_pnl_usd = round(s_cd.get('realized_pnl', 0) or 0, 6)
+                        t.short_close_time = s_cd.get('close_time')
+                        t.fee_short_usd = round(s_cd.get('fee', 0) or 0, 6)
+                    else:
                         t.short_close_price = sp
-                        t.long_close_price = lp
                         if t.short_entry_price and t.short_qty:
                             t.short_pnl_usd = round((t.short_entry_price - sp) * t.short_qty, 6)
+
+                    if l_cd and (l_cd.get('realized_pnl', 0) or 0) != 0:
+                        t.long_close_price = l_cd.get('close_price') or lp
+                        t.long_pnl_usd = round(l_cd.get('realized_pnl', 0) or 0, 6)
+                        t.long_close_time = l_cd.get('close_time')
+                        t.fee_long_usd = round(l_cd.get('fee', 0) or 0, 6)
+                    else:
+                        t.long_close_price = lp
                         if t.long_entry_price and t.long_qty:
                             t.long_pnl_usd = round((lp - t.long_entry_price) * t.long_qty, 6)
 
-                    fees = (t.fee_short_usd or 0) + (t.fee_long_usd or 0)
                     if t.short_pnl_usd is not None and t.long_pnl_usd is not None:
                         t.net_pnl_usd = round(t.short_pnl_usd + t.long_pnl_usd, 6)
                     update_trade(t)

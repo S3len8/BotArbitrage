@@ -26,7 +26,7 @@ from settings import LEVERAGE, BALANCE_ALERT_PCT, MARGIN_RISK_PCT
 # За сколько минут до фандинга закрывать (всегда, независимо от PnL)
 MINUTES_BEFORE_FUNDING: int   = 5
 # Минимальный спред для перезахода после закрытия перед фандингом
-REENTRY_MIN_SPREAD_PCT: float = 4.0
+REENTRY_MIN_SPREAD_PCT: float = 3.5
 
 
 def _now(): return datetime.now(timezone.utc)
@@ -231,10 +231,11 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
         save_trade(trade)
 
         # Логування в канал ордерів
+        sizes_usd = {'short': exec_size_s, 'long': exec_size_l}
         for side, res, ex_name in [('short', short_r, signal.short_exchange), ('long', long_r, signal.long_exchange)]:
             asyncio.create_task(notify_order(
                 ex_name, side, signal.symbol, res['price'], res['qty'],
-                (res['qty'] * res['price']), res['order_id'], f"↔️ Pair: {signal.ticker} | Trade #{trade.id}"
+                sizes_usd[side], res['order_id'], f"↔️ Pair: {signal.ticker} | Trade #{trade.id}"
             ))
 
         actual_spread = (trade.short_entry_price / trade.long_entry_price - 1) * 100
@@ -432,6 +433,47 @@ async def check_balance_alerts(exchanges: list[str], initial_balances: dict[str,
             pct = bal / init * 100
             if pct <= BALANCE_ALERT_PCT:
                 await notify(f"🚨 <b>АЛЕРТ: {ex.upper()}</b>\nНачальный: ${init:.2f}\nТекущий: ${bal:.2f}\nОсталось: {pct:.1f}%")
+
+
+async def _update_trade_with_close_data(t: Trade):
+    """Получает close_data с бирж и сохраняет в БД."""
+    from exchanges import create_exchange
+    s_ex = create_exchange(t.short_exchange)
+    l_ex = create_exchange(t.long_exchange)
+    try:
+        s_cd, l_cd = await asyncio.gather(
+            s_ex.get_close_data(t.symbol),
+            l_ex.get_close_data(t.symbol),
+            return_exceptions=True,
+        )
+        await asyncio.gather(s_ex.close(), l_ex.close())
+    except Exception as e:
+        print(f"[CloseData] {t.ticker}: ошибка получения close_data: {e}")
+        s_cd, l_cd = None, None
+
+    fees = 0.0
+    if not isinstance(s_cd, Exception) and s_cd:
+        pnl = s_cd.get('realized_pnl', 0) or 0
+        t.short_pnl_usd = round(pnl, 6)
+        t.short_close_price = s_cd.get('close_price') or t.short_close_price
+        t.short_close_time = s_cd.get('close_time')
+        t.fee_short_usd = round(s_cd.get('fee', 0) or 0, 6)
+        fees += t.fee_short_usd or 0
+    if not isinstance(l_cd, Exception) and l_cd:
+        pnl = l_cd.get('realized_pnl', 0) or 0
+        t.long_pnl_usd = round(pnl, 6)
+        t.long_close_price = l_cd.get('close_price') or t.long_close_price
+        t.long_close_time = l_cd.get('close_time')
+        t.fee_long_usd = round(l_cd.get('fee', 0) or 0, 6)
+        fees += t.fee_long_usd or 0
+
+    if t.short_pnl_usd is not None and t.long_pnl_usd is not None:
+        t.net_pnl_usd = round(t.short_pnl_usd + t.long_pnl_usd, 6)
+    elif t.short_pnl_usd is None or t.long_pnl_usd is None:
+        _calc_pnl(t)
+
+    update_trade(t)
+    print(f"[CloseData] {t.ticker}: сохранено в БД ✅ (short={t.short_pnl_usd} long={t.long_pnl_usd} net={t.net_pnl_usd})")
 
 
 def _calc_pnl(t: Trade):
@@ -694,21 +736,19 @@ MARGIN_WARN_COOLDOWN_S = 120
 
 
 async def _check_margin_risk(t) -> bool:
-    """Двухступенчатая проверка ликвидации и маржинального риска."""
+    """Быстрая проверка: позиция есть? orphan leg? ликвидация?"""
     import time as _time
     from exchanges import create_exchange
-    from signal_parser import CloseSignal
 
-    now = _time.time()
     try:
         s_ex = create_exchange(t.short_exchange)
         l_ex = create_exchange(t.long_exchange)
 
-        s_price_r, l_price_r, s_pos, l_pos = await asyncio.gather(
-            s_ex.get_price(t.symbol),
-            l_ex.get_price(t.symbol),
+        s_pos, l_pos, s_price_r, l_price_r = await asyncio.gather(
             s_ex.get_open_position(t.symbol),
             l_ex.get_open_position(t.symbol),
+            s_ex.get_price(t.symbol),
+            l_ex.get_price(t.symbol),
             return_exceptions=True,
         )
         await asyncio.gather(s_ex.close(), l_ex.close(), return_exceptions=True)
@@ -716,47 +756,43 @@ async def _check_margin_risk(t) -> bool:
         print(f"[MarginCheck] {t.ticker}: ошибка данных: {e}")
         return False
 
-    # Логика самолечения: позиций нет на обеих биржах → синхронизируем БД
-    if (s_pos is None or isinstance(s_pos, Exception)) and \
-            (l_pos is None or isinstance(l_pos, Exception)):
-        print(f"[MarginCheck] {t.ticker}: Позиции не найдены на биржах. Синхронизирую БД...")
+    s_on = not isinstance(s_pos, Exception) and s_pos and s_pos.get('size', 0) > 0
+    l_on = not isinstance(l_pos, Exception) and l_pos and l_pos.get('size', 0) > 0
+
+    # Обе закрыты — самолечение
+    if not s_on and not l_on:
+        print(f"[MarginCheck] {t.ticker}: обе ноги закрыты ✅")
         t.status = 'closed'
         t.closed_at = datetime.now(timezone.utc).isoformat()
-        update_trade(t)
+        _update_trade_with_close_data(t)
         return True
 
-    # Логика orphan leg: одна позиция закрылась, другую нужно закрыть
-    s_on_ex = not isinstance(s_pos, Exception) and s_pos is not None
-    l_on_ex = not isinstance(l_pos, Exception) and l_pos is not None
-
-    if s_on_ex and not l_on_ex:
-        print(f"[MarginCheck] 🚨 {t.ticker}: LONG позиция закрылась на бирже, закрываю SHORT!")
-        await notify(f"🚨 <b>Orphan leg: {t.ticker}</b>\nLONG закрылся на бирже, закрываю SHORT...")
+    # Orphan leg — сразу закрываем вторую ногу
+    if s_on and not l_on:
+        print(f"[MarginCheck] 🚨 {t.ticker}: LONG закрыта на бирже, закрываю SHORT!")
+        await notify(f"🚨 <b>Orphan leg: {t.ticker}</b>\nLONG закрылась на бирже, закрываю SHORT...")
         s_ex2 = create_exchange(t.short_exchange)
         try:
             await s_ex2.close_position(t.symbol, 'buy', t.short_qty or 0)
         finally:
             await s_ex2.close()
-        t.status = 'closed'
-        t.closed_at = datetime.now(timezone.utc).isoformat()
-        update_trade(t)
+        _update_trade_with_close_data(t)
         return True
 
-    if l_on_ex and not s_on_ex:
-        print(f"[MarginCheck] 🚨 {t.ticker}: SHORT позиция закрылась на бирже, закрываю LONG!")
-        await notify(f"🚨 <b>Orphan leg: {t.ticker}</b>\nSHORT закрылся на бирже, закрываю LONG...")
+    if l_on and not s_on:
+        print(f"[MarginCheck] 🚨 {t.ticker}: SHORT закрыта на бирже, закрываю LONG!")
+        await notify(f"🚨 <b>Orphan leg: {t.ticker}</b>\nSHORT закрылась на бирже, закрываю LONG...")
         l_ex2 = create_exchange(t.long_exchange)
         try:
             await l_ex2.close_position(t.symbol, 'sell', t.long_qty or 0)
         finally:
             await l_ex2.close()
-        t.status = 'closed'
-        t.closed_at = datetime.now(timezone.utc).isoformat()
-        update_trade(t)
+        _update_trade_with_close_data(t)
         return True
 
     s_price = float(s_price_r) if not isinstance(s_price_r, Exception) else None
     l_price = float(l_price_r) if not isinstance(l_price_r, Exception) else None
+    now = int(_time.time())
 
     if not s_price or not l_price:
         return False
