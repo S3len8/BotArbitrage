@@ -170,6 +170,53 @@ async def notify_mexc(text: str, tv_url: str = None, buttons: list = None) -> in
     )
 
 
+async def ask_funding_confirmation(ticker: str, spread_pct: float,
+                                   short_ex: str, long_ex: str,
+                                   current_spread: float) -> int | None:
+    """Отправляет запрос на подтверждение входа при проблемах с funding."""
+    import asyncio
+    msg = (
+        f"⚠️ <b>{ticker}: требуется подтверждение</b>\n"
+        f"📊 Сигнал спред: {spread_pct:.2f}% | Текущий: {current_spread:.2f}%\n"
+        f"📉 Short: {short_ex.upper()} | 📈 Long: {long_ex.upper()}\n"
+        f"💡 Не удалось получить funding — нажмите кнопку в течение 15 мин"
+    )
+    buttons = [
+        [{"text": "✅ Войти", "data": f"confirm_yes_{ticker}"},
+         {"text": "❌ Отмена", "data": f"confirm_no_{ticker}"}]
+    ]
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        _executor, _send_inline_sync, msg, NOTIFY_BOT_TOKEN, NOTIFY_CHAT_ID, buttons
+    )
+
+
+def _send_inline_sync(text: str, bot_token: str, chat_id: str,
+                      inline_buttons: list) -> int | None:
+    """Отправка с inline keyboard кнопками."""
+    if not bot_token or not chat_id:
+        print(f"[Notify] пропущено: {text[:120]}")
+        return None
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id":                  chat_id,
+        "text":                     _safe_html(text),
+        "parse_mode":               "HTML",
+        "disable_web_page_preview": True,
+        "reply_markup":             {"inline_keyboard": inline_buttons},
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        if not r.ok:
+            print(f"[Notify] inline send ошибка {r.status_code}: {r.text[:200]}")
+            return None
+        return r.json().get('result', {}).get('message_id')
+    except Exception as e:
+        print(f"[Notify] inline send исключение: {e}")
+        return None
+
+
 async def notify_order(exchange: str, side: str, symbol: str,
                        price: float, qty, size_usd: float,
                        order_id: str = '', extra: str = '') -> None:

@@ -132,7 +132,7 @@ async def _monitor_loop():
     """Периодически проверяет кэшированные сигналы + фандинг."""
     from risk_manager import check_signal
     from order_executor import open_position
-    from listener import _minutes_until, _get_funding_times, WAIT_BEFORE_FUNDING_MIN
+    from listener import _minutes_until, _get_funding_times, _min_until, WAIT_BEFORE_FUNDING_MIN, _ask_funding_confirmation, _is_blocked
 
     while True:
         await asyncio.sleep(MONITOR_INTERVAL)
@@ -144,6 +144,9 @@ async def _monitor_loop():
         stale = {}  # {ticker: reason}
 
         for ticker, cached in list(_cached_signals.items()):
+            # Пропускаем заблокированные тикеры
+            if _is_blocked(ticker):
+                continue
             # Проверяем время жизни
             if now - cached.cached_at > CACHE_TTL_SECONDS:
                 stale[ticker] = f"устарел ({CACHE_TTL_SECONDS // 60} мин)"
@@ -186,11 +189,8 @@ async def _monitor_loop():
 
                 print(f"[SignalCache] {ticker}: спред {current_spread:.2f}% (попытка {cached.attempts})")
 
-                # Спред должен быть >= CACHE_MIN_SPREAD (4.0%)
-                if current_spread < CACHE_MIN_SPREAD:
-                    continue
-
-                # Проверяем время до фандинга
+                # Проверяем время до фандинга ПЕРЕД спредом
+                # Если до фандинга <= 15 мин — ЗАМОРАЖИВАЕМ сигнал, не проверяем спред
                 try:
                     from signal_parser import OpenSignal as _OS
                     temp_sig = _OS(
@@ -206,34 +206,55 @@ async def _monitor_loop():
                         _get_funding_times(temp_sig), timeout=10
                     )
                     try:
-                        min_until = min(
+                        min_until = _min_until(
                             _minutes_until(next_short_ts),
                             _minutes_until(next_long_ts),
                         )
                     except ValueError:
-                        # Не удалось получить время фандинга — повторяем через 10 сек
                         print(f"[SignalCache] {ticker}: не удалось получить время фандинга — повторяю через 10с...")
                         await asyncio.sleep(10)
                         try:
                             next_short_ts2, next_long_ts2 = await asyncio.wait_for(
                                 _get_funding_times(temp_sig), timeout=10
                             )
-                            min_until = min(
+                            min_until = _min_until(
                                 _minutes_until(next_short_ts2),
                                 _minutes_until(next_long_ts2),
                             )
                         except ValueError:
-                            print(f"[SignalCache] {ticker}: снова не удалось получить время фандинга — пропускаю проверку, вход заблокирован")
-                            continue  # сигнал остаётся в кэше, следующая попытка через 5 сек
-                except Exception as e:
-                    print(f"[SignalCache] {ticker}: ошибка получения времени фандинга — блокируем вход: {e}")
-                    continue  # если не удалось получить фандинг — НЕ входим, сигнал в кэше
-
-                if min_until <= WAIT_BEFORE_FUNDING_MIN:
-                    print(f"[SignalCache] {ticker}: до фандинга {min_until:.0f} мин — жду начисления")
+                            min_until = None
+                except (asyncio.TimeoutError, Exception) as e:
+                    print(f"[SignalCache] {ticker}: ошибка времени фандинга — {e}")
                     continue
 
-                print(f"[SignalCache] {ticker}: спред {current_spread:.2f}% >= {CACHE_MIN_SPREAD}%, фандинг через {min_until:.0f}м — вхожу!")
+                if min_until is not None and min_until <= WAIT_BEFORE_FUNDING_MIN:
+                    print(f"[SignalCache] {ticker}: до фандинга {min_until:.0f} мин — ЗАМОРАЖИВАЮ сигнал")
+                    continue
+
+                # Спред должен быть >= CACHE_MIN_SPREAD
+                if current_spread < CACHE_MIN_SPREAD:
+                    note = f", фандинг через {min_until:.0f}м" if min_until is not None else ""
+                    print(f"[SignalCache] {ticker}: спред {current_spread:.2f}% < {CACHE_MIN_SPREAD}%{note} — пропускаю")
+                    continue
+
+                # Если funding неизвестен — запрашиваем подтверждение у пользователя
+                if min_until is None:
+                    from signal_parser import OpenSignal as _OS
+                    sig_for_confirm = _OS(
+                        ticker=sig.ticker, symbol=sig.symbol,
+                        short_exchange=sig.short_exchange, long_exchange=sig.long_exchange,
+                        short_price=sp, long_price=lp, spread_pct=current_spread,
+                        funding_short=sig.funding_short, funding_long=sig.funding_long,
+                        max_size_short=sig.max_size_short, max_size_long=sig.max_size_long,
+                        interval_short=sig.interval_short, interval_long=sig.interval_long,
+                        raw_text=sig.raw_text,
+                    )
+                    await _ask_funding_confirmation(sig_for_confirm, current_spread)
+                    print(f"[SignalCache] {ticker}: funding неизвестен — запрошено подтверждение")
+                    continue
+
+                note = f", фандинг через {min_until:.0f}м" if min_until is not None else ""
+                print(f"[SignalCache] {ticker}: спред {current_spread:.2f}% >= {CACHE_MIN_SPREAD}%{note} — вхожу!")
 
                 # Удаляем из кэша чтобы не дублировать
                 _cached_signals.pop(ticker, None)

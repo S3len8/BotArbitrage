@@ -25,8 +25,8 @@ from signal_parser import parse_message, parse_pinned, OpenSignal, CloseSignal
 from risk_manager import check_signal
 from order_executor import open_position, close_position, REENTRY_MIN_SPREAD_PCT
 from exchanges import create_exchange
-from notifier import notify, notify_mexc
-from signal_cache import add_signal, remove_signal, is_cached, start_signal_monitor, stop_signal_monitor, start_spread_monitor, stop_spread_monitor
+from notifier import notify, notify_mexc, ask_funding_confirmation
+from signal_cache import add_signal, remove_signal, is_cached, start_signal_monitor, stop_signal_monitor, start_spread_monitor, stop_spread_monitor, CACHE_MIN_SPREAD
 
 DEDUP_WINDOW_S = 120
 _seen: dict[str, float] = {}
@@ -40,7 +40,7 @@ _mexc_notified: dict[str, float] = {}
 MEXC_NOTIFY_WINDOW_S = 300
 
 # HARDCODED минимум спреда для всех проверок
-MIN_SPREAD_PCT = 4.0
+MIN_SPREAD_PCT = 3.5
 
 # ── Ожидание фандинга ─────────────────────────────────────────
 # Минимальное время до фандинга при котором НЕ открываем позицию сразу
@@ -50,6 +50,33 @@ WAIT_BEFORE_FUNDING_MIN: int = 15
 # Хранит сигналы которые ждут начисления фандинга
 _pending_signals: dict[str, "PendingSignal"] = {}
 
+# ── Подтверждения входа вручную ────────────────────────────────
+# Когда funding нельзя получить — запрашиваем подтверждение у пользователя
+FUNDING_CONFIRM_TIMEOUT_S: int = 900  # 15 минут
+
+# {ticker: {'signal': OpenSignal, 'requested_at': float, 'message_id': int | None}}
+_pending_confirmations: dict[str, dict] = {}
+
+# Заблокированные тикеры после отмены/истечения/CLOSE — не мониторим и не добавляем в кэш
+# {ticker: timestamp_when_unblock}
+_blocked_signals: dict[str, float] = {}
+SIGNAL_BLOCK_DURATION_S: int = 1800  # 30 минут блокировки после отмены
+
+def _block_signal(ticker: str) -> None:
+    """Блокирует тикер на BLOCK_DURATION_S после отмены/истечения/CLOSE."""
+    _blocked_signals[ticker] = time.time() + SIGNAL_BLOCK_DURATION_S
+    from signal_cache import remove_signal
+    remove_signal(ticker)
+    print(f"[Listener] {ticker}: заблокирован на {SIGNAL_BLOCK_DURATION_S // 60} мин")
+
+def _is_blocked(ticker: str) -> bool:
+    """Проверяет заблокирован ли тикер. Очищает истёкшие блокировки."""
+    now = time.time()
+    expired = [t for t, unblock_at in _blocked_signals.items() if now >= unblock_at]
+    for t in expired:
+        _blocked_signals.pop(t, None)
+    return ticker in _blocked_signals
+
 
 class PendingSignal:
     """Сигнал ожидающий начисления фандинга."""
@@ -58,6 +85,93 @@ class PendingSignal:
         self.fund_time   = fund_time   # unix timestamp ближайшего фандинга
         self.received_ms = received_ms
         self.task: asyncio.Task | None = None
+
+
+async def _ask_funding_confirmation(signal: OpenSignal, current_spread: float) -> None:
+    """Запрашивает подтверждение входа у пользователя через Telegram."""
+    ticker = signal.ticker
+    _pending_confirmations[ticker] = {
+        'signal':        signal,
+        'requested_at':  time.time(),
+        'message_id':    None,
+        'spread':        current_spread,
+    }
+    msg_id = await ask_funding_confirmation(
+        ticker, signal.spread_pct,
+        signal.short_exchange, signal.long_exchange,
+        current_spread,
+    )
+    _pending_confirmations[ticker]['message_id'] = msg_id
+    print(f"[Listener] {ticker}: запрос подтверждения отправлен (timeout {FUNDING_CONFIRM_TIMEOUT_S // 60} мин)")
+
+
+async def _confirmation_monitor() -> None:
+    """Фоновый мониторинг ожидающих подтверждений — авто-отмена через 15 мин."""
+    while True:
+        await asyncio.sleep(30)
+        now = time.time()
+        expired = [
+            t for t, c in _pending_confirmations.items()
+            if now - c['requested_at'] > FUNDING_CONFIRM_TIMEOUT_S
+        ]
+        for ticker in expired:
+            conf = _pending_confirmations.pop(ticker, None)
+            if conf:
+                await notify(
+                    f"⛔ <b>{ticker}: сигнал не активен</b>\n"
+                    f"📊 Причина: истёк таймаут подтверждения (15 мин)\n"
+                    f"💡 Funding не удалось получить — позиция не открыта"
+                )
+                print(f"[Listener] {ticker}: подтверждение истекло — сигнал заблокирован на {SIGNAL_BLOCK_DURATION_S // 60} мин")
+                _block_signal(ticker)
+
+
+def _handle_confirmation_response(ticker: str, approved: bool) -> None:
+    """Обрабатывает ответ пользователя на запрос подтверждения."""
+    conf = _pending_confirmations.pop(ticker, None)
+    if not conf:
+        return
+    if not approved:
+        _block_signal(ticker)
+    asyncio.create_task(_process_confirmation(conf, approved))
+
+
+async def _process_confirmation(conf: dict, approved: bool) -> None:
+    """Обрабатывает подтверждение — проверяет спред и открывает позицию."""
+    signal = conf['signal']
+    ticker = signal.ticker
+    if not approved:
+        await notify(f"ℹ️ <b>{ticker}: вход отменён пользователем</b>")
+        print(f"[Listener] {ticker}: вход отменён пользователем")
+        return
+    try:
+        short_ex = create_exchange(signal.short_exchange)
+        long_ex  = create_exchange(signal.long_exchange)
+        try:
+            s_p, l_p = await asyncio.gather(
+                short_ex.get_price(signal.symbol),
+                long_ex.get_price(signal.symbol),
+            )
+            current_spread = (s_p / l_p - 1) * 100 if l_p > 0 else 0
+            if current_spread < MIN_SPREAD_PCT:
+                await notify(
+                    f"⛔ <b>{ticker}: сигнал не активен</b>\n"
+                    f"📊 Причина: спред упал до {current_spread:.2f}% (мін {MIN_SPREAD_PCT}%)\n"
+                    f"💡 Funding не удалось получить — позиция не открыта"
+                )
+                print(f"[Listener] {ticker}: спред {current_spread:.2f}% < {MIN_SPREAD_PCT}% — вход отменён")
+                return
+            risk = await check_signal(signal, short_ex, long_ex)
+            if not risk:
+                await notify(f"⛔ <b>{ticker}: risk-менеджер отклонил: {risk.reason}</b>")
+                return
+            await open_position(signal, risk.final_size_usd)
+            await notify(f"✅ <b>{ticker}: позиция открыта после подтверждения</b>")
+        finally:
+            await asyncio.gather(short_ex.close(), long_ex.close())
+    except Exception as e:
+        await notify(f"❌ <b>{ticker}: ошибка открытия после подтверждения: {e}</b>")
+        print(f"[Listener] {ticker}: ошибка открытия после подтверждения: {e}")
 
 
 async def _notify_mexc(signal, reason: str = None):
@@ -159,11 +273,17 @@ async def _get_funding_times(signal: OpenSignal) -> tuple[int | None, int | None
         return None, None
 
 
-def _minutes_until(ts: int | None) -> float:
-    """Минут до unix timestamp. Бросает ValueError если ts=None или <= 0."""
+def _minutes_until(ts: int | None) -> float | None:
+    """Минут до unix timestamp. Возвращает None если ts=None или <= 0."""
     if not ts or ts <= 0:
-        raise ValueError("Funding time not available")
+        return None
     return max(0.0, (ts - time.time()) / 60)
+
+def _min_until(a: float | None, b: float | None) -> float | None:
+    """Минимум двух времён, None = игнорируется (бесконечность)."""
+    if a is None: return b
+    if b is None: return a
+    return min(a, b)
 
 
 async def _wait_and_open(pending: PendingSignal):
@@ -269,7 +389,7 @@ async def _wait_and_open(pending: PendingSignal):
         next_short_ts, next_long_ts = await asyncio.wait_for(
             _get_funding_times(updated_signal), timeout=10
         )
-        min_until = min(
+        min_until = _min_until(
             _minutes_until(next_short_ts),
             _minutes_until(next_long_ts),
         )
@@ -281,7 +401,7 @@ async def _wait_and_open(pending: PendingSignal):
             next_short_ts, next_long_ts = await asyncio.wait_for(
                 _get_funding_times(updated_signal), timeout=10
             )
-            min_until = min(
+            min_until = _min_until(
                 _minutes_until(next_short_ts),
                 _minutes_until(next_long_ts),
             )
@@ -405,14 +525,34 @@ class SignalListener:
         await start_signal_monitor()
         await start_spread_monitor()
 
+        # Запускаем монитор подтверждений (авто-отмена через 15 мин)
+        asyncio.create_task(_confirmation_monitor())
+
         RECENT_MSG_SECONDS = 5 * 60
+
+        @self.client.on(events.CallbackQuery)
+        async def on_callback(event):
+            if not self._running:
+                return
+            data = event.data or ""
+            if data.startswith("confirm_yes_"):
+                ticker = data.replace("confirm_yes_", "")
+                print(f"[Listener] Подтверждение получено: {ticker} ✅")
+                await event.answer("✅ Вход подтверждён!", alert=True)
+                _handle_confirmation_response(ticker, approved=True)
+            elif data.startswith("confirm_no_"):
+                ticker = data.replace("confirm_no_", "")
+                print(f"[Listener] Отмена подтверждения: {ticker} ❌")
+                await event.answer("❌ Вход отменён", alert=True)
+                _handle_confirmation_response(ticker, approved=False)
 
         @self.client.on(events.NewMessage(chats=SIGNAL_CHANNEL))
         async def on_new(event):
             if not self._running:
                 return
             received_ms = int(time.time() * 1000)
-            await self._handle(event.message.text or "", received_ms, is_edit=False)
+            text = event.message.text or ""
+            await self._handle(text, received_ms, is_edit=False)
 
         @self.client.on(events.MessageEdited(chats=SIGNAL_CHANNEL))
         async def on_edit(event):
@@ -446,6 +586,10 @@ class SignalListener:
                 pending.task.cancel()
                 print(f"[Listener] Отменено ожидание фандинга для {ticker}")
         _pending_signals.clear()
+        # Отменяем ожидающие подтверждения
+        for ticker in list(_pending_confirmations.keys()):
+            print(f"[Listener] Отменено ожидание подтверждения для {ticker}")
+        _pending_confirmations.clear()
         # Останавливаем мониторы
         await stop_signal_monitor()
         await stop_spread_monitor()
@@ -485,6 +629,12 @@ class SignalListener:
                 await _notify_mexc(signal)
                 return
 
+            # Пропускаем заблокированные тикеры (после отмены/CLOSE)
+            if _is_blocked(signal.ticker):
+                remaining = int(_blocked_signals.get(signal.ticker, 0) - time.time())
+                print(f"[Listener] {signal.ticker} заблокирован — пропускаем (осталось {remaining // 60} мин)")
+                return
+
             in_pinned = signal.ticker in _pinned_tickers
             if is_edit:
                 if is_recent:
@@ -516,9 +666,21 @@ class SignalListener:
             await self._cache_signal(signal, received_ms)
 
         elif isinstance(signal, CloseSignal):
-            # Если тикер в кэше — удаляем (спред сошёлся)
+            # Если тикер в кэше — удаляем и блокируем
             if is_cached(signal.ticker):
                 await remove_signal(signal.ticker)
+                _block_signal(signal.ticker)
+            # Если тикер ожидает подтверждения — отменяем и блокируем
+            if signal.ticker in _pending_confirmations:
+                conf = _pending_confirmations.pop(signal.ticker, None)
+                if conf:
+                    await notify(
+                        f"⛔ <b>{signal.ticker}: сигнал не активен</b>\n"
+                        f"📊 Причина: спред сошёлся (CLOSE сигнал)\n"
+                        f"💡 Funding не удалось получить — позиция не открыта"
+                    )
+                    print(f"[Listener] {signal.ticker}: подтверждение отменено — спред сошёлся, блокирован на {SIGNAL_BLOCK_DURATION_S // 60} мин")
+                    _block_signal(signal.ticker)
             print(f"[Listener] CLOSE {signal.ticker}")
             await self._close(signal)
 
@@ -574,7 +736,7 @@ class SignalListener:
         add_signal(cached_sig, current_spread)
         await notify(
             f"💤 <b>{signal.ticker}: сигнал в кэше</b>\n"
-            f"📊 Спред: {current_spread:.2f}% (мин {MIN_SPREAD_PCT}%)\n"
+            f"📊 Спред: {current_spread:.2f}% (мин {CACHE_MIN_SPREAD}%)\n"
             f"📉 SHORT {signal.short_exchange.upper()} | 📈 LONG {signal.long_exchange.upper()}\n"
             f"⏳ Мониторю каждые 5с, макс 15 мин"
         )
@@ -613,16 +775,19 @@ class SignalListener:
             return
 
         try:
-            min_until = min(
+            min_until = _min_until(
                 _minutes_until(next_short_ts),
                 _minutes_until(next_long_ts),
             )
         except ValueError:
-            # Не удалось получить время фандинга — кэшируем сигнал, повторяем через монитор
-            print(f"[Listener] {signal.ticker}: не удалось получить время фандинга — кэширую")
+            min_until = None
+
+        if min_until is None:
+            current_spread = (signal.short_price / signal.long_price - 1) * 100 if signal.long_price > 0 else 0
+            print(f"[Listener] {signal.ticker}: funding неизвестен — запрашиваю подтверждение")
             await short_ex.close()
             await long_ex.close()
-            await self._cache_signal(signal, received_ms)
+            await _ask_funding_confirmation(signal, current_spread)
             _seen.pop(signal.ticker, None)
             return
 
