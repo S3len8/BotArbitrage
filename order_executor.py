@@ -22,6 +22,7 @@ from db import Trade, save_trade, update_trade, get_open_trade, save_balance_sna
 from signal_parser import OpenSignal, CloseSignal
 from notifier import notify, tradingview_url, edit_notify, exchange_url, notify_order
 from settings import LEVERAGE, BALANCE_ALERT_PCT, MARGIN_RISK_PCT
+from risk_manager import get_allocated
 
 # ── Настройки перезахода ──────────────────────────────────────
 # За сколько минут до фандинга закрывать (всегда, независимо от PnL)
@@ -60,10 +61,13 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
 
         # --- КРОК 2: ФІНАЛЬНИЙ ГВАРД СПРЕДУ (ОСТАННЯ МИТЬ) ---
         # Отримуємо ціни ПІСЛЯ налаштувань, прямо перед входом
-        s_p, l_p = await asyncio.gather(
+        s_p_raw, l_p_raw = await asyncio.gather(
             short_ex.get_price(signal.symbol),
             long_ex.get_price(signal.symbol)
         )
+        s_p = float(s_p_raw)
+        l_p = float(l_p_raw)
+        print(f"[Executor] {signal.ticker}: SHORT ({signal.short_exchange}) price={s_p}, LONG ({signal.long_exchange}) price={l_p}")
 
         current_spread = (s_p / l_p - 1) * 100 if l_p > 0 else 0
         print(f"[Guard] {signal.ticker}: Спред перед входом {current_spread:.2f}% (Потрібно: {MIN_SPREAD_PCT}%)")
@@ -95,38 +99,60 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
         min_s  = max(inf_s.get('min_qty', 1.0) or 1.0, 1.0)
         min_l  = max(inf_l.get('min_qty', 1.0) or 1.0, 1.0)
 
-        # Розраховуємо бажану qty для кожної біржі (в монетах)
+        # ВАЖНО: min_qty и step на Gate.io — В КОНТРАКТАХ, не в монетах!
+        # min_s_coins = min_s * mult_s — минимум в монетах
+        min_s_coins = min_s * mult_s
+        min_l_coins = min_l  # Binance min_qty уже в монетах
+
+        # Розраховуємо бажану qty в монетах
         qty_s_raw = final_size_usd / (s_p * mult_s) if (s_p * mult_s) > 0 else 0
         qty_l_raw = final_size_usd / (l_p * mult_l) if (l_p * mult_l) > 0 else 0
 
         # Беремо мінімум — лімітуюча біржа (менша qty)
-        # Щоб спільна qty не перевищувала те, що може відкрити жодна з бірж
         min_qty_raw = min(qty_s_raw, qty_l_raw)
 
         # Спільний крок = НСД(s_step, l_step), щоб обидві біржі могли відкрити
-        step_common = math.gcd(int(step_s), int(step_l))
+        # step теж в контрактах для Gate, переводимо в монети
+        step_s_coins = step_s * mult_s
+        step_l_coins = step_l  # Binance step в монетах
+        step_common = math.gcd(int(step_s_coins), int(step_l_coins))
         if step_common < 1:
             step_common = 1
         qty_common = int(min_qty_raw) // step_common * step_common
+
+        print(f"[Executor] {signal.ticker}: final_size=${final_size_usd}, "
+              f"s_p={s_p} l_p={l_p}, mult_s={mult_s} mult_l={mult_l}, "
+              f"min_qty_gate={min_s} contracts={min_s_coins:.6f} coins, "
+              f"min_qty_bn={min_l} coins, "
+              f"qty_s_raw={qty_s_raw:.4f} coins, qty_l_raw={qty_l_raw:.4f} coins, "
+              f"step_common={step_common}, qty_common={qty_common}")
 
         # Застосовуємо однакову qty до обох бірж
         qty_s = qty_common
         qty_l = qty_common
 
-        # Перевірка мінімального лота — обидві сторони мають однакову qty
-        need_s = max(min_s - qty_s, 0)
-        need_l = max(min_l - qty_l, 0)
+        # Перевірка мінімального лота (в монетах)
+        need_s = max(min_s_coins - qty_s, 0)
+        need_l = max(min_l_coins - qty_l, 0)
         if need_s > 0 or need_l > 0:
             raise_qty = max(qty_s + need_s, qty_l + need_l)
             cost_s = raise_qty * s_p * mult_s
             cost_l = raise_qty * l_p * mult_l
-            if cost_s <= final_size_usd * 1.2 and cost_l <= final_size_usd * 1.2:
+            # Кожна сторона перевіряється окремо проти своєї allocated budget
+            alloc_s = get_allocated(signal.short_exchange)
+            alloc_l = get_allocated(signal.long_exchange)
+            budget_s = max(alloc_s, 1.0) * 1.2 if alloc_s > 0 else final_size_usd * 1.2
+            budget_l = max(alloc_l, 1.0) * 1.2 if alloc_l > 0 else final_size_usd * 1.2
+            print(f"[Executor] {signal.ticker}: need_s={need_s:.6f} need_l={need_l:.6f} raise_qty={raise_qty}, "
+                  f"cost_s={cost_s:.2f} cost_l={cost_l:.2f} budget_s={budget_s:.2f} budget_l={budget_l:.2f}, "
+                  f"s_p={s_p} l_p={l_p} mult_s={mult_s} mult_l={mult_l}")
+            if cost_s <= budget_s and cost_l <= budget_l:
                 qty_s = raise_qty
                 qty_l = raise_qty
-                print(f"[Executor] {signal.ticker}: qty збільшено до {raise_qty} (мін лот для обох бірж)")
+                print(f"[Executor] {signal.ticker}: qty збільшено до {raise_qty} (мін лот обох бірж, ${cost_s:.2f}/${cost_l:.2f})")
             else:
                 await asyncio.gather(short_ex.close(), long_ex.close())
-                msg = f"❌ {signal.ticker}: мін. лот перевищує ліміт ${final_size_usd}"
+                msg = f"❌ {signal.ticker}: мін. лот перевищує ліміт (${cost_s:.2f}/${cost_l:.2f})"
                 return None, msg
 
         # Фактичний розмір в USD

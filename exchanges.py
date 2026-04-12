@@ -1989,8 +1989,11 @@ class GateExchange(CcxtExchange):
         items = r.json()
         if not items:
             raise ValueError(f"gate: немає даних для {ticker}")
-        price = items[0].get('lowest_ask') or items[0].get('last') or items[0].get('highest_bid')
-        return float(price)
+        price_str = items[0].get('lowest_ask') or items[0].get('last') or items[0].get('highest_bid')
+        price = float(price_str)
+        if price > 10000:
+            print(f"[gate] ⚠️ {symbol}: ціна {price} виглядає завеликою (>10000), перевіряю contract_info")
+        return price
 
     def _balance_sync(self) -> float:
         import hashlib as hl
