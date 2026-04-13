@@ -204,10 +204,8 @@ def _parse_pinned_block(block: str) -> Optional[OpenSignal]:
         return None
 
     # Парсим строки с биржами и ценами: GATE : 0.3365
-    # Первая цена = short (выше), вторая = long (ниже) — по порядку
     exchange_prices = []
     for line in lines:
-        # Строка типа: 🔵 GATE   : 0.3365  или  GATE : 0.3365
         m = re.search(r'([A-Z]{2,10})\s*:\s*([\d.]+)', line)
         if m:
             ex    = m.group(1).strip().lower()
@@ -218,11 +216,17 @@ def _parse_pinned_block(block: str) -> Optional[OpenSignal]:
     if len(exchange_prices) < 2:
         return None
 
-    # 🔧 ИСПРАВЛЕНИЕ: В закреплённом сообщении порядок бирж УЖЕ правильный
-    # Первая строка = short (дороже), вторая = long (дешевле)
-    # НЕ меняем их местами — доверяем порядку из сообщения
-    short_exchange, short_price = exchange_prices[0]
-    long_exchange,  long_price  = exchange_prices[1]
+    # Спред: (макс - мін) / макс * 100
+    # SHORT = вища ціна (sell), LONG = нижча ціна (buy)
+    p1_ex, p1 = exchange_prices[0]
+    p2_ex, p2 = exchange_prices[1]
+
+    if p1 >= p2:
+        short_exchange, short_price = p1_ex, p1
+        long_exchange,  long_price  = p2_ex, p2
+    else:
+        short_exchange, short_price = p2_ex, p2
+        long_exchange,  long_price  = p1_ex, p1
 
     return OpenSignal(
         ticker=ticker,
@@ -232,7 +236,7 @@ def _parse_pinned_block(block: str) -> Optional[OpenSignal]:
         short_price=short_price,
         long_price=long_price,
         spread_pct=spread_pct,
-        funding_short=None,   # в закреплённом нет фандинга — фильтр пропускается
+        funding_short=None,
         funding_long=None,
         max_size_short=None,
         max_size_long=None,

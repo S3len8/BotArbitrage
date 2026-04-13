@@ -328,7 +328,7 @@ async def _monitor_loop():
                 # Открываем позицию
                 try:
                     trade, msg = await asyncio.wait_for(
-                        open_position(updated, risk.final_size_usd, signal_received_ms=int(cached.cached_at * 1000)),
+                        open_position(updated, risk.final_size_short, risk.final_size_long, signal_received_ms=int(cached.cached_at * 1000)),
                         timeout=60
                     )
                     if trade:

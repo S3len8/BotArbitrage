@@ -34,6 +34,7 @@ _seen: dict[str, float] = {}
 # Тикеры из закреплённого сообщения
 _pinned_tickers: set[str] = set()
 _pinned_msg_id: int | None = None
+_prev_pinned_tickers: set[str] = set()  # предыдущее состояние для детекта новых
 
 # Дедупликация MEXC уведомлений
 _mexc_notified: dict[str, float] = {}
@@ -165,7 +166,7 @@ async def _process_confirmation(conf: dict, approved: bool) -> None:
             if not risk:
                 await notify(f"⛔ <b>{ticker}: risk-менеджер отклонил: {risk.reason}</b>")
                 return
-            await open_position(signal, risk.final_size_usd)
+            await open_position(signal, risk.final_size_short, risk.final_size_long)
             await notify(f"✅ <b>{ticker}: позиция открыта после подтверждения</b>")
         finally:
             await asyncio.gather(short_ex.close(), long_ex.close())
@@ -485,12 +486,12 @@ async def _wait_and_open(pending: PendingSignal):
     await notify(
         f"✅ <b>{ticker}: открываем после фандинга</b>\n"
         f"📊 Спред: {current_spread:.2f}%\n"
-        f"💵 Размер: ${risk.final_size_usd:.2f}"
+        f"💵 SH: ${risk.final_size_short:.2f} / LH: ${risk.final_size_long:.2f}"
     )
 
     try:
         trade, msg = await asyncio.wait_for(
-            open_position(updated_signal, risk.final_size_usd,
+            open_position(updated_signal, risk.final_size_short, risk.final_size_long,
                           signal_received_ms=pending.received_ms),
             timeout=60
         )
@@ -597,7 +598,7 @@ class SignalListener:
         await self.client.disconnect()
 
     async def _load_pinned(self):
-        global _pinned_tickers, _pinned_msg_id
+        global _pinned_tickers, _pinned_msg_id, _prev_pinned_tickers
         try:
             full = await self.client(GetFullChannelRequest(SIGNAL_CHANNEL))
             pinned_id = full.full_chat.pinned_msg_id
@@ -609,12 +610,146 @@ class SignalListener:
             if not msgs:
                 return
             text = msgs.text or ""
-            print(f"[Listener] Закреплённое RAW (первые 300 симв): {repr(text[:300])}")
             signals = parse_pinned(text)
-            _pinned_tickers = {s.ticker for s in signals}
-            print(f"[Listener] Закреплённое: {len(signals)} спредов → тикеры: {_pinned_tickers}")
+            new_tickers = {s.ticker for s in signals}
+
+            # При самом первом вызове (старт) — обрабатываем все тикеры
+            is_first = not _prev_pinned_tickers
+            if is_first:
+                _prev_pinned_tickers = new_tickers
+                _pinned_tickers = new_tickers
+                print(f"[Listener] Закреплённое: {len(signals)} спредов → тикеры: {_pinned_tickers}")
+                if signals:
+                    asyncio.create_task(self._process_pinned_signals(signals, is_startup=True))
+            else:
+                # При обновлении — только новые тикеры
+                added = new_tickers - _prev_pinned_tickers
+                _prev_pinned_tickers = new_tickers
+                _pinned_tickers = new_tickers
+                print(f"[Listener] Закреплённое обновлено: новые={added}")
+                if added:
+                    new_signals = [s for s in signals if s.ticker in added]
+                    asyncio.create_task(self._process_pinned_signals(new_signals, is_startup=False))
         except Exception as e:
             print(f"[Listener] Ошибка чтения закреплённого: {e}")
+
+    async def _process_pinned_signals(self, signals: list, is_startup: bool = False):
+        """Обрабатывает сигналы из закреплённого — один проход при запуске."""
+        print(f"[Listener] {'Старт' if is_startup else 'Обновление'} pinned: {len(signals)} тикеров")
+        for i, signal in enumerate(signals):
+            ticker = signal.ticker
+            if _is_blocked(ticker):
+                print(f"[Listener] [{i+1}/{len(signals)}] {ticker}: заблокирован — пропускаем")
+                continue
+            from db import get_open_trade
+            if get_open_trade(ticker):
+                print(f"[Listener] [{i+1}/{len(signals)}] {ticker}: позиция открыта — пропускаем")
+                continue
+
+            print(f"[Listener] [{i+1}/{len(signals)}] {ticker}: обрабатываю...")
+            received_ms = int(time.time() * 1000)
+            await self._handle_pinned(signal, received_ms, is_startup=is_startup)
+
+            if i < len(signals) - 1:
+                await asyncio.sleep(3)
+
+        print(f"[Listener] pinned обработан")
+
+    async def _handle_pinned(self, signal: OpenSignal, received_ms: int, is_startup: bool = False):
+        """Обрабатывает один сигнал из закреплённого — один проход, спред из сообщения."""
+        ticker = signal.ticker
+        is_mexc = 'mexc' in (signal.short_exchange.lower(), signal.long_exchange.lower())
+        if is_mexc:
+            await _notify_mexc(signal)
+            return
+
+        print(f"[Listener] [pinned] {ticker}: спред={signal.spread_pct:.2f}% (need {MIN_SPREAD_PCT}%)")
+
+        # Спред ниже минимума — пропускаем (НЕ кэшируем из pinned)
+        if signal.spread_pct < MIN_SPREAD_PCT:
+            print(f"[Listener] [pinned] {ticker}: спред {signal.spread_pct:.2f}% < {MIN_SPREAD_PCT}% — пропускаем")
+            return
+
+        # Спред OK — получаем живые цены и funding
+        try:
+            short_ex = create_exchange(signal.short_exchange)
+            long_ex  = create_exchange(signal.long_exchange)
+            s_p, l_p, s_fund, l_fund = await asyncio.gather(
+                short_ex.get_price(signal.symbol),
+                long_ex.get_price(signal.symbol),
+                short_ex.get_funding_rate(signal.symbol),
+                long_ex.get_funding_rate(signal.symbol),
+            )
+            await asyncio.gather(short_ex.close(), long_ex.close())
+        except Exception as e:
+            print(f"[Listener] [pinned] {ticker}: ошибка получения данных — {e}")
+            return
+
+        s_p = float(s_p)
+        l_p = float(l_p)
+        current_spread = (s_p / l_p - 1) * 100 if l_p > 0 else 0
+
+        # Funding: используем полученные данные
+        sf = s_fund.get('rate') if s_fund else None
+        lf = l_fund.get('rate') if l_fund else None
+        ns_ts = s_fund.get('next_time') if s_fund else None
+        nl_ts = l_fund.get('next_time') if l_fund else None
+
+        from signal_parser import OpenSignal as _OS
+        updated = _OS(
+            ticker=signal.ticker, symbol=signal.symbol,
+            short_exchange=signal.short_exchange, long_exchange=signal.long_exchange,
+            short_price=s_p, long_price=l_p, spread_pct=current_spread,
+            funding_short=sf, funding_long=lf,
+            max_size_short=None, max_size_long=None,
+            interval_short=None, interval_long=None,
+            raw_text=f"[pinned] {signal.ticker}",
+        )
+
+        # Проверяем funding
+        if sf is not None and lf is not None:
+            diff_pct = abs(sf - lf) * 100
+            both_negative = sf < 0 and lf < 0
+            both_pay_us = (sf > 0) and (lf < 0)
+            passes = diff_pct < 0.2 or (both_negative and diff_pct < 1.0) or both_pay_us
+            if not passes:
+                print(f"[Listener] [pinned] {ticker}: funding не прошёл — пропускаем")
+                return
+
+        # Funding близко — пропускаем
+        if ns_ts or nl_ts:
+            try:
+                min_until = _min_until(
+                    _minutes_until(ns_ts),
+                    _minutes_until(nl_ts),
+                )
+            except (ValueError, TypeError):
+                min_until = None
+            if min_until is not None and min_until <= WAIT_BEFORE_FUNDING_MIN:
+                print(f"[Listener] [pinned] {ticker}: funding через {min_until:.0f} мин — пропускаем")
+                return
+
+        # Все OK — открываем
+        try:
+            short_ex2 = create_exchange(signal.short_exchange)
+            long_ex2  = create_exchange(signal.long_exchange)
+            try:
+                risk = await asyncio.wait_for(
+                    check_signal(updated, short_ex2, long_ex2),
+                    timeout=30
+                )
+            finally:
+                await asyncio.gather(short_ex2.close(), long_ex2.close())
+
+            if not risk:
+                print(f"[Listener] [pinned] {ticker}: risk отклонил — {risk.reason}")
+                await notify(f"⛔ <b>{ticker}: risk отклонил ({risk.reason})")
+                return
+
+            await open_position(updated, risk.final_size_short, risk.final_size_long, signal_received_ms=received_ms)
+        except Exception as e:
+            print(f"[Listener] [pinned] {ticker}: ошибка открытия — {e}")
+            await notify(f"❌ <b>{ticker}: ошибка открытия — {e}")
 
     async def _handle(self, text: str, received_ms: int, is_edit: bool, is_recent: bool = False):
         signal = parse_message(text)
@@ -697,9 +832,8 @@ class SignalListener:
             s_price, l_price = await asyncio.gather(
                 s_ex.get_price(signal.symbol),
                 l_ex.get_price(signal.symbol),
-                return_exceptions=True,
             )
-            await asyncio.gather(s_ex.close(), l_ex.close(), return_exceptions=True)
+            await asyncio.gather(s_ex.close(), l_ex.close())
         except Exception as e:
             print(f"[Listener] Ошибка получения цен для кэша {signal.ticker}: {e}")
             return
@@ -736,11 +870,10 @@ class SignalListener:
         add_signal(cached_sig, current_spread)
         await notify(
             f"💤 <b>{signal.ticker}: сигнал в кэше</b>\n"
-            f"📊 Спред: {current_spread:.2f}% (мин {CACHE_MIN_SPREAD}%)\n"
+            f"📊 Спред: {current_spread:.2f}% (мін {CACHE_MIN_SPREAD}%)\n"
             f"📉 SHORT {signal.short_exchange.upper()} | 📈 LONG {signal.long_exchange.upper()}\n"
             f"⏳ Мониторю каждые 5с, макс 15 мин"
         )
-
     async def _open(self, signal: OpenSignal, received_ms: int):
         if _is_duplicate(signal.ticker):
             print(f"[Listener] Дубль {signal.ticker} — пропускаем (окно {DEDUP_WINDOW_S}с)")
@@ -895,7 +1028,7 @@ class SignalListener:
         print(f"[Listener] Risk OK: {risk.reason}")
         try:
             trade, msg = await asyncio.wait_for(
-                open_position(signal, risk.final_size_usd, signal_received_ms=received_ms),
+                open_position(signal, risk.final_size_short, risk.final_size_long, signal_received_ms=received_ms),
                 timeout=60
             )
         except asyncio.TimeoutError:

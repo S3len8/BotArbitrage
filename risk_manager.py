@@ -70,6 +70,8 @@ class RiskResult:
     ok: bool
     reason: str = ""
     final_size_usd: Optional[float] = None
+    final_size_short: Optional[float] = None  # бюджет для SHORT
+    final_size_long: Optional[float] = None   # бюджет для LONG
 
     def __bool__(self): return self.ok
 
@@ -171,36 +173,57 @@ async def check_signal(signal: OpenSignal, short_ex: BaseExchange, long_ex: Base
             if vol is not None and vol < MIN_VOLUME_USD:
                 return RiskResult(ok=False, reason=f"Низкий объём на {exname.upper()}: ${vol:,.0f} < минимум ${MIN_VOLUME_USD:,.0f}. {signal.ticker} пропущен.")
 
-    # 7. Итоговый размер — минимум из всех ограничений
-    candidates = []
-
-    # Выделенный капитал × плечо (приоритет если задан)
+    # 7. Итоговый размер — для КАЖДОЙ биржи отдельно
+    # Если allocated задано — используем allocated × leverage
+    # Иначе — balance × leverage (если баланс доступен)
+    # Ограничиваем max_position с каждой стороны
     alloc_short = get_allocated(signal.short_exchange)
     alloc_long  = get_allocated(signal.long_exchange)
 
+    # SHORT budget
     if alloc_short > 0:
-        candidates.append((f'{signal.short_exchange}_allocated×lev', alloc_short * LEVERAGE))
+        final_size_short = alloc_short * LEVERAGE
+        limit_short = f'{signal.short_exchange}_allocated×lev'
     elif not isinstance(bal_short, Exception) and bal_short > 0:
-        candidates.append(('balance_short×lev', bal_short * LEVERAGE))
+        final_size_short = bal_short * LEVERAGE
+        limit_short = 'balance_short×lev'
+    else:
+        final_size_short = 0
+        limit_short = 'no_balance'
 
+    # LONG budget
     if alloc_long > 0:
-        candidates.append((f'{signal.long_exchange}_allocated×lev', alloc_long * LEVERAGE))
+        final_size_long = alloc_long * LEVERAGE
+        limit_long = f'{signal.long_exchange}_allocated×lev'
     elif not isinstance(bal_long, Exception) and bal_long > 0:
-        candidates.append(('balance_long×lev', bal_long * LEVERAGE))
-    if not isinstance(max_short, Exception) and max_short:
-        candidates.append((f'{signal.short_exchange}_max', max_short))
-    if not isinstance(max_long,  Exception) and max_long:
-        candidates.append((f'{signal.long_exchange}_max',  max_long))
-    if signal.max_size_short:
-        candidates.append(('signal_max_short', signal.max_size_short))
-    if signal.max_size_long:
-        candidates.append(('signal_max_long',  signal.max_size_long))
+        final_size_long = bal_long * LEVERAGE
+        limit_long = 'balance_long×lev'
+    else:
+        final_size_long = 0
+        limit_long = 'no_balance'
 
-    if not candidates:
+    # Ограничиваем max_position
+    if not isinstance(max_short, Exception) and max_short:
+        if max_short < final_size_short:
+            final_size_short = max_short
+            limit_short = f'{signal.short_exchange}_max'
+    if not isinstance(max_long, Exception) and max_long:
+        if max_long < final_size_long:
+            final_size_long = max_long
+            limit_long = f'{signal.long_exchange}_max'
+
+    # Ограничиваем signal max_size
+    if signal.max_size_short and signal.max_size_short < final_size_short:
+        final_size_short = signal.max_size_short
+        limit_short = 'signal_max_short'
+    if signal.max_size_long and signal.max_size_long < final_size_long:
+        final_size_long = signal.max_size_long
+        limit_long = 'signal_max_long'
+
+    if final_size_short <= 0 or final_size_long <= 0:
         return RiskResult(ok=False, reason=f"Не удалось определить размер позиции для {signal.ticker}")
 
-    final_size = min(v for _, v in candidates)
-    limiting   = min(candidates, key=lambda x: x[1])
+    print(f"[Risk] {signal.ticker}: short={limit_short}=${final_size_short:.2f}, long={limit_long}=${final_size_long:.2f}")
 
     vol_info = ""
     if not isinstance(vol_short, Exception) and vol_short:
@@ -211,7 +234,9 @@ async def check_signal(signal: OpenSignal, short_ex: BaseExchange, long_ex: Base
     return RiskResult(
         ok=True,
         reason=(f"✅ {signal.ticker}: спред {real_spread:.2f}%, "
-                f"размер ${final_size:.2f} (лимит: {limiting[0]}), "
+                f"short ${final_size_short:.2f}, long ${final_size_long:.2f}, "
                 f"плечо {LEVERAGE}×, позиций {len(open_trades)}/{MAX_OPEN_POSITIONS}{vol_info}"),
-        final_size_usd=final_size,
+        final_size_usd=min(final_size_short, final_size_long),
+        final_size_short=final_size_short,
+        final_size_long=final_size_long,
     )

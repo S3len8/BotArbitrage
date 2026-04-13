@@ -35,7 +35,7 @@ def _now(): return datetime.now(timezone.utc)
 def _ms():  return int(time.time() * 1000)
 
 
-async def open_position(signal: OpenSignal, final_size_usd: float, signal_received_ms: int = None) -> tuple[
+async def open_position(signal: OpenSignal, budget_short: float, budget_long: float, signal_received_ms: int = None) -> tuple[
     Optional[Trade], str]:
     """
     Покращена функція відкриття:
@@ -45,7 +45,7 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
     4. Послідовне виконання ордерів.
     """
     t0 = signal_received_ms or _ms()
-    from settings import MIN_SPREAD_PCT
+    from settings import MIN_SPREAD_PCT, AUTO_CLOSE_SPREAD_PCT
 
     short_ex = create_exchange(signal.short_exchange)
     long_ex = create_exchange(signal.long_exchange)
@@ -70,22 +70,23 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
         print(f"[Executor] {signal.ticker}: SHORT ({signal.short_exchange}) price={s_p}, LONG ({signal.long_exchange}) price={l_p}")
 
         current_spread = (s_p / l_p - 1) * 100 if l_p > 0 else 0
-        print(f"[Guard] {signal.ticker}: Спред перед входом {current_spread:.2f}% (Потрібно: {MIN_SPREAD_PCT}%)")
-
-        if current_spread < MIN_SPREAD_PCT:
-            await asyncio.gather(short_ex.close(), long_ex.close())
-            msg = f"⛔ {signal.ticker} СКАСОВАНО: спред упав до {current_spread:.2f}% (мін {MIN_SPREAD_PCT}%)"
-            return None, msg
+        print(f"[Guard] {signal.ticker}: Спред перед входом {current_spread:.2f}% (сигнал: {signal.spread_pct:.2f}%)")
 
         # --- КРОК 2.5: ПЕРЕВІРКА ЩО SHORT > LONG (НЕГАТИВНИЙ СПРЕД) ---
         if s_p <= l_p:
             await asyncio.gather(short_ex.close(), long_ex.close())
-            msg = f"⛔ {signal.ticker} СКАСОВАНО: short_price ({s_p}) <= long_price ({l_p}) — негативний спред"
+            msg = f"⛔ {signal.ticker}: short_price ({s_p}) <= long_price ({l_p}) — негативний спред"
             return None, msg
 
-        # --- КРОК 3: РОЗРАХУНОК ОБСЯГУ ДЛЯ КОЖНОЇ БІРЖІ ОКРЕМО ---
-        # Кожна біржа має свої одиниці: Gate — контракти, Binance — монети
-        # Рахуємо qty окремо, потім обмежуємо по USD
+        # --- КРОК 3: РОЗРАХУНОК ОБСЯГУ ---
+        # Кожна біржа має свій бюджет: allocated × leverage
+        alloc_s = get_allocated(signal.short_exchange)
+        alloc_l = get_allocated(signal.long_exchange)
+        budget_s = alloc_s * LEVERAGE if alloc_s > 0 else budget_short
+        budget_l = alloc_l * LEVERAGE if alloc_l > 0 else budget_long
+
+        print(f"[Executor] {signal.ticker}: alloc_short=${alloc_s:.2f} × {LEVERAGE} = ${budget_s:.2f}, "
+              f"alloc_long=${alloc_l:.2f} × {LEVERAGE} = ${budget_l:.2f}")
 
         inf_s, inf_l = await asyncio.gather(
             short_ex.get_contract_info(signal.symbol),
@@ -99,78 +100,59 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
         min_s  = max(inf_s.get('min_qty', 1.0) or 1.0, 1.0)
         min_l  = max(inf_l.get('min_qty', 1.0) or 1.0, 1.0)
 
-        # ВАЖНО: min_qty и step на Gate.io — В КОНТРАКТАХ, не в монетах!
-        # min_s_coins = min_s * mult_s — минимум в монетах
+        # min_qty в монетах
         min_s_coins = min_s * mult_s
-        min_l_coins = min_l  # Binance min_qty уже в монетах
+        min_l_coins = min_l
 
-        # Розраховуємо бажану qty в монетах
-        qty_s_raw = final_size_usd / (s_p * mult_s) if (s_p * mult_s) > 0 else 0
-        qty_l_raw = final_size_usd / (l_p * mult_l) if (l_p * mult_l) > 0 else 0
+        # Розраховуємо qty в монетах для кожної сторони окремо
+        qty_s_raw = budget_s / (s_p * mult_s) if (s_p * mult_s) > 0 else 0
+        qty_l_raw = budget_l / (l_p * mult_l) if (l_p * mult_l) > 0 else 0
 
-        # Беремо мінімум — лімітуюча біржа (менша qty)
+        # Беремо мінімум (лімітуюча біржа)
         min_qty_raw = min(qty_s_raw, qty_l_raw)
 
-        # Спільний крок = НСД(s_step, l_step), щоб обидві біржі могли відкрити
-        # step теж в контрактах для Gate, переводимо в монети
+        # Спільний крок
         step_s_coins = step_s * mult_s
-        step_l_coins = step_l  # Binance step в монетах
+        step_l_coins = step_l
         step_common = math.gcd(int(step_s_coins), int(step_l_coins))
         if step_common < 1:
             step_common = 1
+
+        # Округлюємо ВНИЗ до step_common
         qty_common = int(min_qty_raw) // step_common * step_common
 
-        print(f"[Executor] {signal.ticker}: final_size=${final_size_usd}, "
-              f"s_p={s_p} l_p={l_p}, mult_s={mult_s} mult_l={mult_l}, "
-              f"min_qty_gate={min_s} contracts={min_s_coins:.6f} coins, "
-              f"min_qty_bn={min_l} coins, "
-              f"qty_s_raw={qty_s_raw:.4f} coins, qty_l_raw={qty_l_raw:.4f} coins, "
-              f"step_common={step_common}, qty_common={qty_common}")
+        # Якщо результат < мін лот — піднімаємо до мін лоту
+        min_lot_coins = max(min_s_coins, min_l_coins)
+        if qty_common < min_lot_coins:
+            qty_common = int(min_lot_coins) // step_common * step_common
+            if qty_common < min_lot_coins:
+                qty_common += step_common
 
-        # Застосовуємо однакову qty до обох бірж
         qty_s = qty_common
         qty_l = qty_common
 
-        # Перевірка мінімального лота (в монетах)
-        need_s = max(min_s_coins - qty_s, 0)
-        need_l = max(min_l_coins - qty_l, 0)
-        if need_s > 0 or need_l > 0:
-            raise_qty = max(qty_s + need_s, qty_l + need_l)
-            cost_s = raise_qty * s_p * mult_s
-            cost_l = raise_qty * l_p * mult_l
-            # Кожна сторона перевіряється окремо проти своєї allocated budget
-            alloc_s = get_allocated(signal.short_exchange)
-            alloc_l = get_allocated(signal.long_exchange)
-            budget_s = max(alloc_s, 1.0) * 1.2 if alloc_s > 0 else final_size_usd * 1.2
-            budget_l = max(alloc_l, 1.0) * 1.2 if alloc_l > 0 else final_size_usd * 1.2
-            print(f"[Executor] {signal.ticker}: need_s={need_s:.6f} need_l={need_l:.6f} raise_qty={raise_qty}, "
-                  f"cost_s={cost_s:.2f} cost_l={cost_l:.2f} budget_s={budget_s:.2f} budget_l={budget_l:.2f}, "
-                  f"s_p={s_p} l_p={l_p} mult_s={mult_s} mult_l={mult_l}")
-            if cost_s <= budget_s and cost_l <= budget_l:
-                qty_s = raise_qty
-                qty_l = raise_qty
-                print(f"[Executor] {signal.ticker}: qty збільшено до {raise_qty} (мін лот обох бірж, ${cost_s:.2f}/${cost_l:.2f})")
-            else:
-                await asyncio.gather(short_ex.close(), long_ex.close())
-                msg = f"❌ {signal.ticker}: мін. лот перевищує ліміт (${cost_s:.2f}/${cost_l:.2f})"
-                return None, msg
+        cost_s = qty_s * s_p * mult_s
+        cost_l = qty_l * l_p * mult_l
 
-        # Фактичний розмір в USD
-        exec_size_s = qty_s * s_p * mult_s
-        exec_size_l = qty_l * l_p * mult_l
+        print(f"[Executor] {signal.ticker}: qty={qty_common}, cost=${cost_s:.2f}/${cost_l:.2f}, "
+              f"budget=${budget_s:.2f}/${budget_l:.2f}")
 
-        # Попередження: якщо одна сторона менше 50% від цілі — позиція занадто мала
-        if exec_size_s < final_size_usd * 0.5 or exec_size_l < final_size_usd * 0.5:
-            print(f"[Executor] {signal.ticker}: ⚠️ мала позиція — short=${exec_size_s:.2f} long=${exec_size_l:.2f} (ціль=${final_size_usd:.2f})")
+        min_cost_s = min_s_coins * s_p * mult_s
+        min_cost_l = min_l_coins * l_p * mult_l
 
-        # ЗАХИСТ: фактичний розмір не повинен перевищувати ліміт більше ніж на 20%
-        max_allowed = final_size_usd * 1.2
-        if exec_size_s > max_allowed or exec_size_l > max_allowed:
-            print(f"[Executor] {signal.ticker}: ПЕРЕВИЩЕННЯ ОБСЯГУ! "
-                  f"short=${exec_size_s:.2f} long=${exec_size_l:.2f} ліміт=${final_size_usd:.2f}")
+        if cost_s > budget_s * 1.2 or cost_l > budget_l * 1.2:
             await asyncio.gather(short_ex.close(), long_ex.close())
-            msg = f"❌ {signal.ticker}: обсяг перевищено — short=${exec_size_s:.2f}, long=${exec_size_l:.2f} (ліміт ${final_size_usd:.2f})"
+            await notify(
+                f"⚠️ <b>{signal.ticker}: мін. лот перевищує бюджет</b>\n"
+                f"📌 {signal.short_exchange}: мін. позиція ${min_cost_s:.2f}, бюджет ${budget_s:.2f}\n"
+                f"📌 {signal.long_exchange}: мін. позиція ${min_cost_l:.2f}, бюджет ${budget_l:.2f}\n"
+                f"💡 Збільште виділену маржу для цієї біржі"
+            )
+            msg = f"❌ {signal.ticker}: мін. лот перевищує ліміт (${cost_s:.2f}/${cost_l:.2f})"
             return None, msg
+
+        exec_size_s = cost_s
+        exec_size_l = cost_l
 
         # --- КРОК 4: ВИКОНАННЯ ОРДЕРІВ ---
         trade = Trade(
@@ -241,10 +223,10 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
         trade.exec_time_short_ms = exec_ms
         trade.exec_time_long_ms = exec_ms
 
-        # ПЕРЕВІРКА: фактичний спред після філів ордерів
+        # ПЕРЕВІРКА: фактичний спред після філів ордерів (толерантність 0.2%)
         actual_spread = (trade.short_entry_price / trade.long_entry_price - 1) * 100
-        if actual_spread < MIN_SPREAD_PCT:
-            print(f"[Executor] {signal.ticker}: фактичний спред {actual_spread:.2f}% < {MIN_SPREAD_PCT}% — негайне закриття!")
+        if actual_spread < AUTO_CLOSE_SPREAD_PCT:
+            print(f"[Executor] {signal.ticker}: фактичний спред {actual_spread:.2f}% < {AUTO_CLOSE_SPREAD_PCT}% — негайне закриття!")
             await notify(
                 f"⛔ <b>{signal.ticker}: скасовано — фактичний спред {actual_spread:.2f}%</b>\n"
                 f"📊 Спред сигналу: {signal.spread_pct:.2f}% | Факт: {actual_spread:.2f}%\n"
@@ -262,7 +244,7 @@ async def open_position(signal: OpenSignal, final_size_usd: float, signal_receiv
             await asyncio.gather(short_ex.close(), long_ex.close())
             trade.status = 'failed'
             save_trade(trade)
-            return None, f"Фактичний спред {actual_spread:.2f}% < {MIN_SPREAD_PCT}%"
+            return None, f"Фактичний спред {actual_spread:.2f}% < {AUTO_CLOSE_SPREAD_PCT}%"
 
         save_trade(trade)
 
@@ -643,11 +625,11 @@ async def _try_reentry(trade: Trade, current_spread_pct: float):
         await notify(
             f"🔄 <b>Перезаход {trade.ticker}</b>\n"
             f"📊 Текущий спред: {current_spread_pct:.2f}%\n"
-            f"💵 Размер: ${risk.final_size_usd:.2f}\n"
+            f"💵 SH: ${risk.final_size_short:.2f} / LH: ${risk.final_size_long:.2f}\n"
             f"⚡ Открываю новую позицию..."
         )
 
-        new_trade, open_msg = await open_position(reentry_signal, risk.final_size_usd)
+        new_trade, open_msg = await open_position(reentry_signal, risk.final_size_short, risk.final_size_long)
         if new_trade:
             print(f"[Reentry] {trade.ticker}: успешно перезашли, trade_id={new_trade.id}")
         else:
