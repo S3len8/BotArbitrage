@@ -164,7 +164,8 @@ async def _process_confirmation(conf: dict, approved: bool) -> None:
                 return
             risk = await check_signal(signal, short_ex, long_ex)
             if not risk:
-                await notify(f"⛔ <b>{ticker}: risk-менеджер отклонил: {risk.reason}</b>")
+                if 'черном списке' not in risk.reason.lower():
+                    await notify(f"⛔ <b>{ticker}: risk-менеджер отклонил: {risk.reason}</b>")
                 return
             await open_position(signal, risk.final_size_short, risk.final_size_long)
             await notify(f"✅ <b>{ticker}: позиция открыта после подтверждения</b>")
@@ -287,6 +288,9 @@ def _min_until(a: float | None, b: float | None) -> float | None:
     return min(a, b)
 
 
+FUNDING_COOLDOWN_SEC: int = 120
+
+
 async def _wait_and_open(pending: PendingSignal):
     """
     Ждёт начисления фандинга, потом проверяет спред и открывает позицию.
@@ -296,7 +300,6 @@ async def _wait_and_open(pending: PendingSignal):
     fund_ts  = pending.fund_time
     ticker   = signal.ticker
 
-    # Ждём до момента фандинга + небольшой буфер (30 сек чтобы биржи успели начислить)
     wait_secs = max(0, fund_ts - time.time()) + 30
     print(f"[Listener] {ticker}: ждём фандинга {wait_secs:.0f}с (до {fund_ts})")
 
@@ -305,15 +308,19 @@ async def _wait_and_open(pending: PendingSignal):
         f"📊 Спред сигнала: {signal.spread_pct:.2f}%\n"
         f"📉 SHORT {signal.short_exchange.upper()} | 📈 LONG {signal.long_exchange.upper()}\n"
         f"⏱ Начисление через ~{wait_secs/60:.0f} мин\n"
-        f"🔄 После начисления проверим спред (минимум {REENTRY_MIN_SPREAD_PCT}%)"
+        f"🔄 После начисления: пауза {FUNDING_COOLDOWN_SEC//60} мин → проверка спреда"
     )
 
     await asyncio.sleep(wait_secs)
 
-    # Убираем из очереди
     _pending_signals.pop(ticker, None)
 
-    print(f"[Listener] {ticker}: фандинг начислен, проверяем спред")
+    print(f"[Listener] {ticker}: фандинг начислен, пауза {FUNDING_COOLDOWN_SEC//60} мин...")
+
+    await notify(f"⏳ <b>{ticker}: пост-фандинговая пауза {FUNDING_COOLDOWN_SEC//60} мин</b>")
+    await asyncio.sleep(FUNDING_COOLDOWN_SEC)
+
+    print(f"[Listener] {ticker}: пауза завершена, проверяем спред")
 
     # Получаем актуальные цены
     try:
@@ -743,7 +750,8 @@ class SignalListener:
 
             if not risk:
                 print(f"[Listener] [pinned] {ticker}: risk отклонил — {risk.reason}")
-                await notify(f"⛔ <b>{ticker}: risk отклонил ({risk.reason})")
+                if 'черном списке' not in risk.reason.lower():
+                    await notify(f"⛔ <b>{ticker}: risk отклонил ({risk.reason})")
                 return
 
             await open_position(updated, risk.final_size_short, risk.final_size_long, signal_received_ms=received_ms)
@@ -1022,7 +1030,8 @@ class SignalListener:
                 else:
                     print(f"[Listener] {signal.ticker} уже в кэше — пропускаю")
 
-            await notify(f"⏭ Пропущен {signal.ticker}\n{risk.reason}")
+            if 'черном списке' not in risk.reason.lower():
+                await notify(f"⏭ Пропущен {signal.ticker}\n{risk.reason}")
             return
 
         print(f"[Listener] Risk OK: {risk.reason}")

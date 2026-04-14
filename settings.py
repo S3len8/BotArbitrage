@@ -57,6 +57,11 @@ ORDERS_CHAT_ID:   str = os.getenv("ORDERS_CHAT_ID",   os.getenv("NOTIFY_CHAT_ID"
 # Приклад: маржа $5, позиція -$4 = 80% → закриваємо. Default = 80.
 MARGIN_RISK_PCT: float = float(os.getenv("MARGIN_RISK_PCT", "80"))
 
+# ── Фільтри захисту (Anti-Toxic Flow) ─────────────────────────
+ATR_VOLATILE_MULTIPLIER: float = float(os.getenv("ATR_VOLATILE_MULTIPLIER", "2.5"))
+DEPTH_MIN_RATIO:         float = float(os.getenv("DEPTH_MIN_RATIO", "3.0"))
+INDEX_DEVIATION_PCT:     float = float(os.getenv("INDEX_DEVIATION_PCT", "1.0"))
+
 EXCHANGE_KEYS: dict = {
     "binance": {"api_key": os.getenv("BINANCE_API_KEY", ""), "api_secret": os.getenv("BINANCE_API_SECRET", "")},
     "bybit":   {"api_key": os.getenv("BYBIT_API_KEY",   ""), "api_secret": os.getenv("BYBIT_API_SECRET",   "")},

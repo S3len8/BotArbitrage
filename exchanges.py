@@ -80,6 +80,12 @@ class BaseExchange(ABC):
         """
         return None
 
+    async def get_order_book_depth(self, symbol: str, order_size_usd: float, current_price: float) -> Optional[float]:
+        """Проверяет ликвидность в стакане.
+        Возвращает суммарный объём в USD на top-20 уровнях рядом с current_price,
+        или None если API недоступен."""
+        return None
+
     async def get_position_size_usd(self) -> float:
         return await self.get_futures_balance() * LEVERAGE
 
@@ -342,14 +348,18 @@ class BinanceExchange(CcxtExchange):
                 if s['symbol'] == ticker:
                     step = 0.001
                     min_qty = 0.001
+                    min_notional = 5.0
                     for f in s.get('filters', []):
                         if f['filterType'] == 'LOT_SIZE':
                             step = float(f['stepSize'])
                             min_qty = float(f['minQty'])
+                        if f['filterType'] == 'MIN_NOTIONAL':
+                            min_notional = float(f.get('notional', 5.0) or 5.0)
                     return {
                         'step': step,
                         'multiplier': 1.0,
                         'min_qty': min_qty,
+                        'min_notional': min_notional,
                     }
             return {'step': 0.001, 'multiplier': 1.0, 'min_qty': 0.001}
 
@@ -566,6 +576,30 @@ class BinanceExchange(CcxtExchange):
                         'leverage': int(float(p.get('leverage', LEVERAGE))),
                     }
             return None
+        try:
+            return await _run_sync(_sync)
+        except Exception:
+            return None
+
+    async def get_order_book_depth(self, symbol: str, order_size_usd: float, current_price: float) -> Optional[float]:
+        def _sync():
+            ticker = symbol.replace('/', '').replace(':USDT', '')
+            r = requests.get('https://fapi.binance.com/fapi/v1/depth',
+                             params={'symbol': ticker, 'limit': 20}, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            bids = data.get('bids', [])
+            asks = data.get('asks', [])
+            if not bids and not asks:
+                return None
+            total = 0.0
+            price_range_pct = 0.005
+            for price_str, qty_str in bids + asks:
+                price = float(price_str)
+                qty = float(qty_str)
+                if abs(price - current_price) / current_price <= price_range_pct:
+                    total += qty * price
+            return total
         try:
             return await _run_sync(_sync)
         except Exception:
@@ -913,7 +947,7 @@ class BybitExchange(BaseExchange):
             r.raise_for_status()
             items = r.json().get('result', {}).get('list', [])
             if not items:
-                return {'step': 0.001, 'multiplier': 1.0, 'min_qty': 0.001}
+                return {'step': 0.001, 'multiplier': 1.0, 'min_qty': 0.001, 'min_notional': 5.0}
             d = items[0]
             lot_filter = d.get('lotSizeFilter', {})
             step = float(lot_filter.get('qtyStep', 0.001))
@@ -1814,10 +1848,12 @@ class GateExchange(CcxtExchange):
             r = requests.get(f'https://api.gateio.ws/api/v4/futures/usdt/contracts/{ticker}', timeout=10)
             r.raise_for_status()
             d = r.json()
+            qm = float(d.get('quanto_multiplier') or 1)
             return {
                 'step': max(float(d.get('order_size_min', 1) or 1), 1.0),
-                'multiplier': float(d.get('quanto_multiplier') or d.get('multiplier') or 1),
-                'min_qty': max(float(d.get('order_size_min', 1) or 1), 1.0)
+                'multiplier': qm,
+                'min_qty': max(float(d.get('order_size_min', 1) or 1), 1.0),
+                'min_notional': float(d.get('order_size_min', 1) or 1) * qm,
             }
 
         return await _run_sync(_sync_info)

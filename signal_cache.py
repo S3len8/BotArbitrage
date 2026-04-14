@@ -305,7 +305,8 @@ async def _monitor_loop():
                 if not risk:
                     reason = risk.reason or ""
                     print(f"[SignalCache] {ticker}: риск-менеджер отклонил — {reason}")
-                    await notify(f"⛔ <b>{ticker}: кэшированный сигнал отклонён</b>\n{reason}")
+                    if 'черном списке' not in reason.lower():
+                        await notify(f"⛔ <b>{ticker}: кэшированный сигнал отклонён</b>\n{reason}")
 
                     # Конфликт: max positions / insufficient funds / same ticker → выбираем наибольший спред
                     conflict_reasons = (

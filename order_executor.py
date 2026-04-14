@@ -35,6 +35,9 @@ def _now(): return datetime.now(timezone.utc)
 def _ms():  return int(time.time() * 1000)
 
 
+_pending_opens: set[str] = set()
+
+
 async def open_position(signal: OpenSignal, budget_short: float, budget_long: float, signal_received_ms: int = None) -> tuple[
     Optional[Trade], str]:
     """
@@ -44,6 +47,11 @@ async def open_position(signal: OpenSignal, budget_short: float, budget_long: fl
     3. Синхронізація кількості монет/контрактів.
     4. Послідовне виконання ордерів.
     """
+    ticker = signal.ticker
+    if ticker in _pending_opens:
+        print(f"[Executor] {ticker}: вже відкривається іншим потоком — пропускаю")
+        return None, f"⏳ {ticker}: позиція вже відкривається"
+    _pending_opens.add(ticker)
     t0 = signal_received_ms or _ms()
     from settings import MIN_SPREAD_PCT, AUTO_CLOSE_SPREAD_PCT
 
@@ -67,15 +75,16 @@ async def open_position(signal: OpenSignal, budget_short: float, budget_long: fl
         )
         s_p = float(s_p_raw)
         l_p = float(l_p_raw)
-        print(f"[Executor] {signal.ticker}: SHORT ({signal.short_exchange}) price={s_p}, LONG ({signal.long_exchange}) price={l_p}")
+        print(f"[Executor] {ticker}: SHORT ({signal.short_exchange}) price={s_p}, LONG ({signal.long_exchange}) price={l_p}")
 
         current_spread = (s_p / l_p - 1) * 100 if l_p > 0 else 0
-        print(f"[Guard] {signal.ticker}: Спред перед входом {current_spread:.2f}% (сигнал: {signal.spread_pct:.2f}%)")
+        print(f"[Guard] {ticker}: Спред перед входом {current_spread:.2f}% (сигнал: {signal.spread_pct:.2f}%)")
 
         # --- КРОК 2.5: ПЕРЕВІРКА ЩО SHORT > LONG (НЕГАТИВНИЙ СПРЕД) ---
         if s_p <= l_p:
             await asyncio.gather(short_ex.close(), long_ex.close())
-            msg = f"⛔ {signal.ticker}: short_price ({s_p}) <= long_price ({l_p}) — негативний спред"
+            msg = f"⛔ {ticker}: short_price ({s_p}) <= long_price ({l_p}) — негативний спред"
+            _pending_opens.discard(ticker)
             return None, msg
 
         # --- КРОК 3: РОЗРАХУНОК ОБСЯГУ ---
@@ -85,13 +94,35 @@ async def open_position(signal: OpenSignal, budget_short: float, budget_long: fl
         budget_s = alloc_s * LEVERAGE if alloc_s > 0 else budget_short
         budget_l = alloc_l * LEVERAGE if alloc_l > 0 else budget_long
 
-        print(f"[Executor] {signal.ticker}: alloc_short=${alloc_s:.2f} × {LEVERAGE} = ${budget_s:.2f}, "
+        print(f"[Executor] {ticker}: alloc_short=${alloc_s:.2f} × {LEVERAGE} = ${budget_s:.2f}, "
               f"alloc_long=${alloc_l:.2f} × {LEVERAGE} = ${budget_l:.2f}")
 
-        inf_s, inf_l = await asyncio.gather(
-            short_ex.get_contract_info(signal.symbol),
-            long_ex.get_contract_info(signal.symbol)
-        )
+        err_s = err_l = None
+        try:
+            inf_s = await short_ex.get_contract_info(signal.symbol)
+        except Exception as e:
+            err_s = str(e)
+            inf_s = {}
+        try:
+            inf_l = await long_ex.get_contract_info(signal.symbol)
+        except Exception as e:
+            err_l = str(e)
+            inf_l = {}
+
+        if err_s or err_l:
+            await asyncio.gather(short_ex.close(), long_ex.close())
+            parts = []
+            if err_s:
+                parts.append(f"📌 {signal.short_exchange}: не вдалося отримати дані — {err_s}")
+            if err_l:
+                parts.append(f"📌 {signal.long_exchange}: не вдалося отримати дані — {err_l}")
+            await notify(
+                f"⚠️ <b>{ticker}: помилка отримання даних про контракт</b>\n"
+                + "\n".join(parts)
+            )
+            msg = f"❌ {ticker}: не вдалося отримати contract_info"
+            _pending_opens.discard(ticker)
+            return None, msg
 
         mult_s = inf_s.get('multiplier', 1.0) or 1.0
         mult_l = inf_l.get('multiplier', 1.0) or 1.0
@@ -100,28 +131,50 @@ async def open_position(signal: OpenSignal, budget_short: float, budget_long: fl
         min_s  = max(inf_s.get('min_qty', 1.0) or 1.0, 1.0)
         min_l  = max(inf_l.get('min_qty', 1.0) or 1.0, 1.0)
 
-        # min_qty в монетах
         min_s_coins = min_s * mult_s
         min_l_coins = min_l
 
-        # Розраховуємо qty в монетах для кожної сторони окремо
-        qty_s_raw = budget_s / (s_p * mult_s) if (s_p * mult_s) > 0 else 0
-        qty_l_raw = budget_l / (l_p * mult_l) if (l_p * mult_l) > 0 else 0
+        min_notional_s = inf_s.get('min_notional') or (min_s_coins * s_p)
+        min_notional_l = inf_l.get('min_notional') or (min_l_coins * l_p)
+        min_cost_s = max(min_s_coins * s_p, min_notional_s)
+        min_cost_l = max(min_l_coins * l_p, min_notional_l)
 
-        # Беремо мінімум (лімітуюча біржа)
-        min_qty_raw = min(qty_s_raw, qty_l_raw)
+        if budget_s <= 0 or budget_l <= 0:
+            await asyncio.gather(short_ex.close(), long_ex.close())
+            await notify(
+                f"⚠️ <b>{ticker}: бюджет не визначено</b>\n"
+                f"📌 {signal.short_exchange}: бюджет ${budget_s:.2f}\n"
+                f"📌 {signal.long_exchange}: бюджет ${budget_l:.2f}\n"
+                f"💡 Перевірте виділену маржу для бірж"
+            )
+            msg = f"❌ {ticker}: бюджет не визначено"
+            _pending_opens.discard(ticker)
+            return None, msg
 
-        # Спільний крок
+        if min_cost_s > budget_s or min_cost_l > budget_l:
+            await asyncio.gather(short_ex.close(), long_ex.close())
+            await notify(
+                f"⚠️ <b>{ticker}: мін. лот перевищує бюджет</b>\n"
+                f"📌 {signal.short_exchange}: мін. позиція ${min_cost_s:.2f}, бюджет ${budget_s:.2f}\n"
+                f"📌 {signal.long_exchange}: мін. позиція ${min_cost_l:.2f}, бюджет ${budget_l:.2f}\n"
+                f"💡 Збільште виділену маржу для цієї біржі"
+            )
+            msg = f"❌ {ticker}: мін. лот перевищує бюджет"
+            _pending_opens.discard(ticker)
+            return None, msg
+
         step_s_coins = step_s * mult_s
         step_l_coins = step_l
         step_common = math.gcd(int(step_s_coins), int(step_l_coins))
         if step_common < 1:
             step_common = 1
 
-        # Округлюємо ВНИЗ до step_common
+        qty_s_raw = budget_s / (s_p * mult_s)
+        qty_l_raw = budget_l / (l_p * mult_l)
+        min_qty_raw = min(qty_s_raw, qty_l_raw)
+
         qty_common = int(min_qty_raw) // step_common * step_common
 
-        # Якщо результат < мін лот — піднімаємо до мін лоту
         min_lot_coins = max(min_s_coins, min_l_coins)
         if qty_common < min_lot_coins:
             qty_common = int(min_lot_coins) // step_common * step_common
@@ -134,22 +187,30 @@ async def open_position(signal: OpenSignal, budget_short: float, budget_long: fl
         cost_s = qty_s * s_p * mult_s
         cost_l = qty_l * l_p * mult_l
 
-        print(f"[Executor] {signal.ticker}: qty={qty_common}, cost=${cost_s:.2f}/${cost_l:.2f}, "
+        print(f"[Executor] {ticker}: qty={qty_common}, cost=${cost_s:.2f}/${cost_l:.2f}, "
               f"budget=${budget_s:.2f}/${budget_l:.2f}")
 
-        min_cost_s = min_s_coins * s_p * mult_s
-        min_cost_l = min_l_coins * l_p * mult_l
-
-        if cost_s > budget_s * 1.2 or cost_l > budget_l * 1.2:
+        from settings import DEPTH_MIN_RATIO
+        depth_s = await short_ex.get_order_book_depth(signal.symbol, cost_s, s_p)
+        depth_l = await long_ex.get_order_book_depth(signal.symbol, cost_l, l_p)
+        if depth_s is not None and depth_s < cost_s / DEPTH_MIN_RATIO:
             await asyncio.gather(short_ex.close(), long_ex.close())
             await notify(
-                f"⚠️ <b>{signal.ticker}: мін. лот перевищує бюджет</b>\n"
-                f"📌 {signal.short_exchange}: мін. позиція ${min_cost_s:.2f}, бюджет ${budget_s:.2f}\n"
-                f"📌 {signal.long_exchange}: мін. позиція ${min_cost_l:.2f}, бюджет ${budget_l:.2f}\n"
-                f"💡 Збільште виділену маржу для цієї біржі"
+                f"⚠️ <b>{ticker}: недостаточно ликвидности (SH {signal.short_exchange})</b>\n"
+                f"📊 Ордер: ${cost_s:.2f}, ликвидность: ${depth_s:.2f} ({DEPTH_MIN_RATIO}x)\n"
+                f"💡 Используйте лимитные ордера"
             )
-            msg = f"❌ {signal.ticker}: мін. лот перевищує ліміт (${cost_s:.2f}/${cost_l:.2f})"
-            return None, msg
+            _pending_opens.discard(ticker)
+            return None, f"❌ {ticker}: недостаточно ликвидности (SH)"
+        if depth_l is not None and depth_l < cost_l / DEPTH_MIN_RATIO:
+            await asyncio.gather(short_ex.close(), long_ex.close())
+            await notify(
+                f"⚠️ <b>{ticker}: недостаточно ликвидности (LH {signal.long_exchange})</b>\n"
+                f"📊 Ордер: ${cost_l:.2f}, ликвидность: ${depth_l:.2f} ({DEPTH_MIN_RATIO}x)\n"
+                f"💡 Используйте лимитные ордера"
+            )
+            _pending_opens.discard(ticker)
+            return None, f"❌ {ticker}: недостаточно ликвидности (LH)"
 
         exec_size_s = cost_s
         exec_size_l = cost_l
@@ -182,6 +243,7 @@ async def open_position(signal: OpenSignal, budget_short: float, budget_long: fl
             msg = f"❌ {signal.ticker}: Short помилка ({signal.short_exchange}): {short_r}"
             await asyncio.gather(short_ex.close(), long_ex.close())
             await notify(msg)
+            _pending_opens.discard(ticker)
             return None, msg
 
         # 2. Long
@@ -209,6 +271,7 @@ async def open_position(signal: OpenSignal, budget_short: float, budget_long: fl
             msg = f"❌ {signal.ticker}: Long помилка ({signal.long_exchange}): {long_r}\n{rollback}"
             await asyncio.gather(short_ex.close(), long_ex.close())
             await notify(msg)
+            _pending_opens.discard(ticker)
             return None, msg
 
         # --- КРОК 5: ЗБЕРЕЖЕННЯ ТА ПОВІДОМЛЕННЯ ---
@@ -438,6 +501,7 @@ async def close_position(close_signal: CloseSignal) -> tuple[Optional[Trade], st
         pass
 
     await _close(short_ex, long_ex)
+    _pending_opens.discard(ticker)
     return trade, msg
 
 
@@ -615,11 +679,12 @@ async def _try_reentry(trade: Trade, current_spread_pct: float):
 
         if not risk:
             print(f"[Reentry] {trade.ticker}: risk_manager отклонил — {risk.reason}")
-            await notify(
-                f"🔄 <b>Перезаход {trade.ticker}: отклонён риск-менеджером</b>\n"
-                f"📊 Спред: {current_spread_pct:.2f}%\n"
-                f"⛔ Причина: {risk.reason}"
-            )
+            if 'черном списке' not in (risk.reason or '').lower():
+                await notify(
+                    f"🔄 <b>Перезаход {trade.ticker}: отклонён риск-менеджером</b>\n"
+                    f"📊 Спред: {current_spread_pct:.2f}%\n"
+                    f"⛔ Причина: {risk.reason}"
+                )
             return
 
         await notify(
